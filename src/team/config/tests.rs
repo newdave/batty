@@ -52,12 +52,12 @@ fn parse_minimal_config() {
     assert_eq!(config.roles[0].role_type, RoleType::Architect);
     assert_eq!(config.roles[2].instances, 3);
     assert_eq!(config.workflow_mode, WorkflowMode::Legacy);
-    assert!(config.orchestrator_pane);
+    assert!(!config.orchestrator_pane);
     assert_eq!(
         config.event_log_max_bytes,
         super::super::DEFAULT_EVENT_LOG_MAX_BYTES
     );
-    assert!(config.auto_respawn_on_crash);
+    assert!(!config.auto_respawn_on_crash);
     assert_eq!(config.workflow_policy.graceful_shutdown_timeout_secs, 30);
     assert!(config.workflow_policy.auto_commit_on_restart);
     assert!(!config.workflow_policy.clean_room_mode);
@@ -138,7 +138,7 @@ roles:
         "openclaw"
     );
     assert_eq!(config.workflow_mode, WorkflowMode::Legacy);
-    assert!(config.orchestrator_pane);
+    assert!(!config.orchestrator_pane);
 }
 
 #[test]
@@ -310,13 +310,13 @@ roles:
     assert!(config.board.auto_dispatch);
     assert!(config.board.auto_replenish);
     assert_eq!(config.board.state_reconciliation_interval_secs, 30);
-    assert_eq!(config.standup.interval_secs, 300);
-    assert_eq!(config.standup.output_lines, 30);
+    assert_eq!(config.standup.interval_secs, 1800);
+    assert_eq!(config.standup.output_lines, 12);
     assert!(config.automation.timeout_nudges);
     assert!(config.automation.standups);
     assert!(config.automation.failure_pattern_detection);
     assert!(config.automation.triage_interventions);
-    assert_eq!(config.automation.intervention_idle_grace_secs, 60);
+    assert_eq!(config.automation.intervention_idle_grace_secs, 300);
     assert_eq!(config.workflow_policy.narration_threshold, 0.8);
     assert_eq!(config.workflow_policy.narration_nudge_max, 2);
     assert!(config.workflow_policy.narration_detection_enabled);
@@ -338,12 +338,12 @@ roles:
     assert!(config.cost.models.is_empty());
     assert_eq!(config.roles[0].instances, 1);
     assert_eq!(config.workflow_mode, WorkflowMode::Legacy);
-    assert!(config.orchestrator_pane);
+    assert!(!config.orchestrator_pane);
     assert_eq!(
         config.event_log_max_bytes,
         super::super::DEFAULT_EVENT_LOG_MAX_BYTES
     );
-    assert!(config.auto_respawn_on_crash);
+    assert!(!config.auto_respawn_on_crash);
 }
 
 #[test]

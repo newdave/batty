@@ -416,6 +416,21 @@ fn build_zones_from_config<'a>(
     for (zone_idx, zone_def) in config.zones.iter().enumerate() {
         let zone_name = zone_def.name.as_str();
 
+        if !zone_def.members.is_empty() {
+            for selector in &zone_def.members {
+                let selected: Vec<_> = member_queue
+                    .iter()
+                    .copied()
+                    .filter(|m| m.name == *selector || m.role_name == *selector)
+                    .collect();
+                for member in selected {
+                    zones[zone_idx].members.push(member);
+                }
+                member_queue.retain(|m| m.name != *selector && m.role_name != *selector);
+            }
+            continue;
+        }
+
         let exact_matches: Vec<&MemberInstance> = member_queue
             .iter()
             .copied()
@@ -598,16 +613,19 @@ roles:
         let layout = LayoutConfig {
             zones: vec![
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "architect".to_string(),
                     width_pct: 20,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "managers".to_string(),
                     width_pct: 30,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "engineers".to_string(),
                     width_pct: 50,
                     split: None,
@@ -660,16 +678,19 @@ roles:
         let layout = Some(LayoutConfig {
             zones: vec![
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "architect".to_string(),
                     width_pct: 15,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "managers".to_string(),
                     width_pct: 25,
                     split: Some(super::super::config::SplitDef { horizontal: 2 }),
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "engineers".to_string(),
                     width_pct: 60,
                     split: Some(super::super::config::SplitDef { horizontal: 6 }),
@@ -813,6 +834,7 @@ roles:
         // Only define one zone — everything else should end up there
         let layout = LayoutConfig {
             zones: vec![super::super::config::ZoneDef {
+                members: Vec::new(),
                 name: "architect".to_string(),
                 width_pct: 100,
                 split: None,
@@ -863,21 +885,25 @@ roles:
         let layout = LayoutConfig {
             zones: vec![
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "scientist".to_string(),
                     width_pct: 10,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "architect".to_string(),
                     width_pct: 10,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "black-lead".to_string(),
                     width_pct: 40,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "red-lead".to_string(),
                     width_pct: 40,
                     split: None,
@@ -1087,6 +1113,7 @@ roles:
 
         let layout = Some(LayoutConfig {
             zones: vec![super::super::config::ZoneDef {
+                members: Vec::new(),
                 name: "architect".to_string(),
                 width_pct: 100,
                 split: Some(super::super::config::SplitDef { horizontal: 2 }),
@@ -1438,16 +1465,19 @@ roles:
         let layout = LayoutConfig {
             zones: vec![
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "my-architect-zone".to_string(),
                     width_pct: 20,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "the-manager-area".to_string(),
                     width_pct: 30,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "engineer-pool".to_string(),
                     width_pct: 50,
                     split: None,
@@ -1488,6 +1518,7 @@ roles:
         );
         let layout = LayoutConfig {
             zones: vec![super::super::config::ZoneDef {
+                members: Vec::new(),
                 name: "unrelated-zone".to_string(),
                 width_pct: 100,
                 split: None,
@@ -1517,11 +1548,13 @@ roles:
         let layout = LayoutConfig {
             zones: vec![
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "architect".to_string(),
                     width_pct: 30,
                     split: None,
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "engineers".to_string(),
                     width_pct: 70,
                     split: None,
@@ -1542,6 +1575,7 @@ roles:
     fn config_zones_horizontal_columns_stored_from_split() {
         let layout = LayoutConfig {
             zones: vec![super::super::config::ZoneDef {
+                members: Vec::new(),
                 name: "engineers".to_string(),
                 width_pct: 100,
                 split: Some(super::super::config::SplitDef { horizontal: 4 }),
@@ -1623,11 +1657,13 @@ roles:
         let layout = LayoutConfig {
             zones: vec![
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "engineers".to_string(),
                     width_pct: 50,
                     split: Some(super::super::config::SplitDef { horizontal: 3 }),
                 },
                 super::super::config::ZoneDef {
+                    members: Vec::new(),
                     name: "overflow".to_string(),
                     width_pct: 50,
                     split: None,
@@ -1666,5 +1702,17 @@ roles:
         // Single quote should be escaped for shell safety
         assert!(!cmd.contains("it's"));
         assert!(cmd.contains("console-pane"));
+    }
+    #[test]
+    fn explicit_selectors_mix_roles_without_duplicating_members() {
+        let members = make_members(
+            "name: sample\nroles:\n- name: builder\n  role_type: engineer\n  agent: codex\n  instances: 2\n- name: auditor\n  role_type: engineer\n  agent: claude\n",
+        );
+        let config: LayoutConfig=serde_yaml::from_str("zones:\n- name: mixed\n  width_pct: 50\n  members: [auditor, builder]\n- name: other\n  width_pct: 50\n  members: [builder]\n").unwrap();
+        let refs: Vec<_> = members.iter().collect();
+        let zones = build_zones_from_config(&config, &refs);
+        assert_eq!(zones[0].members.len(), 3);
+        assert_eq!(zones[0].members[0].role_name, "auditor");
+        assert_eq!(zones.len(), 1);
     }
 }

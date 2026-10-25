@@ -1659,6 +1659,37 @@ impl TeamDaemon {
                 }
             })
             .collect();
+        let configured_roles: std::collections::BTreeSet<_> = task
+            .tags
+            .iter()
+            .filter_map(|tag| self.config.team_config.board.tag_roles.get(tag))
+            .collect();
+        if configured_roles.len() > 1 {
+            return Vec::new();
+        }
+        let required_role = configured_roles.first().map(|s| s.as_str());
+        let body_role = parse_body_owner_role(&task.description);
+        if let (Some(mapped), Some(body)) = (required_role, body_role.as_deref()) {
+            if mapped != body {
+                return Vec::new();
+            }
+        }
+        eligible.retain(|name| {
+            let Some(member) = self.config.members.iter().find(|m| m.name == *name) else {
+                return false;
+            };
+            if let Some(role) = required_role {
+                return member.role_name == role;
+            }
+            let on_demand = self
+                .config
+                .team_config
+                .role_def(&member.role_name)
+                .is_some_and(|r| r.on_demand);
+            !on_demand
+                || task.assignee.as_deref() == Some(name.as_str())
+                || body_role.as_deref() == Some(member.role_name.as_str())
+        });
         eligible.sort();
 
         // #705: when the task body explicitly names an engineer role
@@ -4190,5 +4221,59 @@ mod tests {
         daemon.enqueue_dispatch_candidates().unwrap();
         assert_eq!(daemon.dispatch_queue.len(), 1);
         assert_eq!(daemon.dispatch_queue[0].task_id, 61);
+    }
+    #[test]
+    fn configured_tag_routes_and_on_demand_roles_bound_eligibility() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut specialist = engineer_member("auditor", None, false);
+        specialist.role_name = "audit-role".into();
+        let general = engineer_member("builder", None, false);
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![general, specialist])
+            .states(HashMap::from([
+                ("builder".into(), MemberState::Idle),
+                ("auditor".into(), MemberState::Idle),
+            ]))
+            .build();
+        daemon
+            .config
+            .team_config
+            .roles
+            .iter_mut()
+            .find(|r| r.name == "audit-role")
+            .unwrap()
+            .on_demand = true;
+        daemon
+            .config
+            .team_config
+            .board
+            .tag_roles
+            .insert("audit".into(), "audit-role".into());
+        daemon
+            .config
+            .team_config
+            .board
+            .tag_roles
+            .insert("build".into(), "engineer".into());
+        write_open_task_file(tmp.path(), 1, "sample", "todo");
+        let path = tmp.path().join(".batty/team_config/board/tasks");
+        let mut task = crate::task::load_tasks_from_dir(&path).unwrap().remove(0);
+        let ranked = |task: &crate::task::Task| {
+            daemon.rank_dispatch_engineers(
+                task,
+                &HashSet::new(),
+                &Default::default(),
+                std::time::Duration::ZERO,
+                &HashMap::new(),
+            )
+        };
+        assert_eq!(ranked(&task), vec!["builder"]);
+        task.tags = vec!["audit".into()];
+        assert_eq!(ranked(&task), vec!["auditor"]);
+        task.tags.push("build".into());
+        assert!(ranked(&task).is_empty());
+        task.tags.clear();
+        task.assignee = Some("auditor".into());
+        assert_eq!(ranked(&task), vec!["auditor"]);
     }
 }
