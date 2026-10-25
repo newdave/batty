@@ -27,6 +27,8 @@ All notable changes to Batty are documented here.
 
 ### Fixed
 
+- `batty init --template mixed` no longer asks for one agent backend and applies it
+  to every role; it keeps the template's per-role backends unless `--agent` is passed.
 - Codex SDK uses actual provider thread IDs, first-turn role context and explicit
   resume provenance; live token statistics follow deduplicated completed turns.
 - Codex exec failures no longer report successful task completion; shutdown stops
