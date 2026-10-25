@@ -40,9 +40,8 @@ pub struct TeamConfig {
     /// screen-scraping. Requires `use_shim: true`. Defaults to true.
     pub use_sdk_mode: bool,
     /// When true and `use_shim` is enabled, crashed agents are automatically
-    /// respawned instead of escalating to the manager. This is the default
-    /// posture for unattended teams; disable it only for debugging or
-    /// deliberate manual supervision.
+    /// respawned instead of escalating to the manager. Disabled by default
+    /// to keep failed launches from consuming repeated inference sessions.
     pub auto_respawn_on_crash: bool,
     /// Interval in seconds between Ping health checks sent to shim handles.
     pub shim_health_check_interval_secs: u64,
@@ -197,7 +196,7 @@ fn default_use_sdk_mode() -> bool {
 }
 
 fn default_auto_respawn_on_crash() -> bool {
-    true
+    false
 }
 
 pub fn default_trunk_branch() -> String {
@@ -230,6 +229,14 @@ pub struct ModelPricing {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowPolicy {
+    /// Optional bounded native runtime validation after startup.
+    #[serde(default = "default_startup_validation_timeout")]
+    pub startup_validation_timeout_secs: Option<u64>,
+    /// Whether an idle shim may issue inference keepalives. Null uses role policy.
+    #[serde(default = "default_idle_inference_enabled")]
+    pub idle_inference_enabled: Option<bool>,
+    #[serde(default)]
+    pub zero_diff_recovery: ZeroDiffRecovery,
     #[serde(default)]
     pub clean_room_mode: bool,
     #[serde(default)]
@@ -357,9 +364,24 @@ pub struct ReviewTimeoutOverride {
     pub review_timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ZeroDiffRecovery {
+    Restart,
+    #[default]
+    Park,
+}
+
+fn default_idle_inference_enabled() -> Option<bool> {
+    Some(false)
+}
+
 impl Default for WorkflowPolicy {
     fn default() -> Self {
         Self {
+            startup_validation_timeout_secs: Some(30),
+            idle_inference_enabled: Some(false),
+            zero_diff_recovery: ZeroDiffRecovery::default(),
             clean_room_mode: false,
             barrier_groups: HashMap::new(),
             handoff_directory: default_handoff_directory(),
@@ -493,7 +515,7 @@ fn default_graceful_shutdown_timeout_secs() -> u64 {
 }
 
 fn default_verification_max_iterations() -> u32 {
-    5
+    2
 }
 
 fn default_verification_auto_run_tests() -> bool {
@@ -577,7 +599,7 @@ fn default_context_handoff_enabled() -> bool {
 }
 
 fn default_handoff_screen_history() -> usize {
-    20
+    1
 }
 
 fn default_handoff_directory() -> String {
@@ -585,7 +607,7 @@ fn default_handoff_directory() -> String {
 }
 
 fn default_planning_cycle_cooldown_secs() -> u64 {
-    300
+    1800
 }
 
 fn default_context_pressure_threshold() -> u64 {
@@ -726,6 +748,9 @@ impl WorkflowMode {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BoardConfig {
+    /// Optional explicit task-tag to role routing. Conflicting mapped tags are held.
+    #[serde(default)]
+    pub tag_roles: HashMap<String, String>,
     #[serde(default = "default_rotation_threshold")]
     pub rotation_threshold: u32,
     #[serde(default = "default_board_auto_dispatch")]
@@ -771,6 +796,7 @@ pub struct BoardConfig {
 impl Default for BoardConfig {
     fn default() -> Self {
         Self {
+            tag_roles: HashMap::new(),
             rotation_threshold: default_rotation_threshold(),
             auto_dispatch: default_board_auto_dispatch(),
             worktree_stale_rebase_threshold: default_worktree_stale_rebase_threshold(),
@@ -821,7 +847,7 @@ pub struct AutomationConfig {
     pub owned_task_interventions: bool,
     #[serde(default = "default_enabled")]
     pub manager_dispatch_interventions: bool,
-    #[serde(default = "default_enabled")]
+    #[serde(default)]
     pub architect_utilization_interventions: bool,
     #[serde(default)]
     pub replenishment_threshold: Option<usize>,
@@ -848,7 +874,7 @@ impl Default for AutomationConfig {
             review_interventions: default_enabled(),
             owned_task_interventions: default_enabled(),
             manager_dispatch_interventions: default_enabled(),
-            architect_utilization_interventions: default_enabled(),
+            architect_utilization_interventions: false,
             replenishment_threshold: None,
             intervention_idle_grace_secs: default_intervention_idle_grace_secs(),
             intervention_cooldown_secs: default_intervention_cooldown_secs(),
@@ -866,6 +892,9 @@ pub struct LayoutConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZoneDef {
+    /// Ordered exact member or role selectors; empty retains legacy name matching.
+    #[serde(default)]
+    pub members: Vec<String>,
     pub name: String,
     pub width_pct: u32,
     #[serde(default)]
@@ -885,6 +914,9 @@ pub struct RoleDef {
     pub agent: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional backend reasoning effort; omitted values leave backend defaults intact.
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub auth_mode: Option<ClaudeAuthMode>,
     #[serde(default)]
@@ -920,6 +952,9 @@ pub struct RoleDef {
     pub barrier_group: Option<String>,
     #[serde(default)]
     pub use_worktrees: bool,
+    /// Restrict automatic dispatch to tasks explicitly routed to this role.
+    #[serde(default)]
+    pub on_demand: bool,
 }
 
 impl Default for RoleDef {
@@ -929,6 +964,7 @@ impl Default for RoleDef {
             role_type: RoleType::Engineer,
             agent: None,
             model: None,
+            effort: None,
             auth_mode: None,
             auth_env: Vec::new(),
             instances: default_instances(),
@@ -946,6 +982,7 @@ impl Default for RoleDef {
             owns: Vec::new(),
             barrier_group: None,
             use_worktrees: false,
+            on_demand: false,
         }
     }
 }
@@ -956,6 +993,9 @@ pub struct RoleInstanceOverride {
     pub agent: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional backend reasoning effort; omitted values leave backend defaults intact.
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
@@ -1080,7 +1120,7 @@ fn default_dispatch_release_exclusion_secs() -> u64 {
 }
 
 fn default_standup_interval() -> u64 {
-    300
+    1800
 }
 
 fn default_pipeline_starvation_threshold() -> Option<usize> {
@@ -1088,7 +1128,7 @@ fn default_pipeline_starvation_threshold() -> Option<usize> {
 }
 
 fn default_output_lines() -> u32 {
-    30
+    12
 }
 
 fn default_instances() -> u32 {
@@ -1120,11 +1160,11 @@ fn default_stale_review_hours() -> u64 {
 }
 
 fn default_stall_threshold_secs() -> u64 {
-    300
+    900
 }
 
 fn default_max_stall_restarts() -> u32 {
-    2
+    1
 }
 
 fn default_health_check_interval_secs() -> u64 {
@@ -1140,11 +1180,11 @@ fn default_enabled() -> bool {
 }
 
 fn default_orchestrator_pane() -> bool {
-    true
+    false
 }
 
 fn default_intervention_idle_grace_secs() -> u64 {
-    60
+    300
 }
 
 fn default_intervention_cooldown_secs() -> u64 {
@@ -1237,4 +1277,8 @@ fn default_shim_working_state_timeout_secs() -> u64 {
 
 fn default_pending_queue_max_age_secs() -> u64 {
     600 // 10 minutes
+}
+
+fn default_startup_validation_timeout() -> Option<u64> {
+    Some(30)
 }

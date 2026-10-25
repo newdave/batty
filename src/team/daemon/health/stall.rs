@@ -1058,8 +1058,8 @@ mod tests {
     #[test]
     fn stall_detection_config_defaults() {
         let policy = WorkflowPolicy::default();
-        assert_eq!(policy.stall_threshold_secs, 300);
-        assert_eq!(policy.max_stall_restarts, 2);
+        assert_eq!(policy.stall_threshold_secs, 900);
+        assert_eq!(policy.max_stall_restarts, 1);
     }
 
     #[test]

@@ -514,8 +514,12 @@ fn parse_workflow_policy_defaults_all_applied() {
     assert!(p.auto_archive_done_after_secs.is_none());
     assert!(p.capability_overrides.is_empty());
     assert!(!p.file_level_locks);
-    assert_eq!(p.stall_threshold_secs, 300);
-    assert_eq!(p.max_stall_restarts, 2);
+    assert_eq!(p.stall_threshold_secs, 900);
+    assert_eq!(p.max_stall_restarts, 1);
+    assert_eq!(p.verification.max_iterations, 2);
+    assert_eq!(p.startup_validation_timeout_secs, Some(30));
+    assert_eq!(p.idle_inference_enabled, Some(false));
+    assert_eq!(p.zero_diff_recovery, ZeroDiffRecovery::Park);
     assert_eq!(p.health_check_interval_secs, 60);
     assert_eq!(p.uncommitted_warn_threshold, 200);
     assert!(p.test_command.is_none());

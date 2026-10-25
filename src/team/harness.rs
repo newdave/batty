@@ -40,10 +40,23 @@ impl TestHarness {
                 trunk_branch: crate::team::config::default_trunk_branch(),
                 agent: None,
                 workflow_mode: WorkflowMode::Legacy,
-                workflow_policy: WorkflowPolicy::default(),
+                workflow_policy: WorkflowPolicy {
+                    stall_threshold_secs: 300,
+                    max_stall_restarts: 2,
+                    verification: crate::team::config::VerificationPolicy {
+                        max_iterations: 3,
+                        ..Default::default()
+                    },
+                    zero_diff_recovery: crate::team::config::ZeroDiffRecovery::Restart,
+                    ..WorkflowPolicy::default()
+                },
                 board: BoardConfig::default(),
                 standup: StandupConfig::default(),
-                automation: AutomationConfig::default(),
+                automation: AutomationConfig {
+                    architect_utilization_interventions: true,
+                    intervention_idle_grace_secs: 60,
+                    ..AutomationConfig::default()
+                },
                 automation_sender: None,
                 external_senders: Vec::new(),
                 orchestrator_pane: false,

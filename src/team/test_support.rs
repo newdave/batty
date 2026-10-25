@@ -342,6 +342,8 @@ pub(crate) fn inferred_role_defs(members: &[MemberInstance]) -> Vec<RoleDef> {
             .iter()
             .any(|candidate| candidate.role_name == member.role_name && candidate.use_worktrees);
         roles.push(RoleDef {
+            effort: None,
+            on_demand: false,
             name: member.role_name.clone(),
             role_type: member.role_type,
             agent: member.agent.clone(),
@@ -392,9 +394,25 @@ impl<'a> TestDaemonBuilder<'a> {
             states: HashMap::new(),
             watchers: None,
             nudges: HashMap::new(),
-            workflow_policy: WorkflowPolicy::default(),
+            // Behaviour fixtures choose short intervention windows explicitly;
+            // production defaults are covered by config tests.
+            workflow_policy: WorkflowPolicy {
+                stall_threshold_secs: 300,
+                max_stall_restarts: 2,
+                verification: crate::team::config::VerificationPolicy {
+                    max_iterations: 3,
+                    ..Default::default()
+                },
+                zero_diff_recovery: crate::team::config::ZeroDiffRecovery::Restart,
+                planning_cycle_cooldown_secs: 300,
+                ..WorkflowPolicy::default()
+            },
             board: BoardConfig::default(),
-            automation: AutomationConfig::default(),
+            automation: AutomationConfig {
+                architect_utilization_interventions: true,
+                intervention_idle_grace_secs: 60,
+                ..AutomationConfig::default()
+            },
             orchestrator_pane: true,
         }
     }
