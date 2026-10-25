@@ -10,6 +10,48 @@ use super::{
     team_config_path, team_events_path,
 };
 
+fn override_template_backend(yaml: &str, agent: &str) -> Result<String> {
+    use serde_yaml::Value;
+    fn canonical(agent: &str) -> String {
+        crate::agent::adapter_from_name(agent)
+            .map(|adapter| adapter.name().to_string())
+            .unwrap_or_else(|| agent.into())
+    }
+    fn replace_role(role: &mut serde_yaml::Mapping, agent: &str, inherited_change: bool) {
+        let changed = role
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(|old| canonical(old) != canonical(agent))
+            .unwrap_or(inherited_change);
+        role.insert(Value::String("agent".into()), Value::String(agent.into()));
+        if changed {
+            role.remove("model");
+            role.remove("effort");
+        }
+        if let Some(overrides) = role
+            .get_mut("instance_overrides")
+            .and_then(Value::as_mapping_mut)
+        {
+            for value in overrides.values_mut() {
+                if let Some(instance) = value.as_mapping_mut() {
+                    replace_role(instance, agent, changed);
+                }
+            }
+        }
+    }
+    let mut config: Value = serde_yaml::from_str(yaml)?;
+    if let Some(roles) = config.get_mut("roles").and_then(Value::as_sequence_mut) {
+        for role in roles {
+            if let Some(role) = role.as_mapping_mut() {
+                if role.get("role_type").and_then(Value::as_str) != Some("user") {
+                    replace_role(role, agent, true);
+                }
+            }
+        }
+    }
+    Ok(serde_yaml::to_string(&config)?)
+}
+
 /// Returns `~/.batty/templates/`.
 pub fn templates_base_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("cannot determine home directory")?;
@@ -81,6 +123,7 @@ pub fn init_team_with_overrides(
         "cleanroom" => include_str!("templates/team_cleanroom.yaml"),
         "batty" => include_str!("templates/team_batty.yaml"),
         "python" => include_str!("templates/team_python.yaml"),
+        "mixed" => include_str!("templates/team_mixed.yaml"),
         _ => include_str!("templates/team_simple.yaml"),
     };
     let mut yaml_content = yaml_content.to_string();
@@ -90,9 +133,7 @@ pub fn init_team_with_overrides(
         }
     }
     if let Some(agent_name) = agent {
-        yaml_content = yaml_content
-            .replace("agent: claude", &format!("agent: {agent_name}"))
-            .replace("agent: codex", &format!("agent: {agent_name}"));
+        yaml_content = override_template_backend(&yaml_content, agent_name)?;
     }
     if let Some(ov) = overrides {
         yaml_content = apply_init_overrides(&yaml_content, ov);
@@ -156,7 +197,7 @@ pub fn init_team_with_overrides(
                 include_str!("templates/python_engineer.md"),
             ),
         ],
-        "simple" => &[
+        "simple" | "mixed" => &[
             ("architect.md", include_str!("templates/architect.md")),
             ("manager.md", include_str!("templates/manager.md")),
             ("engineer.md", include_str!("templates/engineer.md")),
@@ -1598,6 +1639,41 @@ mod tests {
                 .get(serde_yaml::Value::String("enabled".into()))
                 .and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+    #[test]
+    fn mixed_template_uses_codex_for_bounded_execution_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_team(tmp.path(), "mixed", None, None, false).unwrap();
+        let config = crate::team::config::TeamConfig::load(&team_config_path(tmp.path())).unwrap();
+        let options = crate::team::agent_options::all(&config).unwrap();
+        assert_eq!(
+            options
+                .iter()
+                .filter(|member| member.backend.as_deref() == Some("codex"))
+                .count(),
+            3
+        );
+        for member in options
+            .iter()
+            .filter(|member| member.backend.as_deref() == Some("codex"))
+        {
+            assert_eq!(member.effort.as_deref(), Some("medium"));
+            assert!(member.model.is_none());
+        }
+        assert!(
+            team_config_dir(tmp.path())
+                .join("quality_specialist.md")
+                .is_file()
+        );
+        let converted =
+            override_template_backend(include_str!("templates/team_simple.yaml"), "codex").unwrap();
+        let converted: crate::team::config::TeamConfig = serde_yaml::from_str(&converted).unwrap();
+        assert!(
+            crate::team::agent_options::all(&converted)
+                .unwrap()
+                .iter()
+                .all(|member| member.backend.as_deref() == Some("codex") && member.model.is_none())
         );
     }
 }

@@ -859,8 +859,10 @@ pub enum InitTemplate {
     Solo,
     /// Architect + 1 engineer pair (2 panes)
     Pair,
-    /// 1 architect + 1 manager + 3 engineers (5 panes)
+    /// Architect, manager, two engineers and three on-demand specialists
     Simple,
+    /// Claude coordination and research; Codex engineering and QA; Haiku documentation
+    Mixed,
     /// 1 architect + 1 manager + 5 engineers with layout (7 panes)
     Squad,
     /// Human + architect + 3 managers + 15 engineers with Telegram (19 panes)
@@ -3101,6 +3103,7 @@ mod tests {
             ("solo", InitTemplate::Solo),
             ("pair", InitTemplate::Pair),
             ("simple", InitTemplate::Simple),
+            ("mixed", InitTemplate::Mixed),
             ("squad", InitTemplate::Squad),
             ("large", InitTemplate::Large),
             ("research", InitTemplate::Research),
