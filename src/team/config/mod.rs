@@ -36,6 +36,14 @@ impl PlanningDirectiveFile {
     }
 }
 
+/// Resolve the configured trunk branch for a project. Falls back to the
+/// default (`main`) when `team.yaml` is missing or cannot be parsed.
+pub fn configured_trunk_branch(project_root: &Path) -> String {
+    TeamConfig::load(&crate::team::team_config_path(project_root))
+        .map(|config| config.trunk_branch().to_string())
+        .unwrap_or_else(|_| default_trunk_branch())
+}
+
 /// A single validation check result.
 #[derive(Debug, Clone)]
 pub struct ValidationCheck {
@@ -589,11 +597,24 @@ pub fn validate_trunk_branch_exists(project_root: &Path, trunk_branch: &str) -> 
 
     if !local_exists && !remote_exists {
         bail!(
-            "configured trunk_branch `{trunk_branch}` does not exist in {} (expected `{}` or `{}`)",
+            "configured trunk_branch `{trunk_branch}` does not exist in {} (expected `{}` or `{}`); create it with `git branch {trunk_branch} <start-point>`",
             project_root.display(),
             local_ref,
             remote_ref
         );
+    }
+
+    // Merges advance the local trunk ref, so a remote-only trunk (e.g. an
+    // integration branch created on the forge) needs a local tracking branch.
+    if !local_exists {
+        let remote_branch = format!("origin/{trunk_branch}");
+        crate::team::git_cmd::run_git(
+            project_root,
+            &["branch", "--track", trunk_branch, &remote_branch],
+        )
+        .with_context(|| {
+            format!("failed to create local trunk branch `{trunk_branch}` from `{remote_branch}`")
+        })?;
     }
 
     Ok(())
