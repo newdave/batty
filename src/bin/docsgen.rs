@@ -94,7 +94,13 @@ fn render_help_block(mut command: clap::Command) -> Result<String> {
         .write_long_help(&mut buffer)
         .context("failed to render clap help")?;
     let text = String::from_utf8(buffer).context("clap help was not valid UTF-8")?;
-    Ok(text.trim_end().to_string())
+    Ok(text
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string())
 }
 
 fn render_config_reference() -> String {
@@ -329,6 +335,10 @@ mod tests {
         assert!(markdown.contains("## `batty stop`"));
         assert!(markdown.contains("## `batty status`"));
         assert!(markdown.contains("## `batty send`"));
+        assert!(markdown.contains("## `batty preflight`"));
+        assert!(markdown.contains("## `batty backend-probe`"));
+        assert!(markdown.contains("## `batty outcome-record`"));
+        assert!(markdown.lines().all(|line| line == line.trim_end()));
     }
 
     #[test]

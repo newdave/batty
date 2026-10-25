@@ -391,3 +391,5 @@ Pre-configured alerts:
 ## License
 
 MIT
+
+See [agent efficiency and session accounting](docs/reference/agent-efficiency.md) for per-member launch options, lower-usage defaults, recovery and native operator commands.
