@@ -187,14 +187,11 @@ impl TeamDaemon {
         );
 
         let sdk_mode = agent_supports_sdk_mode(agent_name) && self.config.team_config.use_sdk_mode;
-        // SDK mode always uses a fresh session — Claude -p doesn't support --resume
-        // and reusing a session_id causes "Session ID already in use" errors.
-        let effective_session_id = if sdk_mode {
-            Some(uuid::Uuid::new_v4().to_string())
-        } else {
-            session_id.clone()
-        };
-        let effective_resume = if sdk_mode { false } else { member_resume };
+        // Claude SDK starts fresh; Codex must wait for its provider thread ID
+        // and may resume only the explicitly selected previous thread.
+        let effective_session_id =
+            sdk_launch_session_id(&normalized_agent, sdk_mode, member_resume, session_id);
+        let effective_resume = member_resume && !(sdk_mode && normalized_agent == "claude-code");
         let short_cmd = write_launch_script(
             &member.name,
             agent_name,
@@ -464,8 +461,18 @@ impl TeamDaemon {
         let mut changed = false;
 
         for (member_name, watcher) in &mut self.watchers {
+            if self.config.team_config.use_sdk_mode
+                && self.config.members.iter().any(|member| {
+                    member.name == *member_name
+                        && matches!(member.agent.as_deref(), Some("codex" | "codex-cli"))
+                })
+                && watcher.configured_session_id().is_none()
+            {
+                continue;
+            }
             watcher.refresh_session_tracking()?;
             let preferred_session_id = watcher.configured_session_id();
+
             let session_id = watcher.current_session_id().or_else(|| {
                 let member = self
                     .config
@@ -526,6 +533,21 @@ impl TeamDaemon {
         }
         entry.session_id = Some(session_id.to_string());
         save_launch_state(&self.config.project_root, &launch_state)
+    }
+}
+
+fn sdk_launch_session_id(
+    agent: &str,
+    sdk: bool,
+    resume: bool,
+    previous: Option<String>,
+) -> Option<String> {
+    if sdk && agent == "claude-code" {
+        Some(uuid::Uuid::new_v4().to_string())
+    } else if sdk && agent == "codex-cli" && !resume {
+        None
+    } else {
+        previous
     }
 }
 
@@ -601,6 +623,13 @@ pub(super) fn write_launch_script(
         "codex" | "codex-cli" => prepare_codex_context(member_name, role_context, work_dir)?,
         _ => work_dir.to_path_buf(),
     };
+    if sdk_mode && matches!(agent_name, "codex" | "codex-cli") {
+        crate::shim::codex_session::LaunchContext {
+            role_context: prompt.to_string(),
+            resume_session_id: resume.then(|| session_id.map(str::to_string)).flatten(),
+        }
+        .save(work_dir, member_name)?;
+    }
     let launch_dir_str = launch_dir.to_string_lossy();
 
     let adapter: Box<dyn agent::AgentAdapter> = if matches!(agent_name, "kiro" | "kiro-cli") {
@@ -2257,5 +2286,15 @@ mod tests {
         .unwrap();
         assert!(script.contains("--model 'custom-model'"));
         assert!(script.contains("-c 'model_reasoning_effort=\"low\"'"));
+    }
+    #[test]
+    fn sdk_codex_waits_for_real_thread_identity_and_only_resumes_explicitly() {
+        let previous = Some(uuid::Uuid::new_v4().to_string());
+        assert!(sdk_launch_session_id("codex-cli", true, false, previous.clone()).is_none());
+        assert_eq!(
+            sdk_launch_session_id("codex-cli", true, true, previous.clone()),
+            previous
+        );
+        assert!(sdk_launch_session_id("claude-code", true, false, None).is_some());
     }
 }

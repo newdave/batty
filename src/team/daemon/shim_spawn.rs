@@ -194,6 +194,22 @@ pub(in crate::team) fn spawn_shim(
         cmd.env_remove("BATTY_AGENT_EFFORT");
     }
 
+    // SDK subprocesses do not execute the generated shell launcher. Preserve
+    // its member-scoped board wrappers so commands target the shared board.
+    if sdk_mode {
+        let slug = project_root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let wrappers = std::env::temp_dir().join(format!("batty-bin-{slug}-{member_name}"));
+        if wrappers.is_dir() {
+            let mut paths = vec![wrappers];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            cmd.env("PATH", std::env::join_paths(paths)?);
+        }
+    }
     // Set BATTY_MEMBER so detect_sender() works in SDK mode subprocesses
     cmd.env("BATTY_MEMBER", member_name);
     let mcp_isolation = crate::team::mcp::McpIsolation::for_member(project_root, member_name);

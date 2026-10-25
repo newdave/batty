@@ -138,6 +138,10 @@ pub enum Event {
         state: ShimState,
         since_secs: u64,
     },
+    /// Actual provider thread identity, never a locally invented placeholder.
+    SessionStarted {
+        session_id: String,
+    },
     SessionStats {
         output_bytes: u64,
         uptime_secs: u64,

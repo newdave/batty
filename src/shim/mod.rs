@@ -2,6 +2,7 @@
 mod bench;
 pub mod chat;
 pub mod classifier;
+pub mod codex_session;
 pub mod codex_types;
 pub mod common;
 #[cfg(any(test, feature = "scenario-test"))]
