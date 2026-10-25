@@ -23,6 +23,7 @@ nav:
       - CLI Reference: reference/cli.md
       - Runtime Config: reference/config.md
       - Agent Efficiency: reference/agent-efficiency.md
+      - Codex: reference/codex.md
       - Environment Variables: reference/environment-variables.md
       - Modules: reference/modules.md
   - Architecture: architecture.md

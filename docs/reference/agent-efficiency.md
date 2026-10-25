@@ -101,3 +101,5 @@ then the legacy policy command. Otherwise it detects `make check`, `make test`
 or `cargo test` from project files, in that order. Other projects must configure
 a command; preflight and startup report this before launching a team. Non-code
 deliverables can explicitly disable automatic tests.
+
+For an opt-in Codex allocation and SDK behaviour, see [Codex in Batty](codex.md).

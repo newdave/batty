@@ -6,6 +6,8 @@ All notable changes to Batty are documented here.
 
 ### Added
 
+- An opt-in mixed template with Codex/medium engineers and QA, Claude coordination
+  and research, and Haiku documentation. Backend overrides clear incompatible pins.
 - Per-member model and effort overrides, explicit tag-to-role routing, on-demand
   specialists and ordered mixed-role layout zones.
 - Native preflight, bounded startup consistency checks, member-scoped backend
@@ -25,6 +27,11 @@ All notable changes to Batty are documented here.
 
 ### Fixed
 
+- Codex SDK uses actual provider thread IDs, first-turn role context and explicit
+  resume provenance; live token statistics follow deduplicated completed turns.
+- Codex exec failures no longer report successful task completion; shutdown stops
+  owned execution and queued delivery failures remain visible. Explicit Codex
+  probes are ephemeral and read-only.
 - Pinned session identities no longer follow unrelated newer transcripts.
 - Context pressure follows request usage and explicit provider window metadata.
 - Terminal configuration failures park the affected backend until repaired.
