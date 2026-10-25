@@ -110,11 +110,62 @@ pub(crate) fn next_unclaimed_task(board_dir: &Path) -> Result<Option<crate::task
     Ok(available.into_iter().next())
 }
 
+/// Resolve verification without assuming every project uses Rust.
+pub fn resolve_test_command(root: &Path, explicit: Option<&str>) -> Result<String> {
+    if let Some(command) = explicit {
+        anyhow::ensure!(
+            !command.trim().is_empty(),
+            "verification command must not be empty"
+        );
+        return Ok(command.into());
+    }
+    if let Ok(makefile) = std::fs::read_to_string(root.join("Makefile")) {
+        for target in ["check", "test"] {
+            if makefile.lines().any(|line| {
+                !line.starts_with(['\t', '#'])
+                    && line.split_once(':').is_some_and(|(names, _)| {
+                        names.split_whitespace().any(|name| name == target)
+                    })
+            }) {
+                return Ok(format!("make {target}"));
+            }
+        }
+    }
+    if root.join("Cargo.toml").is_file() {
+        return Ok("cargo test".into());
+    }
+    anyhow::bail!(
+        "verification command is not configured; set workflow_policy.verification.test_command for this project, or disable automatic tests for a non-code deliverable"
+    )
+}
+
 pub(crate) fn run_tests_in_worktree(
     worktree_dir: &Path,
     test_command: Option<&str>,
 ) -> Result<TestRunOutput> {
-    let command_text = test_command.unwrap_or("cargo test");
+    if !worktree_dir.is_dir() {
+        let output = format!(
+            "failed to run tests: worktree does not exist: {}",
+            worktree_dir.display()
+        );
+        return Ok(TestRunOutput {
+            passed: false,
+            results: test_results::parse(test_command.unwrap_or(""), &output, false),
+            output,
+        });
+    }
+    let resolved = match resolve_test_command(worktree_dir, test_command) {
+        Ok(command) => command,
+        Err(error) => {
+            let output = error.to_string();
+            return Ok(TestRunOutput {
+                passed: false,
+                results: test_results::parse(test_command.unwrap_or(""), &output, false),
+                output,
+            });
+        }
+    };
+    let command_text = resolved.as_str();
     let mut command = std::process::Command::new("sh");
     let cargo_home = engineer_worktree_project_root(worktree_dir)
         .map(|project_root| project_root.join(".batty").join("cargo-home"))
@@ -4131,5 +4182,35 @@ mod tests {
         let incoming = "const CHECKS: &[&str] = &[\n    \"renamed\",\n];\n";
 
         assert!(merge_additive_only_text(base, current, incoming).is_none());
+    }
+    #[test]
+    fn verification_command_is_project_aware_and_explicit_settings_win() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(resolve_test_command(root, None).is_err());
+        let missing = run_tests_in_worktree(root, None).unwrap();
+        assert!(!missing.passed);
+        assert!(
+            missing
+                .output
+                .contains("verification command is not configured")
+        );
+        assert_eq!(
+            resolve_test_command(root, Some("python -m pytest")).unwrap(),
+            "python -m pytest"
+        );
+        assert!(resolve_test_command(root, Some(" ")).is_err());
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(resolve_test_command(root, None).unwrap(), "cargo test");
+        std::fs::write(
+            root.join("Makefile"),
+            ".PHONY: check\ncheck: test\n\ttrue\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_test_command(root, None).unwrap(), "make check");
+        assert_eq!(
+            resolve_test_command(root, Some("custom verify")).unwrap(),
+            "custom verify"
+        );
     }
 }

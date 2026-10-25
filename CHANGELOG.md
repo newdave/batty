@@ -11,6 +11,8 @@ All notable changes to Batty are documented here.
 - Native preflight, bounded startup consistency checks, member-scoped backend
   recovery, explicit live backend probes and acceptance evidence reports.
 - Machine-readable cost output with pricing coverage and attribution warnings.
+- Project-aware verification commands with explicit overrides, Makefile/Cargo
+  detection and pre-launch diagnostics for unsupported projects.
 
 ### Changed
 

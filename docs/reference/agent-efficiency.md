@@ -41,7 +41,7 @@ Existing explicit configuration values take precedence. These defaults also
 change omitted settings in existing teams; review `batty config` before starting.
 
 Transport Ping/Pong remains active when idle inference is disabled. Claude SDK
-context pressure uses per-request input usage and explicit provider context
+context pressure uses per-request input, cache and output usage and explicit provider context
 window metadata. Cumulative session totals do not determine request pressure.
 Unknown context capacity stays unknown. Each member's pinned session is kept
 separate; a newer transcript belonging to another member does not replace it.
@@ -91,3 +91,11 @@ kanban-md 0.39.0's create/TUI protocol. That backend's standalone edit/move CLI
 does not take this lock; external callers must coordinate raw CLI mutations.
 Native mutation on other platforms currently returns an explicit unsupported
 error. Batty does not remove or replace the shared lock inode.
+
+## Verification commands
+
+Verification uses an explicit `workflow_policy.verification.test_command` first,
+then the legacy policy command. Otherwise it detects `make check`, `make test`
+or `cargo test` from project files, in that order. Other projects must configure
+a command; preflight and startup report this before launching a team. Non-code
+deliverables can explicitly disable automatic tests.

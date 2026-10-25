@@ -39,12 +39,23 @@ pub fn inspect(root: &Path, runtime: bool) -> Result<Report> {
             diagnostics.push(format!("tag route refers to unknown role '{role}'"));
         }
     }
-    let verification_command = config
+    let explicit_command = config
         .workflow_policy
         .verification
         .test_command
-        .clone()
-        .or_else(|| config.workflow_policy.test_command.clone());
+        .as_deref()
+        .or(config.workflow_policy.test_command.as_deref());
+    let verification_command = if config.workflow_policy.verification.auto_run_tests {
+        match super::task_loop::resolve_test_command(root, explicit_command) {
+            Ok(command) => Some(command),
+            Err(error) => {
+                diagnostics.push(error.to_string());
+                None
+            }
+        }
+    } else {
+        explicit_command.map(str::to_string)
+    };
     if runtime {
         diagnostics.extend(runtime_diagnostics(root, &members)?);
     }
