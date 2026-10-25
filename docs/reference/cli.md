@@ -878,7 +878,8 @@ Options:
           Possible values:
           - solo:      Single agent, no hierarchy (1 pane)
           - pair:      Architect + 1 engineer pair (2 panes)
-          - simple:    1 architect + 1 manager + 3 engineers (5 panes)
+          - simple:    Architect, manager, two engineers and three on-demand specialists
+          - mixed:     Claude coordination and research; Codex engineering and QA; Haiku documentation
           - squad:     1 architect + 1 manager + 5 engineers with layout (7 panes)
           - large:     Human + architect + 3 managers + 15 engineers with Telegram (19 panes)
           - research:  PI + 3 sub-leads + 6 researchers — research lab style (10 panes)
