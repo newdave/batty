@@ -1449,8 +1449,12 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Cost => {
-            team::cost::show_cost(&root)?;
+        Command::Cost { json } => {
+            if json {
+                team::cost::show_cost_json(&root)?;
+            } else {
+                team::cost::show_cost(&root)?;
+            }
         }
 
         Command::Scale { command } => {
