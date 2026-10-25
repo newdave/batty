@@ -316,6 +316,13 @@ pub enum Command {
 
     /// Reset a repaired terminal backend configuration error
     BackendReset { member: String },
+    /// Make one explicit inference request to check a configured backend
+    BackendProbe {
+        member: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+
     /// Dynamically scale team topology (add/remove agents)
     Scale {
         #[command(subcommand)]
