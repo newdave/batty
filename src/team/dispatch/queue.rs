@@ -1294,6 +1294,7 @@ impl TeamDaemon {
                 let alt = self.idle_engineer_names().into_iter().find(|name| {
                     name != &entry.engineer
                         && !retained_engineers.contains(name.as_str())
+                        && self.engineer_role_eligible(&task, name)
                         && self
                             .engineer_active_board_item_count(&board_dir, name)
                             .unwrap_or(1)
@@ -1610,6 +1611,41 @@ impl TeamDaemon {
         Ok(())
     }
 
+    /// Whether `name` may take `task` under `board.tag_roles`, body owner
+    /// routing and `on_demand` roles. Every path that picks an engineer for
+    /// a task must apply this, including queue reassignment.
+    fn engineer_role_eligible(&self, task: &crate::task::Task, name: &str) -> bool {
+        let configured_roles: std::collections::BTreeSet<_> = task
+            .tags
+            .iter()
+            .filter_map(|tag| self.config.team_config.board.tag_roles.get(tag))
+            .collect();
+        if configured_roles.len() > 1 {
+            return false;
+        }
+        let required_role = configured_roles.first().map(|s| s.as_str());
+        let body_role = parse_body_owner_role(&task.description);
+        if let (Some(mapped), Some(body)) = (required_role, body_role.as_deref()) {
+            if mapped != body {
+                return false;
+            }
+        }
+        let Some(member) = self.config.members.iter().find(|m| m.name == name) else {
+            return false;
+        };
+        if let Some(role) = required_role {
+            return member.role_name == role;
+        }
+        let on_demand = self
+            .config
+            .team_config
+            .role_def(&member.role_name)
+            .is_some_and(|r| r.on_demand);
+        !on_demand
+            || task.assignee.as_deref() == Some(name)
+            || body_role.as_deref() == Some(member.role_name.as_str())
+    }
+
     fn rank_dispatch_engineers(
         &self,
         task: &crate::task::Task,
@@ -1659,37 +1695,7 @@ impl TeamDaemon {
                 }
             })
             .collect();
-        let configured_roles: std::collections::BTreeSet<_> = task
-            .tags
-            .iter()
-            .filter_map(|tag| self.config.team_config.board.tag_roles.get(tag))
-            .collect();
-        if configured_roles.len() > 1 {
-            return Vec::new();
-        }
-        let required_role = configured_roles.first().map(|s| s.as_str());
-        let body_role = parse_body_owner_role(&task.description);
-        if let (Some(mapped), Some(body)) = (required_role, body_role.as_deref()) {
-            if mapped != body {
-                return Vec::new();
-            }
-        }
-        eligible.retain(|name| {
-            let Some(member) = self.config.members.iter().find(|m| m.name == *name) else {
-                return false;
-            };
-            if let Some(role) = required_role {
-                return member.role_name == role;
-            }
-            let on_demand = self
-                .config
-                .team_config
-                .role_def(&member.role_name)
-                .is_some_and(|r| r.on_demand);
-            !on_demand
-                || task.assignee.as_deref() == Some(name.as_str())
-                || body_role.as_deref() == Some(member.role_name.as_str())
-        });
+        eligible.retain(|name| self.engineer_role_eligible(task, name));
         eligible.sort();
 
         // #705: when the task body explicitly names an engineer role
@@ -4275,5 +4281,13 @@ mod tests {
         task.tags.clear();
         task.assignee = Some("auditor".into());
         assert_eq!(ranked(&task), vec!["auditor"]);
+
+        // Queue reassignment uses the same gate: an untagged task or one
+        // tagged for engineers never moves to an idle on-demand specialist.
+        task.assignee = None;
+        assert!(daemon.engineer_role_eligible(&task, "builder"));
+        assert!(!daemon.engineer_role_eligible(&task, "auditor"));
+        task.tags = vec!["build".into()];
+        assert!(!daemon.engineer_role_eligible(&task, "auditor"));
     }
 }
