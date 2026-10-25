@@ -774,6 +774,7 @@ pub(crate) fn worktree_staleness_by_member(
     project_root: &Path,
     members: &[MemberInstance],
 ) -> HashMap<String, u32> {
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     members
         .iter()
         .filter(|member| member.role_type == RoleType::Engineer && member.use_worktrees)
@@ -788,7 +789,7 @@ pub(crate) fn worktree_staleness_by_member(
 
             let mut max_count: Option<u32> = None;
             for repo in status_worktree_repo_targets(&worktree_dir) {
-                match super::task_loop::worktree_commits_behind_main(&repo.path) {
+                match super::task_loop::worktree_commits_behind_trunk(&repo.path, &trunk_branch) {
                     Ok(count) => {
                         max_count = Some(match max_count {
                             Some(current) => current.max(count),

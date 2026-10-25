@@ -875,6 +875,7 @@ fn preferred_trunk_start_ref(path: &Path, trunk_branch: &str) -> Result<MainStar
     })
 }
 
+#[cfg(test)]
 fn preferred_main_start_ref(path: &Path) -> Result<MainStartRefSelection> {
     preferred_trunk_start_ref(path, "main")
 }
@@ -930,6 +931,7 @@ pub fn ensure_baseline_branch_from_trunk(
     }))
 }
 
+#[cfg(test)]
 pub fn ensure_worktree_branch_for_dispatch(
     worktree_path: &Path,
     expected_branch: &str,
@@ -1020,6 +1022,7 @@ pub fn ensure_worktree_branch_for_dispatch_from_trunk(
 
 /// Reset a worktree to point at its base branch. Used to clean up after a
 /// cherry-pick merge has made the task branch redundant.
+#[cfg(test)]
 pub fn reset_worktree_to_base(worktree_path: &Path, base_branch: &str) -> Result<()> {
     let branch = git_current_branch(worktree_path).unwrap_or_else(|_| base_branch.to_string());
     let commit_message = format!("wip: auto-save before worktree reset [{branch}]");
@@ -1034,6 +1037,7 @@ pub fn reset_worktree_to_base(worktree_path: &Path, base_branch: &str) -> Result
     Ok(())
 }
 
+#[cfg(test)]
 pub fn reset_worktree_to_base_with_options(
     worktree_path: &Path,
     base_branch: &str,
@@ -1051,6 +1055,7 @@ pub fn reset_worktree_to_base_with_options(
     )
 }
 
+#[cfg(test)]
 pub fn reset_worktree_to_base_with_options_for(
     worktree_path: &Path,
     base_branch: &str,
@@ -1187,6 +1192,7 @@ pub(crate) fn prepare_worktree_for_reset(
     Ok(WorktreeResetReason::PreserveFailedForceReset)
 }
 
+#[cfg(test)]
 pub fn reset_worktree_to_base_if_clean(
     worktree_path: &Path,
     base_branch: &str,

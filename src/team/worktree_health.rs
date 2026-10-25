@@ -129,10 +129,11 @@ fn inspect_worktree(
                 .collect::<Vec<_>>()
         })
         .collect();
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     let behind_main = branch.as_ref().and_then(|_| {
         let values = targets
             .iter()
-            .filter_map(|target| behind_main_count(project_root, &target.path))
+            .filter_map(|target| behind_trunk_count(project_root, &target.path, &trunk_branch))
             .collect::<Vec<_>>();
         (!values.is_empty()).then(|| values.into_iter().sum())
     });
@@ -350,9 +351,10 @@ fn find_lock_files(path: &Path) -> Vec<String> {
     locks
 }
 
-fn behind_main_count(project_root: &Path, path: &Path) -> Option<u64> {
+fn behind_trunk_count(project_root: &Path, path: &Path, trunk_branch: &str) -> Option<u64> {
+    let range = format!("HEAD...{trunk_branch}");
     let output = Command::new(git_program())
-        .args(["rev-list", "--left-right", "--count", "HEAD...main"])
+        .args(["rev-list", "--left-right", "--count", &range])
         .current_dir(path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -450,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn behind_main_count_reports_stale_branch() {
+    fn behind_trunk_count_reports_stale_branch() {
         let repo = init_repo();
         assert!(
             Command::new(git_program())
@@ -485,7 +487,10 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        assert_eq!(behind_main_count(repo.path(), repo.path()), Some(1));
+        assert_eq!(
+            behind_trunk_count(repo.path(), repo.path(), "main"),
+            Some(1)
+        );
     }
 
     #[test]
@@ -522,6 +527,9 @@ mod tests {
             registered_multi_repo_worktree_paths(&project_root, &["pkg-a".to_string()]).unwrap();
 
         assert!(registered.contains(&normalized_path(&worktree)));
-        assert_eq!(behind_main_count(&project_root, &worktree), Some(1));
+        assert_eq!(
+            behind_trunk_count(&project_root, &worktree, "main"),
+            Some(1)
+        );
     }
 }

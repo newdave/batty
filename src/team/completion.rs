@@ -214,7 +214,8 @@ fn scope_review_blockers(
         return Ok(Vec::new());
     }
 
-    let changed_files = verification::changed_files_from_main(&worktree_dir)?;
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
+    let changed_files = verification::changed_files_from_trunk(&worktree_dir, &trunk_branch)?;
     let scope = verification::validate_declared_scope(task_text, &changed_files);
     if scope.declared_scope.is_empty() || scope.out_of_scope_files.is_empty() {
         return Ok(Vec::new());
@@ -258,6 +259,7 @@ pub(crate) fn ingest_completion_message(project_root: &Path, message: &str) -> R
         review_blockers.extend(crate::team::task_loop::validate_review_ready_worktree(
             &worktree_path,
             &task_text,
+            &crate::team::config::configured_trunk_branch(project_root),
         )?);
     }
     metadata.review_blockers = review_blockers;

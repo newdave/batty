@@ -149,7 +149,7 @@ pub(crate) fn compute_task_aging_at(
             "in-progress" | "in_progress" => {
                 let age_secs = task_age_from_frontmatter(&task, now, AgeAnchor::Started)?;
                 if age_secs >= thresholds.stale_in_progress_hours.saturating_mul(3600)
-                    && commits_ahead_of_main(project_root, &task)? == 0
+                    && commits_ahead_of_trunk(project_root, &task)? == 0
                 {
                     report.stale_in_progress.push(AgedTask {
                         task_id: task.id,
@@ -661,28 +661,38 @@ fn parse_task_timestamp(value: &str) -> Option<DateTime<Utc>> {
     parse_frontmatter_timestamp_compat(value)
 }
 
-fn commits_ahead_of_main(project_root: &Path, task: &Task) -> Result<u32> {
+fn commits_ahead_of_trunk(project_root: &Path, task: &Task) -> Result<u32> {
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     if let Some(worktree_path) = task.worktree_path.as_deref() {
         let worktree_dir = resolve_task_path(project_root, worktree_path);
         if worktree_dir.is_dir() {
-            return crate::team::git_cmd::rev_list_count(&worktree_dir, "main..HEAD")
-                .map_err(Into::into);
+            return crate::team::git_cmd::rev_list_count(
+                &worktree_dir,
+                &format!("{trunk_branch}..HEAD"),
+            )
+            .map_err(Into::into);
         }
     }
 
     if let Some(owner) = task.claimed_by.as_deref() {
         let worktree_dir = project_root.join(".batty").join("worktrees").join(owner);
         if worktree_dir.is_dir() {
-            return crate::team::git_cmd::rev_list_count(&worktree_dir, "main..HEAD")
-                .map_err(Into::into);
+            return crate::team::git_cmd::rev_list_count(
+                &worktree_dir,
+                &format!("{trunk_branch}..HEAD"),
+            )
+            .map_err(Into::into);
         }
     }
 
     if let Some(branch) = task.branch.as_deref()
         && !branch.is_empty()
     {
-        return crate::team::git_cmd::rev_list_count(project_root, &format!("main..{branch}"))
-            .map_err(Into::into);
+        return crate::team::git_cmd::rev_list_count(
+            project_root,
+            &format!("{trunk_branch}..{branch}"),
+        )
+        .map_err(Into::into);
     }
 
     Ok(0)

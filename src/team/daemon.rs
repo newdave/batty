@@ -46,9 +46,11 @@ use super::status;
 use super::task_cmd;
 #[cfg(test)]
 use super::task_loop::next_unclaimed_task;
+#[cfg(test)]
+use super::task_loop::setup_engineer_worktree;
 use super::task_loop::{
     branch_is_merged_into, current_worktree_branch, engineer_base_branch_name,
-    preserve_worktree_with_commit_for, setup_engineer_worktree,
+    preserve_worktree_with_commit_for, setup_engineer_worktree_from_trunk,
 };
 use super::verification::VerificationState;
 use super::watcher::{SessionWatcher, WatcherState};

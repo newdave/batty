@@ -517,7 +517,8 @@ pub fn purge_inbox(
 /// Merge an engineer's worktree branch.
 pub fn merge_worktree(project_root: &Path, engineer: &str) -> Result<()> {
     let engineer = resolve_member_name(project_root, engineer)?;
-    match merge::merge_engineer_branch(project_root, &engineer)? {
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
+    match merge::merge_engineer_branch_into_trunk(project_root, &engineer, &trunk_branch)? {
         merge::MergeOutcome::Success(_) => Ok(()),
         merge::MergeOutcome::RebaseConflict(stderr) => {
             bail!("merge blocked by rebase conflict: {stderr}")

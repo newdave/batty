@@ -439,6 +439,7 @@ fn branch_consistency_checks(project_root: &Path, tasks: &[&crate::task::Task]) 
         )];
     }
 
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     let mut warnings = Vec::new();
     for task in tasks_with_branch.iter().copied() {
         let branch = task.branch.as_deref().unwrap().trim();
@@ -447,23 +448,25 @@ fn branch_consistency_checks(project_root: &Path, tasks: &[&crate::task::Task]) 
                 CheckLevel::Warn,
                 format!("task #{} declares missing branch '{branch}'", task.id),
             )),
-            Ok(true) => match git_cmd::rev_list_count(project_root, &format!("main..{branch}")) {
-                Ok(0) => warnings.push(check_line(
-                    CheckLevel::Warn,
-                    format!(
-                        "task #{} branch '{branch}' has no commits ahead of main",
-                        task.id
-                    ),
-                )),
-                Ok(_) => {}
-                Err(error) => warnings.push(check_line(
-                    CheckLevel::Warn,
-                    format!(
-                        "task #{} branch '{branch}' could not be compared to main: {error}",
-                        task.id
-                    ),
-                )),
-            },
+            Ok(true) => {
+                match git_cmd::rev_list_count(project_root, &format!("{trunk_branch}..{branch}")) {
+                    Ok(0) => warnings.push(check_line(
+                        CheckLevel::Warn,
+                        format!(
+                            "task #{} branch '{branch}' has no commits ahead of {trunk_branch}",
+                            task.id
+                        ),
+                    )),
+                    Ok(_) => {}
+                    Err(error) => warnings.push(check_line(
+                        CheckLevel::Warn,
+                        format!(
+                            "task #{} branch '{branch}' could not be compared to main: {error}",
+                            task.id
+                        ),
+                    )),
+                }
+            }
             Err(error) => warnings.push(check_line(
                 CheckLevel::Warn,
                 format!("task #{} branch '{branch}' lookup failed: {error}", task.id),

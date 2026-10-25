@@ -240,11 +240,12 @@ impl TeamDaemon {
             }
 
             let base_branch = engineer_base_branch_name(engineer);
-            setup_engineer_worktree(
+            setup_engineer_worktree_from_trunk(
                 &self.config.project_root,
                 &worktree_dir,
                 &base_branch,
                 &team_config_dir,
+                self.config.team_config.trunk_branch(),
             )?;
             let details = format!(
                 "recreated missing worktree for {} at {} from {}",

@@ -1607,9 +1607,14 @@ impl TeamDaemon {
             crate::team::git_cmd::checkout_new_branch(
                 &worktree_dir,
                 &mismatch.expected_branch,
-                "main",
+                self.config.team_config.trunk_branch(),
             )
-            .map_err(|error| anyhow::anyhow!("failed to create expected branch from main: {error}"))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to create expected branch from {}: {error}",
+                    self.config.team_config.trunk_branch()
+                )
+            })
         };
 
         match switch_result {

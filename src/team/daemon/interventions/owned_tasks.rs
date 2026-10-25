@@ -197,7 +197,12 @@ impl TeamDaemon {
         }
 
         worktree_has_user_changes(&worktree_dir).unwrap_or(false)
-            || worktree_commits_ahead_of_main(&worktree_dir).unwrap_or(0) > 0
+            || worktree_commits_ahead_of_trunk(
+                &worktree_dir,
+                self.config.team_config.trunk_branch(),
+            )
+            .unwrap_or(0)
+                > 0
     }
 
     pub(super) fn build_owned_task_intervention_message(
@@ -367,14 +372,18 @@ impl TeamDaemon {
     }
 }
 
-fn worktree_commits_ahead_of_main(worktree_dir: &std::path::Path) -> Result<u32> {
+fn worktree_commits_ahead_of_trunk(
+    worktree_dir: &std::path::Path,
+    trunk_branch: &str,
+) -> Result<u32> {
+    let range = format!("{trunk_branch}..HEAD");
     let output = std::process::Command::new("git")
-        .args(["rev-list", "--count", "main..HEAD"])
+        .args(["rev-list", "--count", &range])
         .current_dir(worktree_dir)
         .output()?;
     if !output.status.success() {
         anyhow::bail!(
-            "failed to count commits ahead of main in {}: {}",
+            "failed to count commits ahead of {trunk_branch} in {}: {}",
             worktree_dir.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
