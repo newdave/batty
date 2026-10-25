@@ -953,6 +953,11 @@ pub struct RoleDef {
     /// Restrict automatic dispatch to tasks explicitly routed to this role.
     #[serde(default)]
     pub on_demand: bool,
+    /// Accept committed documentation-only changes (docs/, *.md and other
+    /// non-code paths) as completion evidence. For documentation roles, whose
+    /// work never touches code; other roles still need a code file changed.
+    #[serde(default)]
+    pub docs_only_evidence: bool,
 }
 
 impl Default for RoleDef {
@@ -981,6 +986,7 @@ impl Default for RoleDef {
             barrier_group: None,
             use_worktrees: false,
             on_demand: false,
+            docs_only_evidence: false,
         }
     }
 }
