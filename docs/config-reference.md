@@ -9,6 +9,7 @@ see [reference/config.md](reference/config.md).
 ```yaml
 name: my-project
 agent: claude
+trunk_branch: main
 workflow_mode: hybrid
 use_shim: true
 use_sdk_mode: true
@@ -159,6 +160,7 @@ roles:
 | ------------------------------------------------- | ---------------------------------------------------------- |
 | `name`                                            | Team/session name                                          |
 | `agent`                                           | Team-wide default backend when a role does not override it |
+| `trunk_branch`                                    | Branch that worktrees start from and merges land on (default `main`) |
 | `workflow_mode`                                   | `legacy`, `hybrid`, or `workflow_first`                    |
 | `use_shim`                                        | Run members through the managed shim runtime               |
 | `use_sdk_mode`                                    | Prefer structured protocols over PTY parsing               |
@@ -167,6 +169,21 @@ roles:
 | `external_senders`                                | Allow non-team sources to message roles                    |
 | `shim_*` and `pending_queue_max_age_secs`         | Runtime health and delivery tuning                         |
 | `event_log_max_bytes` / `retro_min_duration_secs` | Log and retrospective limits                               |
+
+### Merging To An Integration Branch
+
+Repos that protect `main` and require pull requests can point Batty at an
+integration branch instead:
+
+```yaml
+trunk_branch: develop
+```
+
+Engineer worktrees then branch from `develop`, and both the merge queue and
+`batty merge` land completed work on `develop`. Batty does not push or open
+PRs; open a PR from `develop` into `main` on your own schedule. The branch
+must exist locally or as `origin/develop`; when only the remote branch exists,
+`batty start` creates a local tracking branch.
 
 ## `board`
 
