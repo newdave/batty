@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::info;
 
 pub use super::errors::BoardError;
 
@@ -50,7 +50,7 @@ pub fn move_task(
     }
 
     // Restore scheduling fields that kanban-md stripped
-    restore_scheduling_fields(board_dir, task_id, &saved_fields);
+    restore_scheduling_fields(board_dir, task_id, &saved_fields)?;
     Ok(())
 }
 
@@ -93,7 +93,7 @@ pub fn pick_task(
             // Restore scheduling fields for the picked task
             if let Some(ref id) = task_id {
                 if let Some(fields) = saved.get(id.as_str()) {
-                    restore_scheduling_fields(board_dir, id, fields);
+                    restore_scheduling_fields(board_dir, id, fields)?;
                 }
                 if let Ok(parsed_id) = id.parse::<u32>() {
                     let _ = super::task_cmd::annotate_latest_status_activity(
@@ -220,28 +220,37 @@ fn parse_scheduling_fields_from_frontmatter(content: &str) -> Vec<(String, Strin
 }
 
 /// Re-insert scheduling fields into a task file after kanban-md has rewritten it.
-fn restore_scheduling_fields(board_dir: &Path, task_id: &str, fields: &[(String, String)]) {
+fn restore_scheduling_fields(
+    board_dir: &Path,
+    task_id: &str,
+    fields: &[(String, String)],
+) -> Result<(), BoardError> {
     if fields.is_empty() {
-        return;
+        return Ok(());
     }
     let task_path = match find_task_file(board_dir, task_id) {
         Some(path) => path,
-        None => return,
+        None => return Ok(()),
     };
     let content = match std::fs::read_to_string(&task_path) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(error) => {
+            return Err(BoardError::Permanent {
+                message: "failed to read scheduling metadata".into(),
+                stderr: error.to_string(),
+            });
+        }
     };
 
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
-        return;
+        return Ok(());
     }
     let after_open = &trimmed[3..];
     let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
     let close_pos = match after_open.find("\n---") {
         Some(pos) => pos,
-        None => return,
+        None => return Ok(()),
     };
 
     let frontmatter = &after_open[..close_pos];
@@ -263,7 +272,13 @@ fn restore_scheduling_fields(board_dir: &Path, task_id: &str, fields: &[(String,
     updated.push_str("---");
     updated.push_str(body);
 
-    let _ = std::fs::write(&task_path, updated);
+    crate::team::board_write::write_task_file(&task_path, &content, &updated).map_err(|error| {
+        BoardError::Permanent {
+            message: "failed to restore scheduling metadata".into(),
+            stderr: error.to_string(),
+        }
+    })?;
+    Ok(())
 }
 
 /// Snapshot scheduling fields for all tasks in the board (used before pick).
@@ -328,17 +343,35 @@ pub(crate) fn run_board_with_program(
                 );
             }
         }
-        Err(error) => warn!(
-            board = %board_dir.display(),
-            error = %error,
-            "failed to repair malformed task frontmatter before board command"
-        ),
+        Err(error) => {
+            return Err(BoardError::Permanent {
+                message: "failed to repair task frontmatter before board command; mutation refused"
+                    .into(),
+                stderr: error.to_string(),
+            });
+        }
     }
     let current_dir = board_dir
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let command = format_board_command(program, board_dir, args);
+    // kanban-md's create and TUI acquire `.lock` internally; edit/move/pick
+    // do not (0.39.0). Serialize Batty-owned commands with native metadata writes.
+    let board_lock = if board_dir.is_dir()
+        && !matches!(args.first(), Some(&"create" | &"init" | &"board" | &"tui"))
+    {
+        Some(
+            super::board_write::BoardLock::acquire(board_dir).map_err(|error| {
+                BoardError::Transient {
+                    message: "failed to acquire board lock".into(),
+                    stderr: error.to_string(),
+                }
+            })?,
+        )
+    } else {
+        None
+    };
     let output = Command::new(program)
         .current_dir(current_dir)
         .args(build_board_args(board_dir, args))
@@ -348,6 +381,12 @@ pub(crate) fn run_board_with_program(
             source,
         })?;
 
+    if let Some(lock) = board_lock {
+        lock.release().map_err(|error| BoardError::Permanent {
+            message: "failed to release board lock".into(),
+            stderr: error.to_string(),
+        })?;
+    }
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if output.status.success() {
@@ -1047,11 +1086,11 @@ mod tests {
         assert_eq!(fields.len(), 3);
 
         // Simulate kanban-md stripping the fields
-        let stripped = "---\nid: 5\ntitle: recurring\nstatus: in-progress\nclaimed_by: eng-1-2\n---\n\nTask body.\n";
+        let stripped = "---\nid: 5\ntitle: recurring\nstatus: in-progress\n---\n\nTask body.\n";
         fs::write(tasks_dir.join("005-recurring.md"), stripped).unwrap();
 
         // Restore fields
-        restore_scheduling_fields(temp.path(), "5", &fields);
+        restore_scheduling_fields(temp.path(), "5", &fields).unwrap();
 
         // Verify the fields are back
         let result = fs::read_to_string(tasks_dir.join("005-recurring.md")).unwrap();
@@ -1060,7 +1099,6 @@ mod tests {
         assert!(result.contains("cron_last_run: 2026-03-21T09:00:00Z"));
         // And the new status is preserved
         assert!(result.contains("status: in-progress"));
-        assert!(result.contains("claimed_by: eng-1-2"));
     }
 
     #[test]
@@ -1072,7 +1110,7 @@ mod tests {
         let content = "---\nid: 1\ntitle: test\nstatus: done\n---\n\nBody.\n";
         fs::write(tasks_dir.join("001-test.md"), content).unwrap();
 
-        restore_scheduling_fields(temp.path(), "1", &[]);
+        restore_scheduling_fields(temp.path(), "1", &[]).unwrap();
 
         let result = fs::read_to_string(tasks_dir.join("001-test.md")).unwrap();
         assert_eq!(result, content);
@@ -1089,7 +1127,8 @@ mod tests {
             temp.path(),
             "99",
             &[("cron_schedule".to_string(), "0 9 * * *".to_string())],
-        );
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1199,7 +1238,7 @@ mod tests {
                 assert!(!after.contains("cron_schedule"));
 
                 // Restore them
-                restore_scheduling_fields(&board_dir, &task_id, &saved);
+                restore_scheduling_fields(&board_dir, &task_id, &saved).unwrap();
 
                 // Now they're back
                 let restored = fs::read_to_string(&task_file).unwrap();
@@ -1209,5 +1248,24 @@ mod tests {
                 assert!(restored.contains("status: in-progress"));
             }
         });
+    }
+    #[test]
+    fn restore_claimed_standalone_task_under_sibling_lock() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("tasks")).unwrap();
+        let file = tmp.path().join("tasks/001-task.md");
+        let before = "---\nid: 1\ntitle: Synthetic task\nstatus: todo\npriority: medium\nclaimed_by: role-a\n---\nbody\n";
+        fs::write(&file, before).unwrap();
+        let result = restore_scheduling_fields(
+            tmp.path(),
+            "1",
+            &[("scheduled_for".into(), "2030-01-01".into())],
+        );
+        result.unwrap();
+        assert!(
+            fs::read_to_string(file)
+                .unwrap()
+                .contains("scheduled_for: 2030-01-01")
+        );
     }
 }
