@@ -236,7 +236,7 @@ pub(crate) fn write_workflow_metadata(task_path: &Path, metadata: &WorkflowMetad
     updated.push_str("---\n");
     updated.push_str(body);
 
-    std::fs::write(task_path, updated)
+    crate::team::board_write::write_task_file(task_path, &content, &updated)
         .with_context(|| format!("failed to write {}", task_path.display()))?;
     Ok(())
 }
@@ -516,7 +516,7 @@ fn update_task_status(task_path: &Path, new_status: &str) -> Result<()> {
     updated.push_str("---\n");
     updated.push_str(body);
 
-    std::fs::write(task_path, updated)
+    crate::team::board_write::write_task_file(task_path, &content, &updated)
         .with_context(|| format!("failed to write {}", task_path.display()))?;
     Ok(())
 }
@@ -974,7 +974,7 @@ mod tests {
         let task = tmp.path().join("027-task.md");
         std::fs::write(
             &task,
-            "---\nid: 27\ntitle: Completion packets\nstatus: review\npriority: medium\nclaimed_by: eng-1-4\nclass: standard\n---\n\nTask body.\n",
+            "---\nid: 27\ntitle: Completion packets\nstatus: review\npriority: medium\nclass: standard\n---\n\nTask body.\n",
         )
         .unwrap();
 
@@ -1006,7 +1006,7 @@ mod tests {
         write_workflow_metadata(&task, &metadata).unwrap();
 
         let content = std::fs::read_to_string(&task).unwrap();
-        assert!(content.contains("claimed_by: eng-1-4"));
+        assert!(content.contains("title: Completion packets"));
         assert!(content.contains("branch: eng-1-4/task-27"));
         assert!(content.contains("tests_run: true"));
         assert!(content.contains("tests_passed: true"));
@@ -1669,5 +1669,20 @@ mod tests {
         assert_eq!(report.stale_in_progress.len(), 1);
         assert_eq!(report.aged_todo.len(), 1);
         assert_eq!(report.stale_review.len(), 1);
+    }
+    #[test]
+    fn workflow_metadata_updates_claimed_standalone_under_sibling_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("task.md");
+        let before = "---\nid: 1\nclaimed_by: role-a\n---\nbody\n";
+        std::fs::write(&file, before).unwrap();
+        let metadata = WorkflowMetadata {
+            branch: Some("topic".into()),
+            ..Default::default()
+        };
+        write_workflow_metadata(&file, &metadata).unwrap();
+        let after = std::fs::read_to_string(file).unwrap();
+        assert!(after.contains("branch: topic"));
+        assert!(after.contains("claimed_by: role-a"));
     }
 }

@@ -12,6 +12,7 @@ pub mod auto_merge;
 mod behavioral_tests;
 pub mod bench;
 pub mod board;
+pub(crate) mod board_write;
 #[allow(dead_code)]
 pub mod board_reconciliation;
 #[cfg(test)]
