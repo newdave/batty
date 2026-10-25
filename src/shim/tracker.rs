@@ -124,6 +124,9 @@ impl SessionTracker {
     }
 
     fn maybe_rebind(&mut self) -> Result<()> {
+        if self.agent_type == AgentType::Claude && self.session_id.is_some() {
+            return Ok(());
+        }
         let Some(ref current) = self.session_file else {
             return Ok(());
         };

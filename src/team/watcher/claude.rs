@@ -138,6 +138,9 @@ pub(super) fn poll_claude_session(tracker: &mut ClaudeSessionTracker) -> Result<
 }
 
 fn maybe_rebind_claude_session_file(tracker: &mut ClaudeSessionTracker) -> Result<()> {
+    if tracker.session_id.is_some() {
+        return Ok(());
+    }
     let Some(current_file) = tracker.session_file.clone() else {
         return Ok(());
     };
@@ -394,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_tracker_rebinds_to_newer_session_file_after_manual_resume() {
+    fn claude_tracker_does_not_steal_a_pinned_session() {
         let tmp = tempfile::tempdir().unwrap();
         let projects_root = tmp.path().join("projects");
         let cwd = tmp
@@ -433,13 +436,13 @@ mod tests {
 
         assert_eq!(
             poll_claude_session(&mut tracker).unwrap(),
-            TrackerState::Unknown
+            TrackerState::Idle
         );
-        assert_eq!(tracker.session_file.as_deref(), Some(new_session.as_path()));
+        assert_eq!(tracker.session_file.as_deref(), Some(old_session.as_path()));
         assert_eq!(
             tracker.session_id.as_deref(),
-            Some("22222222-2222-4222-8222-222222222222")
+            Some("11111111-1111-4111-8111-111111111111")
         );
-        assert_eq!(tracker.offset, current_file_len(&new_session).unwrap());
+        assert_eq!(tracker.offset, current_file_len(&old_session).unwrap());
     }
 }
