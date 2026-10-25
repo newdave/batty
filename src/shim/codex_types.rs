@@ -30,13 +30,15 @@ pub struct CodexEvent {
     // turn.failed / error
     #[serde(default)]
     pub error: Option<CodexError>,
+    #[serde(default)]
+    pub message: Option<String>,
 
     // item.started / item.updated / item.completed
     #[serde(default)]
     pub item: Option<CodexItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CodexUsage {
     #[serde(default)]
     pub input_tokens: i64,
@@ -44,6 +46,26 @@ pub struct CodexUsage {
     pub cached_input_tokens: i64,
     #[serde(default)]
     pub output_tokens: i64,
+}
+
+impl CodexEvent {
+    pub fn error_message(&self) -> Option<&str> {
+        self.error
+            .as_ref()
+            .map(|error| error.message.as_str())
+            .or(self.message.as_deref())
+    }
+}
+
+impl CodexUsage {
+    pub fn merge_snapshot(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.max(other.input_tokens).max(0);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .max(other.cached_input_tokens)
+            .max(0);
+        self.output_tokens = self.output_tokens.max(other.output_tokens).max(0);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,5 +307,22 @@ mod tests {
                 "-"
             ]
         );
+    }
+    #[test]
+    fn token_snapshots_are_deduplicated_and_cache_tokens_remain_a_subset() {
+        let mut usage = CodexUsage::default();
+        let snapshot = CodexUsage {
+            input_tokens: 10,
+            cached_input_tokens: 8,
+            output_tokens: 3,
+        };
+        usage.merge_snapshot(&snapshot);
+        usage.merge_snapshot(&snapshot);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 8);
+        assert_eq!(usage.output_tokens, 3);
+        let error: CodexEvent =
+            serde_json::from_str(r#"{"type":"error","message":"refresh token expired"}"#).unwrap();
+        assert_eq!(error.error_message(), Some("refresh token expired"));
     }
 }

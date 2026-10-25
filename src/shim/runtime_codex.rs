@@ -56,6 +56,9 @@ struct CodexState {
     message_queue: VecDeque<QueuedMessage>,
     /// Total bytes of response text received.
     cumulative_output_bytes: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    active_child: Option<Arc<Mutex<Child>>>,
     /// The codex binary name/path.
     program: String,
     /// Working directory for spawning subprocesses.
@@ -92,6 +95,9 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
         pending_message_id: None,
         message_queue: VecDeque::new(),
         cumulative_output_bytes: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        active_child: None,
         program: "codex".to_string(),
         cwd: args.cwd.clone(),
         context_approaching_emitted: false,
@@ -126,6 +132,8 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                 return;
             }
             let output_bytes = st.cumulative_output_bytes;
+            let input_tokens = st.input_tokens;
+            let output_tokens = st.output_tokens;
             let uptime_secs = st.started_at.elapsed().as_secs();
             drop(st);
 
@@ -133,8 +141,8 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                 .send(&Event::SessionStats {
                     output_bytes,
                     uptime_secs,
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens,
+                    output_tokens,
                     context_usage_pct: None,
                 })
                 .is_err()
@@ -333,6 +341,7 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                     "[shim-codex {shim_id}] shutdown requested ({})",
                     reason.label()
                 );
+                stop_codex_exec(&state_cmd);
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
                     eprintln!(
                         "[shim-codex {shim_id}] failed to preserve work before shutdown: {error:#}"
@@ -346,6 +355,7 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
             }
 
             ShimCommand::Kill => {
+                stop_codex_exec(&state_cmd);
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
                     eprintln!(
                         "[shim-codex {shim_id}] failed to preserve work before kill: {error:#}"
@@ -360,6 +370,7 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
         }
     }
 
+    stop_codex_exec(&state_cmd);
     Ok(())
 }
 
@@ -381,17 +392,27 @@ fn run_codex_exec(
     pty_log: Option<&Arc<Mutex<PtyLogWriter>>>,
 ) {
     // Spawn the subprocess
-    let mut child = match Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_remove("CLAUDECODE")
-        .spawn()
+        .env_remove("CLAUDECODE");
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut start_guard = state.lock().unwrap();
+    if start_guard.state == ShimState::Dead {
+        return;
+    }
+    let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
+            drop(start_guard);
             eprintln!("[shim-codex {shim_id}] failed to spawn codex exec: {e}");
             let mut st = state.lock().unwrap();
             let msg_id = st.pending_message_id.take();
@@ -407,26 +428,35 @@ fn run_codex_exec(
                 to: ShimState::Idle,
                 summary: format!("spawn failed: {e}"),
             });
-            let _ = evt_channel.send(&Event::Completion {
-                message_id: msg_id,
-                response: String::new(),
-                last_lines: format!("spawn failed: {e}"),
-            });
+            if let Some(id) = msg_id {
+                let _ = evt_channel.send(&Event::DeliveryFailed {
+                    id,
+                    reason: "Codex process could not start".into(),
+                });
+            }
             return;
         }
     };
 
-    let child_pid = child.id();
+    let child = Arc::new(Mutex::new(child));
+    start_guard.active_child = Some(Arc::clone(&child));
+    drop(start_guard);
+    let _execution = CodexExecGuard {
+        child: Arc::clone(&child),
+        state: Arc::clone(state),
+    };
+    let child_pid = child.lock().unwrap().id();
     eprintln!("[shim-codex {shim_id}] codex exec spawned (pid {child_pid})");
 
-    if let Some(mut stdin) = child.stdin.take() {
+    let stdin = child.lock().unwrap().stdin.take();
+    if let Some(mut stdin) = stdin {
         if let Err(e) = stdin.write_all(prompt.as_bytes()) {
             eprintln!("[shim-codex {shim_id}] failed to write prompt to stdin: {e}");
         }
     }
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child.lock().unwrap().stdout.take().unwrap();
+    let stderr = child.lock().unwrap().stderr.take().unwrap();
 
     // stderr reader (log only). Non-recoverable auth failures are detected
     // in the structured `turn.failed` / `error` events below — the codex
@@ -451,6 +481,9 @@ fn run_codex_exec(
             }
         }
     });
+
+    let mut turn_usage = super::codex_types::CodexUsage::default();
+    let mut turn_completed = false;
 
     // stdout JSONL reader
     let reader = BufReader::new(stdout);
@@ -496,8 +529,6 @@ fn run_codex_exec(
                 }
                 // The reader must not wait indefinitely for a terminally
                 // misconfigured provider process that leaves stdout open.
-                let _ = child.kill();
-                let _ = child.wait();
                 return;
             }
         }
@@ -529,8 +560,6 @@ fn run_codex_exec(
                             message: "Codex thread identity changed unexpectedly".into(),
                             code: Some("thread_identity_mismatch".into()),
                         });
-                        let _ = child.kill();
-                        let _ = child.wait();
                         return;
                     }
                     st.thread_id = Some(tid.clone());
@@ -585,11 +614,7 @@ fn run_codex_exec(
             }
 
             "turn.failed" => {
-                let error_msg = evt
-                    .error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_else(|| "unknown error".to_string());
+                let error_msg = evt.error_message().unwrap_or("unknown error").to_string();
                 eprintln!("[shim-codex {shim_id}] turn failed: {error_msg}");
 
                 // Non-recoverable auth failure: the codex refresh token has
@@ -608,7 +633,6 @@ fn run_codex_exec(
                     for event in drain {
                         let _ = evt_channel.send(&event);
                     }
-                    let _ = child.wait();
                     return;
                 }
 
@@ -654,17 +678,12 @@ fn run_codex_exec(
                     for event in drain {
                         let _ = evt_channel.send(&event);
                     }
-                    let _ = child.wait();
                     return;
                 }
             }
 
             "error" => {
-                let error_msg = evt
-                    .error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_else(|| "stream error".to_string());
+                let error_msg = evt.error_message().unwrap_or("stream error").to_string();
                 eprintln!("[shim-codex {shim_id}] error event: {error_msg}");
 
                 // Non-recoverable auth failure short-circuits before quota
@@ -682,7 +701,6 @@ fn run_codex_exec(
                     for event in drain {
                         let _ = evt_channel.send(&event);
                     }
-                    let _ = child.wait();
                     return;
                 }
 
@@ -712,23 +730,83 @@ fn run_codex_exec(
                         for event in drain {
                             let _ = evt_channel.send(&event);
                         }
-                        let _ = child.wait();
                         return;
                     }
                 }
             }
 
-            // turn.started, turn.completed, item.started — informational, no action
+            "turn.completed" => {
+                turn_completed = true;
+                if let Some(usage) = evt.usage {
+                    turn_usage.merge_snapshot(&usage);
+                }
+            }
+            // turn.started and item.started are informational.
             _ => {}
         }
     }
 
-    // stdout closed — subprocess finished. Wait for exit.
-    let exit_code = child.wait().ok().and_then(|s| s.code());
-    eprintln!("[shim-codex {shim_id}] codex exec exited (code: {exit_code:?})");
+    // Poll without holding the child mutex across a blocking wait, so shutdown
+    // can terminate the process even if it closed stdout before exiting.
+    let exit_status = loop {
+        match child.lock().unwrap().try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Err(_) => break None,
+            Ok(None) => {}
+        }
+        if state.lock().unwrap().state == ShimState::Dead {
+            return;
+        }
+        thread::sleep(Duration::from_millis(PROCESS_EXIT_POLL_MS));
+    };
+    {
+        let mut st = state.lock().unwrap();
+        st.input_tokens = st
+            .input_tokens
+            .saturating_add(turn_usage.input_tokens.max(0) as u64);
+        st.output_tokens = st
+            .output_tokens
+            .saturating_add(turn_usage.output_tokens.max(0) as u64);
+        if st.state == ShimState::Dead {
+            return;
+        }
+        if !exit_status.is_some_and(|status| status.success()) || !turn_completed {
+            let message_id = st.pending_message_id.take();
+            st.message_queue.clear();
+            st.state = ShimState::Idle;
+            st.state_changed_at = Instant::now();
+            drop(st);
+            let _ = evt_channel.send(&Event::Error {
+                command: "CodexExec".into(),
+                reason: "Codex did not complete its turn successfully".into(),
+            });
+            if let Some(id) = message_id {
+                let _ = evt_channel.send(&Event::DeliveryFailed {
+                    id,
+                    reason: "Codex turn failed".into(),
+                });
+            }
+            let _ = evt_channel.send(&Event::StateChanged {
+                from: ShimState::Working,
+                to: ShimState::Idle,
+                summary: "Codex turn failed".into(),
+            });
+            return;
+        }
+        let _ = evt_channel.send(&Event::SessionStats {
+            output_bytes: st.cumulative_output_bytes,
+            uptime_secs: st.started_at.elapsed().as_secs(),
+            input_tokens: st.input_tokens,
+            output_tokens: st.output_tokens,
+            context_usage_pct: None,
+        });
+    }
 
     // Transition Working → Idle, emit Completion
     let mut st = state.lock().unwrap();
+    if st.state == ShimState::Dead {
+        return;
+    }
     let response = std::mem::take(&mut st.accumulated_response);
     let last_lines = last_n_lines_of(&response, 5);
     let msg_id = st.pending_message_id.take();
@@ -937,14 +1015,48 @@ fn current_unix_secs() -> u64 {
 // Helpers
 // ---------------------------------------------------------------------------
 
+struct CodexExecGuard {
+    child: Arc<Mutex<Child>>,
+    state: Arc<Mutex<CodexState>>,
+}
+impl Drop for CodexExecGuard {
+    fn drop(&mut self) {
+        let mut st = self.state.lock().unwrap();
+        if st
+            .active_child
+            .as_ref()
+            .is_some_and(|child| Arc::ptr_eq(child, &self.child))
+        {
+            st.active_child = None;
+        }
+        drop(st);
+        terminate_child(&mut self.child.lock().unwrap());
+    }
+}
+fn stop_codex_exec(state: &Arc<Mutex<CodexState>>) {
+    let child = {
+        let mut st = state.lock().unwrap();
+        st.state = ShimState::Dead;
+        st.state_changed_at = Instant::now();
+        st.message_queue.clear();
+        st.active_child.take()
+    };
+    if let Some(child) = child {
+        terminate_child(&mut child.lock().unwrap());
+    }
+}
+
 /// Terminate a child process: SIGTERM, grace period, then SIGKILL.
 #[allow(dead_code)]
 fn terminate_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
     let pid = child.id();
     #[cfg(unix)]
     {
         unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+            libc::kill(-(pid as i32), libc::SIGTERM);
         }
         let deadline = Instant::now() + Duration::from_secs(GROUP_TERM_GRACE_SECS);
         loop {
@@ -957,7 +1069,7 @@ fn terminate_child(child: &mut Child) {
             }
         }
         unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
+            libc::kill(-(pid as i32), libc::SIGKILL);
         }
     }
     #[allow(unreachable_code)]
@@ -1001,6 +1113,9 @@ mod tests {
             pending_message_id: None,
             message_queue: VecDeque::new(),
             cumulative_output_bytes: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            active_child: None,
             program: "codex".into(),
             cwd: std::path::PathBuf::from("/tmp"),
             context_approaching_emitted: false,
@@ -1090,7 +1205,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let program = tmp.path().join("fake-codex");
-        std::fs::write(&program,format!("#!/bin/sh\n/bin/cat > /dev/null\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"{id}\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"done\"}}}}'\n")).unwrap();
+        std::fs::write(&program,format!("#!/bin/sh\n/bin/cat > /dev/null\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"{id}\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"done\"}}}}' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":10,\"cached_input_tokens\":8,\"output_tokens\":3}}}}'\n")).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = Arc::new(Mutex::new(CodexState {
             state: ShimState::Working,
@@ -1102,6 +1217,9 @@ mod tests {
             pending_message_id: Some("message-1".into()),
             message_queue: VecDeque::new(),
             cumulative_output_bytes: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            active_child: None,
             program: program.to_string_lossy().into(),
             cwd: tmp.path().into(),
             context_approaching_emitted: false,
@@ -1124,6 +1242,9 @@ mod tests {
             &mut child,
             None,
         );
+        assert_eq!(state.lock().unwrap().input_tokens, 10);
+        assert_eq!(state.lock().unwrap().output_tokens, 3);
+        assert!(state.lock().unwrap().active_child.is_none());
         assert_eq!(
             state.lock().unwrap().thread_id.as_deref(),
             Some(id.as_str())
@@ -1138,5 +1259,87 @@ mod tests {
         assert!(
             matches!(parent.recv::<Event>().unwrap().unwrap(),Event::SessionStarted{session_id} if session_id==id)
         );
+    }
+    fn fake_working_state(cwd: &std::path::Path) -> Arc<Mutex<CodexState>> {
+        Arc::new(Mutex::new(CodexState {
+            state: ShimState::Working,
+            state_changed_at: Instant::now(),
+            started_at: Instant::now(),
+            thread_id: None,
+            launch_context: Default::default(),
+            accumulated_response: String::new(),
+            pending_message_id: Some("message-1".into()),
+            message_queue: VecDeque::new(),
+            cumulative_output_bytes: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            active_child: None,
+            program: "/bin/false".into(),
+            cwd: cwd.into(),
+            context_approaching_emitted: false,
+            quota_blocked_until: None,
+            configuration_error: None,
+        }))
+    }
+
+    #[test]
+    fn failed_codex_process_is_not_reported_as_a_completed_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_working_state(tmp.path());
+        let (parent, child) = protocol::socketpair().unwrap();
+        let mut parent = protocol::Channel::new(parent);
+        parent
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut child = protocol::Channel::new(child);
+        run_codex_exec(
+            "worker",
+            "/bin/false",
+            &[],
+            "task",
+            tmp.path(),
+            &state,
+            &mut child,
+            None,
+        );
+        let mut failure = false;
+        for _ in 0..3 {
+            let event = parent.recv::<Event>().unwrap().unwrap();
+            assert!(!matches!(event, Event::Completion { .. }));
+            failure |= matches!(event, Event::DeliveryFailed { .. });
+        }
+        assert!(failure);
+        assert!(state.lock().unwrap().active_child.is_none());
+    }
+
+    #[test]
+    fn shutdown_terminates_the_owned_exec_and_discards_queued_work() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = fake_working_state(tmp.path());
+        let child = Arc::new(Mutex::new(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        ));
+        {
+            let mut st = state.lock().unwrap();
+            st.active_child = Some(Arc::clone(&child));
+            st.message_queue.push_back(QueuedMessage {
+                from: "manager".into(),
+                body: "queued".into(),
+                message_id: None,
+            });
+        }
+        let started = Instant::now();
+        stop_codex_exec(&state);
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(child.lock().unwrap().try_wait().unwrap().is_some());
+        let st = state.lock().unwrap();
+        assert_eq!(st.state, ShimState::Dead);
+        assert!(st.message_queue.is_empty());
+        assert!(st.active_child.is_none());
     }
 }

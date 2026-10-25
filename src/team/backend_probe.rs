@@ -37,7 +37,15 @@ pub fn command(options: &AgentOptions) -> Result<(String, Vec<String>)> {
             "claude"
         }
         Some("codex" | "codex-cli") => {
-            args = vec!["exec".into(), "--json".into()];
+            args = vec![
+                "exec".into(),
+                "--json".into(),
+                "--ephemeral".into(),
+                "--sandbox".into(),
+                "read-only".into(),
+                "-c".into(),
+                "approval_policy=\"never\"".into(),
+            ];
             if let Some(model) = &options.model {
                 args.extend(["--model".into(), model.clone()]);
             }
@@ -192,5 +200,15 @@ mod tests {
             args.iter()
                 .any(|a| a.starts_with("model_reasoning_effort=\"high\\\""))
         );
+    }
+    #[test]
+    fn codex_probe_is_ephemeral_and_read_only() {
+        let (_, args) = command(&options("codex")).unwrap();
+        assert!(args.iter().any(|arg| arg == "--ephemeral"));
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--sandbox", "read-only"])
+        );
+        assert!(args.iter().any(|arg| arg == "approval_policy=\"never\""));
     }
 }
