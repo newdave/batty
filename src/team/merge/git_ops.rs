@@ -43,7 +43,7 @@ pub(crate) fn describe_git_failure(
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn commits_ahead_of_main(worktree_dir: &Path) -> Result<u32> {
     commits_ahead_of_trunk(worktree_dir, "main")
 }
@@ -82,7 +82,7 @@ pub(crate) fn commits_ahead_of_trunk(worktree_dir: &Path, trunk_branch: &str) ->
 
 /// Return the diff stat between main and HEAD using `git diff --stat main..HEAD`.
 /// An empty string means the branch has no material file changes relative to main.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn diff_stat_from_main(worktree_dir: &Path) -> Result<String> {
     diff_stat_from_trunk(worktree_dir, "main")
 }
@@ -215,7 +215,7 @@ pub(crate) fn is_non_code_path(path: &Path) -> bool {
 }
 
 /// Count files changed between main and HEAD.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn files_changed_from_main(worktree_dir: &Path) -> Result<u32> {
     files_changed_from_trunk(worktree_dir, "main")
 }
@@ -225,7 +225,7 @@ pub(crate) fn files_changed_from_trunk(worktree_dir: &Path, trunk_branch: &str) 
 }
 
 /// Count code-relevant files changed between main and HEAD.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn code_files_changed_from_main(worktree_dir: &Path) -> Result<u32> {
     code_files_changed_from_trunk(worktree_dir, "main")
 }

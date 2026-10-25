@@ -417,7 +417,11 @@ impl TeamDaemon {
         let threshold = Duration::from_secs(threshold_secs);
 
         let main_activity = [
-            git_dir.join("logs").join("refs").join("heads").join("main"),
+            git_dir
+                .join("logs")
+                .join("refs")
+                .join("heads")
+                .join(self.config.team_config.trunk_branch()),
             git_dir.join("CHERRY_PICK_HEAD"),
             git_dir.join("MERGE_HEAD"),
             git_dir.join("REBASE_HEAD"),

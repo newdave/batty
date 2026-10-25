@@ -120,6 +120,7 @@ fn is_batty_managed_runtime_path(path: &str) -> bool {
         || path.starts_with("target/")
 }
 
+#[cfg(test)]
 pub(crate) fn merge_engineer_branch(
     project_root: &Path,
     engineer_name: &str,
@@ -544,7 +545,7 @@ fn read_conflict_stage(worktree_dir: &Path, stage: u8, path: &str) -> Option<Str
     String::from_utf8(output.stdout).ok()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn reset_engineer_worktree(project_root: &Path, engineer_name: &str) -> Result<()> {
     reset_engineer_worktree_to_trunk(project_root, engineer_name, "main")
 }

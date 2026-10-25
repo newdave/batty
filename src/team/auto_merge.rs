@@ -425,7 +425,7 @@ pub fn evaluate_auto_merge_candidate(
     }
 
     if summary.has_conflicts {
-        reasons.push("conflicts with main".to_string());
+        reasons.push("conflicts with trunk".to_string());
     }
 
     if confidence < policy.confidence_threshold {

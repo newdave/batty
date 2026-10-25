@@ -230,9 +230,11 @@ pub(crate) fn shared_cargo_target_dir(project_root: &Path) -> PathBuf {
 pub(crate) fn validate_review_ready_worktree(
     worktree_dir: &Path,
     task_text: &str,
+    trunk_branch: &str,
 ) -> Result<Vec<String>> {
+    let range = format!("{trunk_branch}..HEAD");
     let diff = map_git_error(
-        retry_git(|| git_cmd::run_git(worktree_dir, &["diff", "--stat", "main..HEAD"])),
+        retry_git(|| git_cmd::run_git(worktree_dir, &["diff", "--stat", &range])),
         "failed to inspect engineer branch diff",
     )?;
     let declared_scope = crate::team::daemon::verification::parse_scope_fence(task_text);
@@ -364,6 +366,7 @@ pub(crate) fn read_task_title(board_dir: &Path, task_id: u32) -> String {
 }
 
 /// Set up a git worktree for an engineer with symlinked shared config.
+#[cfg(test)]
 pub(crate) fn setup_engineer_worktree(
     project_root: &Path,
     worktree_dir: &Path,
@@ -423,7 +426,7 @@ pub(crate) fn setup_engineer_worktree_from_trunk(
     Ok(worktree_dir.to_path_buf())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn prepare_engineer_assignment_worktree(
     project_root: &Path,
     worktree_dir: &Path,
@@ -515,6 +518,7 @@ pub(crate) fn prepare_engineer_assignment_worktree_from_trunk(
 /// Set up worktrees for a multi-repo project. Creates one git worktree per
 /// sub-repo inside `worktree_dir`, mirroring the original directory layout.
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn setup_multi_repo_worktree(
     project_root: &Path,
     worktree_dir: &Path,
@@ -562,6 +566,7 @@ pub(crate) fn setup_multi_repo_worktree_from_trunk(
 /// Prepare worktrees for a multi-repo task assignment. Creates task branches
 /// in every sub-repo so the engineer can work across all of them.
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn prepare_multi_repo_assignment_worktree(
     project_root: &Path,
     worktree_dir: &Path,
@@ -610,10 +615,6 @@ pub(crate) fn prepare_multi_repo_assignment_worktree_from_trunk(
     Ok(worktree_dir.to_path_buf())
 }
 
-pub(crate) fn worktree_commits_behind_main(worktree_dir: &Path) -> Result<u32> {
-    worktree_commits_behind_trunk(worktree_dir, "main")
-}
-
 pub(crate) fn worktree_commits_behind_trunk(
     worktree_dir: &Path,
     trunk_branch: &str,
@@ -644,6 +645,7 @@ pub(crate) fn worktree_commits_behind_trunk(
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn refresh_engineer_worktree_if_stale(
     project_root: &Path,
     worktree_dir: &Path,
@@ -717,6 +719,7 @@ fn ensure_engineer_worktree_health(
 }
 
 #[allow(dead_code)] // Retained for existing tests and as a lower-level helper.
+#[cfg(test)]
 pub(crate) fn refresh_engineer_worktree(
     project_root: &Path,
     worktree_dir: &Path,
@@ -1575,14 +1578,16 @@ pub(crate) fn quarantine_completed_lane_for_recovery(
     timeout: Duration,
 ) -> Result<Option<crate::team::checkpoint::PreservedLaneRecord>> {
     let base_branch = engineer_base_branch_name(engineer_name);
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     if !worktree_has_user_changes(worktree_dir)? {
-        let reset_reason = crate::worktree::reset_worktree_to_base_with_options_for(
+        let reset_reason = crate::worktree::reset_worktree_to_base_with_options_for_trunk(
             worktree_dir,
             &base_branch,
             &format!("wip: preserve completed task #{} before recovery", task.id),
             timeout,
             crate::worktree::PreserveFailureMode::SkipReset,
             "completed-task branch recovery",
+            &trunk_branch,
         )?;
         if !reset_reason.reset_performed() {
             bail!(
@@ -1628,13 +1633,14 @@ pub(crate) fn quarantine_completed_lane_for_recovery(
             );
             crate::team::checkpoint::write_preserved_lane_record(project_root, &record)?;
 
-            let reset_reason = crate::worktree::reset_worktree_to_base_with_options_for(
+            let reset_reason = crate::worktree::reset_worktree_to_base_with_options_for_trunk(
                 worktree_dir,
                 &base_branch,
                 &commit_message,
                 timeout,
                 crate::worktree::PreserveFailureMode::SkipReset,
                 "completed-task branch recovery",
+                &trunk_branch,
             )?;
             if !reset_reason.reset_performed() {
                 bail!(
@@ -1689,8 +1695,14 @@ pub(crate) fn quarantine_completed_lane_for_recovery(
                     snapshot_relative
                 ),
             )?;
-            setup_engineer_worktree(project_root, worktree_dir, &base_branch, team_config_dir)
-                .with_context(|| {
+            setup_engineer_worktree_from_trunk(
+                project_root,
+                worktree_dir,
+                &base_branch,
+                team_config_dir,
+                &trunk_branch,
+            )
+            .with_context(|| {
                     format!(
                         "failed to recreate clean engineer worktree after saving completed lane snapshot '{}'",
                         snapshot_relative
@@ -1788,7 +1800,7 @@ pub(crate) fn current_worktree_branch(worktree_dir: &Path) -> Result<String> {
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn checkout_worktree_branch_from_main(
     worktree_dir: &Path,
     branch_name: &str,
@@ -1859,6 +1871,7 @@ pub(crate) fn branch_is_merged_into(
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn engineer_worktree_ready_for_dispatch(
     project_root: &Path,
     worktree_dir: &Path,

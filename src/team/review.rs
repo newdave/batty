@@ -165,7 +165,7 @@ pub fn validate_review_candidate(
     project_root: &Path,
     meta: &WorkflowMeta,
 ) -> anyhow::Result<ReviewEligibility> {
-    let trunk_branch = configured_trunk_branch(project_root);
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     validate_review_candidate_from_trunk(project_root, meta, &trunk_branch)
 }
 
@@ -237,7 +237,7 @@ pub(crate) fn classify_review_task(
     task: &Task,
     board_tasks: &[Task],
 ) -> ReviewQueueState {
-    let trunk_branch = configured_trunk_branch(project_root);
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     classify_review_task_from_trunk(project_root, task, board_tasks, &trunk_branch)
 }
 
@@ -315,14 +315,8 @@ pub(crate) fn assess_review_merge_remediation(
     project_root: &Path,
     task: &Task,
 ) -> ReviewMergeRemediation {
-    let trunk_branch = configured_trunk_branch(project_root);
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     assess_review_merge_remediation_from_trunk(project_root, task, &trunk_branch)
-}
-
-fn configured_trunk_branch(project_root: &Path) -> String {
-    crate::team::config::TeamConfig::load(&crate::team::team_config_path(project_root))
-        .map(|config| config.trunk_branch().to_string())
-        .unwrap_or_else(|_| crate::team::config::default_trunk_branch())
 }
 
 pub(crate) fn assess_review_merge_remediation_from_trunk(

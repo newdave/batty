@@ -12,7 +12,7 @@ use crate::team::board::{WorkflowMetadata, read_workflow_metadata};
 use crate::team::daemon::verification::run_automatic_verification;
 use crate::team::merge::{
     MergeLock, MergeMode, MergeOutcome, RootDirtyState, infer_merge_mode_from_failure,
-    inspect_root_dirty_state, merge_engineer_branch,
+    inspect_root_dirty_state, merge_engineer_branch_into_trunk,
 };
 use crate::team::task_loop::{current_worktree_branch, read_task_title};
 
@@ -212,6 +212,7 @@ impl TeamDaemon {
     }
 
     fn execute_queued_merge(&mut self, request: &MergeRequest) -> Result<MergeQueueOutcome> {
+        let trunk_branch = self.config.team_config.trunk_branch().to_string();
         if self.is_multi_repo {
             bail!("merge queue execution is not yet implemented for multi-repo projects");
         }
@@ -303,7 +304,11 @@ impl TeamDaemon {
         }
         let pre_merge_head = git_head(self.project_root())?;
 
-        match merge_engineer_branch(self.project_root(), &request.engineer)? {
+        match merge_engineer_branch_into_trunk(
+            self.project_root(),
+            &request.engineer,
+            &trunk_branch,
+        )? {
             MergeOutcome::Success(success) => {
                 if success.mode == MergeMode::IsolatedIntegration {
                     let reason = success
@@ -434,7 +439,7 @@ impl TeamDaemon {
                     self.queue_message(&request.engineer, manager_name, &msg)?;
                     self.mark_member_working(manager_name);
                     let rollup = format!(
-                        "Rollup: Task #{} completed by {} from the merge queue. Tests passed, merged to main.{}",
+                        "Rollup: Task #{} completed by {} from the merge queue. Tests passed, merged to {trunk_branch}.{}",
                         request.task_id,
                         request.engineer,
                         if board_update_ok {
@@ -483,7 +488,7 @@ impl TeamDaemon {
                 let attempt = self.increment_retry(&request.engineer);
                 if attempt <= 2 {
                     let msg = format!(
-                        "Merge conflict during rebase onto main (attempt {attempt}/2). Fix the conflicts in your worktree and try again:\n{conflict_info}"
+                        "Merge conflict during rebase onto {trunk_branch} (attempt {attempt}/2). Fix the conflicts in your worktree and try again:\n{conflict_info}"
                     );
                     self.queue_message("batty", &request.engineer, &msg)?;
                     self.mark_member_working(&request.engineer);
@@ -544,7 +549,7 @@ impl TeamDaemon {
                     &merge_info,
                 );
                 let manager_notice = format!(
-                    "Task #{} from {} passed tests but could not be merged to main.\n{}\nDecide whether to retry the isolated merge path, inspect the integration-worktree failure, or redirect the engineer.",
+                    "Task #{} from {} passed tests but could not be merged to {trunk_branch}.\n{}\nDecide whether to retry the isolated merge path, inspect the integration-worktree failure, or redirect the engineer.",
                     request.task_id, request.engineer, merge_info
                 );
                 if let Some(ref manager_name) = manager_name {
@@ -554,7 +559,7 @@ impl TeamDaemon {
                 }
 
                 let engineer_notice = format!(
-                    "Your task passed tests, but Batty could not merge it into main.\n{}\nWait for lead direction before making more changes.",
+                    "Your task passed tests, but Batty could not merge it into {trunk_branch}.\n{}\nWait for lead direction before making more changes.",
                     merge_info
                 );
                 self.queue_message("daemon", &request.engineer, &engineer_notice)?;
@@ -1461,6 +1466,85 @@ mod tests {
         assert!(
             crate::team::checkpoint::read_preserved_lane_record(&repo, "main").is_some(),
             "runtime-only dirty main state should be snapshotted before merge"
+        );
+    }
+
+    #[test]
+    fn daemon_process_merge_queue_merges_into_configured_integration_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-merge-queue-integration-test");
+        git_ok(&repo, &["branch", "develop"]);
+        write_task_file(&repo, 43, "integration-branch-task", "review");
+
+        let team_config_dir = repo.join(".batty").join("team_config");
+        let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+        crate::team::task_loop::setup_engineer_worktree_from_trunk(
+            &repo,
+            &worktree_dir,
+            "eng-1",
+            &team_config_dir,
+            "develop",
+        )
+        .unwrap();
+        std::fs::write(worktree_dir.join("note.txt"), "integration merge\n").unwrap();
+        git_ok(&worktree_dir, &["add", "note.txt"]);
+        git_ok(&worktree_dir, &["commit", "-m", "integration merge"]);
+        let branch = current_worktree_branch(&worktree_dir).unwrap();
+        let commit = current_head(&worktree_dir);
+        write_completion_metadata(
+            &repo,
+            43,
+            "integration-branch-task",
+            &branch,
+            &worktree_dir,
+            &commit,
+        );
+        let main_before = crate::team::test_support::git_stdout(&repo, &["rev-parse", "main"]);
+
+        let members = vec![
+            manager_member("manager", None),
+            engineer_member("eng-1", Some("manager"), true),
+        ];
+        let mut daemon = make_test_daemon(&repo, members);
+        daemon.config.team_config.trunk_branch = "develop".to_string();
+        daemon.set_active_task_for_test("eng-1", 43);
+        daemon.set_member_state_for_test("eng-1", MemberState::Working);
+        daemon.enqueue_merge_request(MergeRequest {
+            task_id: 43,
+            engineer: "eng-1".to_string(),
+            branch,
+            worktree_dir: worktree_dir.clone(),
+            queued_at: Instant::now(),
+            test_passed: true,
+            should_post_merge_verify: false,
+            test_duration_ms: 1,
+            confidence: 0.95,
+            files_changed: 1,
+            lines_changed: 1,
+        });
+
+        daemon.process_merge_queue().unwrap();
+
+        assert_eq!(
+            crate::team::test_support::git_stdout(&repo, &["show", "develop:note.txt"]),
+            "integration merge"
+        );
+        assert_eq!(
+            crate::team::test_support::git_stdout(&repo, &["rev-parse", "main"]),
+            main_before,
+            "main must stay untouched when trunk_branch points at an integration branch"
+        );
+        let manager_messages = crate::team::inbox::pending_messages(
+            &crate::team::inbox::inboxes_root(&repo),
+            "manager",
+        )
+        .unwrap();
+        assert!(
+            manager_messages.iter().any(|message| message
+                .body
+                .contains("Task #43 completed from merge queue")
+                && message.body.contains("Merge: success")),
+            "manager should see a successful integration-branch merge: {manager_messages:?}"
         );
     }
 

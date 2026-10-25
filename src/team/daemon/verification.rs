@@ -359,10 +359,6 @@ pub(crate) fn is_scope_ack_message(body: &str, task_id: u32) -> bool {
         .contains(&scope_ack_token(task_id).to_ascii_lowercase())
 }
 
-pub(crate) fn changed_files_from_main(worktree_dir: &Path) -> Result<Vec<String>> {
-    changed_files_from_trunk(worktree_dir, "main")
-}
-
 pub(crate) fn changed_files_from_trunk(
     worktree_dir: &Path,
     trunk_branch: &str,
@@ -410,7 +406,7 @@ fn current_branch_name(worktree_dir: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn commit_subjects_since_main(worktree_dir: &Path) -> Result<Vec<String>> {
     commit_subjects_since_trunk(worktree_dir, "main")
 }

@@ -95,6 +95,56 @@ fn validate_trunk_branch_exists_accepts_configured_mainline() {
 }
 
 #[test]
+fn validate_trunk_branch_exists_creates_local_branch_for_remote_only_trunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init"]);
+    git(tmp.path(), &["checkout", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "hello\n").unwrap();
+    git(tmp.path(), &["add", "README.md"]);
+    git(tmp.path(), &["commit", "-m", "init"]);
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ],
+    );
+    git(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/develop", "HEAD"],
+    );
+
+    validate_trunk_branch_exists(tmp.path(), "develop").unwrap();
+
+    assert!(
+        crate::team::git_cmd::show_ref_exists(tmp.path(), "refs/heads/develop").unwrap(),
+        "remote-only trunk should get a local branch so merges can advance it"
+    );
+}
+
+#[test]
+fn configured_trunk_branch_reads_team_yaml_and_defaults_to_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(configured_trunk_branch(tmp.path()), "main");
+
+    let config_dir = tmp.path().join(".batty").join("team_config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("team.yaml"),
+        minimal_yaml().replacen(
+            "name: test-team",
+            "name: test-team\ntrunk_branch: develop",
+            1,
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(configured_trunk_branch(tmp.path()), "develop");
+}
+
+#[test]
 fn validate_trunk_branch_exists_reports_missing_configured_branch() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init"]);
