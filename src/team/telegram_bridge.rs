@@ -2180,6 +2180,7 @@ mod tests {
             RoleDef {
                 effort: None,
                 on_demand: false,
+                docs_only_evidence: false,
                 name: "human".to_string(),
                 role_type: RoleType::User,
                 agent: None,
@@ -2205,6 +2206,7 @@ mod tests {
             RoleDef {
                 effort: None,
                 on_demand: false,
+                docs_only_evidence: false,
                 name: "eng".to_string(),
                 role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),
@@ -2278,6 +2280,7 @@ mod tests {
         let roles = vec![RoleDef {
             effort: None,
             on_demand: false,
+            docs_only_evidence: false,
             name: "eng".to_string(),
             role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
@@ -2335,6 +2338,7 @@ mod tests {
         let roles = vec![RoleDef {
             effort: None,
             on_demand: false,
+            docs_only_evidence: false,
             name: "eng".to_string(),
             role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
@@ -2396,6 +2400,7 @@ mod tests {
             RoleDef {
                 effort: None,
                 on_demand: false,
+                docs_only_evidence: false,
                 name: "human".to_string(),
                 role_type: RoleType::User,
                 agent: None,
@@ -2421,6 +2426,7 @@ mod tests {
             RoleDef {
                 effort: None,
                 on_demand: false,
+                docs_only_evidence: false,
                 name: "architect".to_string(),
                 role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
@@ -2590,6 +2596,7 @@ mod tests {
         let roles = vec![RoleDef {
             effort: None,
             on_demand: false,
+            docs_only_evidence: false,
             name: "eng".to_string(),
             role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
@@ -2674,6 +2681,7 @@ mod tests {
             RoleDef {
                 effort: None,
                 on_demand: false,
+                docs_only_evidence: false,
                 name: "human".to_string(),
                 role_type: RoleType::User,
                 agent: None,
@@ -2699,6 +2707,7 @@ mod tests {
             RoleDef {
                 effort: None,
                 on_demand: false,
+                docs_only_evidence: false,
                 name: "architect".to_string(),
                 role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
@@ -2724,6 +2733,7 @@ mod tests {
             RoleDef {
                 effort: None,
                 on_demand: false,
+                docs_only_evidence: false,
                 name: "eng".to_string(),
                 role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),

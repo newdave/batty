@@ -881,8 +881,15 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         return Ok(());
     }
 
+    let docs_only_evidence = daemon
+        .config
+        .members
+        .iter()
+        .find(|member| member.name == engineer)
+        .and_then(|member| daemon.config.team_config.role_def(&member.role_name))
+        .is_some_and(|role| role.docs_only_evidence);
     let has_required_evidence = if verification_policy.require_evidence {
-        total_commits > 0 && code_files_changed > 0
+        total_commits > 0 && (code_files_changed > 0 || (docs_only_evidence && files_changed > 0))
     } else {
         true
     };
@@ -3326,6 +3333,59 @@ mod tests {
                 && event.task.as_deref() == Some("42")
                 && event.role.as_deref() == Some("eng-1")
         }));
+    }
+
+    #[test]
+    fn docs_only_evidence_role_accepts_docs_only_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-merge-test");
+        write_task_file(&repo, 42, "docs-role-task");
+
+        let team_config_dir = repo.join(".batty").join("team_config");
+        let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+        setup_engineer_worktree(&repo, &worktree_dir, "eng-1", &team_config_dir).unwrap();
+
+        std::fs::create_dir_all(worktree_dir.join("docs")).unwrap();
+        std::fs::write(worktree_dir.join("docs").join("guide.md"), "how to\n").unwrap();
+        git_ok(&worktree_dir, &["add", "docs/guide.md"]);
+        git_ok(&worktree_dir, &["commit", "-m", "docs: add guide"]);
+
+        let mut daemon = setup_completion_daemon(&repo, "eng-1");
+        let role_name = daemon
+            .config
+            .members
+            .iter()
+            .find(|member| member.name == "eng-1")
+            .unwrap()
+            .role_name
+            .clone();
+        let roles = &mut daemon.config.team_config.roles;
+        roles.retain(|role| role.name != role_name);
+        roles.push(crate::team::config::RoleDef {
+            name: role_name,
+            docs_only_evidence: true,
+            ..Default::default()
+        });
+        daemon.set_active_task_for_test("eng-1", 42);
+        daemon.set_member_state_for_test("eng-1", MemberState::Working);
+
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+
+        let engineer_messages =
+            inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
+        assert!(
+            !engineer_messages
+                .iter()
+                .any(|message| message.body.contains("found no code changes")),
+            "docs-only work from a docs role must not be rejected as narration: {engineer_messages:?}"
+        );
+        let events_path = repo.join(".batty").join("team_config").join("events.jsonl");
+        let events = read_events(&events_path).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event == "narration_rejection")
+        );
     }
 
     #[test]

@@ -83,6 +83,7 @@ roles:
     instances: 1
     prompt: documentation_specialist.md
     on_demand: true
+    docs_only_evidence: true
     talks_to: [manager]
     use_worktrees: true
   - name: quality-specialist

@@ -30,6 +30,10 @@ a matching tag route, explicit assignee, or task body role can select it. It doe
 not defer creation of that member's process. Conflicting tag routes hold the task
 for clarification. Layout zones accept an ordered `members` list containing
 member names or role names, so specialists can share zones without pane scripts.
+`docs_only_evidence: true` lets a role pass the completion evidence check with
+committed documentation-only changes (`docs/`, Markdown and other non-code
+paths). Without it, a completion needs a changed code file, so work from a
+documentation role would be rejected as narration-only.
 
 The default simple team contains an architect, a manager, two general engineers,
 and research, documentation and quality specialists. Its standup interval is

@@ -344,6 +344,7 @@ pub(crate) fn inferred_role_defs(members: &[MemberInstance]) -> Vec<RoleDef> {
         roles.push(RoleDef {
             effort: None,
             on_demand: false,
+            docs_only_evidence: false,
             name: member.role_name.clone(),
             role_type: member.role_type,
             agent: member.agent.clone(),
