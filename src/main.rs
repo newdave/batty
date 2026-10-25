@@ -1471,6 +1471,17 @@ fn main() -> Result<()> {
             );
         }
 
+        Command::BackendProbe {
+            member,
+            timeout_secs,
+        } => {
+            let result = team::backend_probe::run(
+                &root,
+                &member,
+                std::time::Duration::from_secs(timeout_secs),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Command::Scale { command } => {
             team::scale::run(&root, command)?;
         }

@@ -8,6 +8,7 @@ pub mod agent_options;
 pub mod allocation;
 pub mod artifact;
 pub mod auto_merge;
+pub mod backend_probe;
 #[cfg(test)]
 mod behavioral_tests;
 pub mod bench;
