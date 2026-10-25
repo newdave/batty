@@ -1457,6 +1457,20 @@ fn main() -> Result<()> {
             }
         }
 
+        Command::Preflight { runtime } => {
+            let report = team::preflight::inspect(&root, runtime)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.diagnostics.is_empty() {
+                bail!("preflight found configuration or runtime drift");
+            }
+        }
+        Command::BackendReset { member } => {
+            team::preflight::reset_backend(&root, &member)?;
+            println!(
+                "Backend configuration error cleared for {member}; a running daemon can recover this member."
+            );
+        }
+
         Command::Scale { command } => {
             team::scale::run(&root, command)?;
         }

@@ -308,6 +308,14 @@ pub enum Command {
         json: bool,
     },
 
+    /// Validate launch settings and provenance without starting agents or inference
+    Preflight {
+        #[arg(long)]
+        runtime: bool,
+    },
+
+    /// Reset a repaired terminal backend configuration error
+    BackendReset { member: String },
     /// Dynamically scale team topology (add/remove agents)
     Scale {
         #[command(subcommand)]
