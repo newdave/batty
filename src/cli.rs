@@ -302,7 +302,11 @@ pub enum Command {
     },
 
     /// Estimate current run cost from agent session files
-    Cost,
+    Cost {
+        /// Emit observed usage and explicit unknown pricing as JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Dynamically scale team topology (add/remove agents)
     Scale {
@@ -2321,7 +2325,7 @@ mod tests {
     #[test]
     fn cost_subcommand_parses() {
         let cli = Cli::parse_from(["batty", "cost"]);
-        assert!(matches!(cli.command, Command::Cost));
+        assert!(matches!(cli.command, Command::Cost { json: false }));
     }
 
     #[test]

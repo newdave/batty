@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
@@ -12,7 +12,7 @@ use super::config::{ModelPricing, TeamConfig};
 use super::hierarchy::{self, MemberInstance};
 use super::{daemon_state_path, status, team_config_path};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct TokenUsage {
     input_tokens: u64,
     cached_input_tokens: u64,
@@ -39,13 +39,14 @@ impl TokenUsage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct SessionUsage {
     model: Option<String>,
     usage: TokenUsage,
+    warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct CostEntry {
     member_name: String,
     agent: String,
@@ -56,11 +57,14 @@ struct CostEntry {
     estimated_cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct CostReport {
     team_name: String,
     entries: Vec<CostEntry>,
-    total_estimated_cost_usd: f64,
+    total_estimated_cost_usd: Option<f64>,
+    known_estimated_subtotal_usd: f64,
+    warnings: Vec<String>,
+    cost_basis: &'static str,
     unpriced_models: BTreeSet<String>,
 }
 
@@ -100,6 +104,10 @@ pub fn show_cost(project_root: &Path) -> Result<()> {
     println!("Run cost estimate for team {}", report.team_name);
     if report.entries.is_empty() {
         println!("No agent session files with token usage were found.");
+        println!("Estimated total: n/a");
+        for warning in &report.warnings {
+            println!("Warning: {warning}");
+        }
         return Ok(());
     }
 
@@ -118,7 +126,7 @@ pub fn show_cost(project_root: &Path) -> Result<()> {
             entry.task,
             entry.usage.input_tokens,
             entry.usage.display_cache_tokens(),
-            entry.usage.output_tokens + entry.usage.reasoning_output_tokens,
+            entry.usage.output_tokens,
             entry
                 .estimated_cost_usd
                 .map(|cost| format!("${cost:.4}"))
@@ -127,7 +135,17 @@ pub fn show_cost(project_root: &Path) -> Result<()> {
     }
 
     println!();
-    println!("Estimated total: ${:.4}", report.total_estimated_cost_usd);
+    match report.total_estimated_cost_usd {
+        Some(total) => println!("Estimated total: ${total:.4}"),
+        None => println!(
+            "Estimated total: n/a (known estimated subtotal: ${:.4})",
+            report.known_estimated_subtotal_usd
+        ),
+    }
+    println!("API price estimates are not subscription charges.");
+    for warning in &report.warnings {
+        println!("Warning: {warning}");
+    }
     if !report.unpriced_models.is_empty() {
         println!(
             "Unpriced models: {}",
@@ -140,6 +158,19 @@ pub fn show_cost(project_root: &Path) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Machine-readable observed usage and API-price estimates. An incomplete
+/// report has a null total; a known subtotal is never presented as the total.
+pub fn show_cost_json(project_root: &Path) -> Result<()> {
+    let config_path = team_config_path(project_root);
+    if !config_path.exists() {
+        bail!("no team config found at {}", config_path.display());
+    }
+    let config = TeamConfig::load(&config_path)?;
+    let report = collect_cost_report(project_root, &config, &SessionRoots::default())?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -174,20 +205,27 @@ fn collect_cost_report(
             .or_insert(0usize) += 1;
     }
     let mut entries = Vec::new();
-    let mut total_estimated_cost_usd = 0.0;
+    let mut known_estimated_subtotal_usd = 0.0;
+    let mut warnings = Vec::new();
+    let mut complete = true;
+    let mut seen_sessions = HashMap::<PathBuf, String>::new();
     let mut unpriced_models = BTreeSet::new();
 
     for member in &members {
         let Some((agent_kind, session_cwd, agent_label)) =
             member_session_target(project_root, member)
         else {
+            if member.role_type != super::config::RoleType::User {
+                complete = false;
+                warnings.push(format!("{}: backend usage is not supported", member.name));
+            }
             continue;
         };
         let session_id = launch_state
             .get(&member.name)
             .and_then(|identity| identity.session_id.as_deref());
-        let allow_cwd_fallback = session_id.is_some()
-            || session_target_counts
+        let allow_cwd_fallback = session_id.is_none()
+            && session_target_counts
                 .get(&(agent_kind, session_cwd.clone()))
                 .copied()
                 .unwrap_or(0)
@@ -207,26 +245,70 @@ fn collect_cost_report(
             )?,
         };
         let Some(session_file) = session_file else {
+            complete = false;
+            warnings.push(format!("{}: no attributable session usage", member.name));
             continue;
         };
+        if session_id.is_none() {
+            complete = false;
+            warnings.push(format!(
+                "{}: session inferred from working directory without recorded identity",
+                member.name
+            ));
+        }
+        let canonical = fs::canonicalize(&session_file).unwrap_or_else(|_| session_file.clone());
+        if let Some(owner) = seen_sessions.get(&canonical) {
+            warnings.push(format!(
+                "{} shares a session with {owner}; usage counted once, task attribution ambiguous",
+                member.name
+            ));
+            continue;
+        }
+        seen_sessions.insert(canonical, member.name.clone());
 
         let session_usage = match agent_kind {
             SessionAgent::Codex => parse_codex_session_usage(&session_file)?,
             SessionAgent::Claude => parse_claude_session_usage(&session_file)?,
         };
         let Some(session_usage) = session_usage else {
+            complete = false;
+            warnings.push(format!("{}: session has no usable usage", member.name));
             continue;
         };
+        warnings.extend(
+            session_usage
+                .warnings
+                .iter()
+                .map(|warning| format!("{}: {warning}", member.name)),
+        );
+        if !session_usage.warnings.is_empty() {
+            complete = false;
+        }
         if session_usage.usage.total_tokens() == 0 {
             continue;
         }
 
         let model = session_usage.model.unwrap_or_else(|| "unknown".to_string());
         let estimated_cost_usd = pricing_for_model(&team_config.cost.models, &model)
-            .map(|pricing| estimate_cost_usd(&session_usage.usage, &pricing));
+            .filter(|_| model != "unknown")
+            .map(|pricing| {
+                let mut chargeable = session_usage.usage.clone();
+                if agent_kind == SessionAgent::Codex {
+                    // Codex counters include cached input and reasoning output
+                    // in their respective totals. Price each subset once.
+                    chargeable.input_tokens = chargeable
+                        .input_tokens
+                        .saturating_sub(chargeable.cached_input_tokens);
+                    chargeable.output_tokens = chargeable
+                        .output_tokens
+                        .saturating_sub(chargeable.reasoning_output_tokens);
+                }
+                estimate_cost_usd(&chargeable, &pricing)
+            });
         if let Some(cost) = estimated_cost_usd {
-            total_estimated_cost_usd += cost;
+            known_estimated_subtotal_usd += cost;
         } else {
+            complete = false;
             unpriced_models.insert(model.clone());
         }
 
@@ -253,10 +335,15 @@ fn collect_cost_report(
 
     entries.sort_by(|left, right| left.member_name.cmp(&right.member_name));
 
+    let total_estimated_cost_usd =
+        (complete && !entries.is_empty()).then_some(known_estimated_subtotal_usd);
     Ok(CostReport {
         team_name: team_config.name.clone(),
         entries,
         total_estimated_cost_usd,
+        known_estimated_subtotal_usd,
+        warnings,
+        cost_basis: "observed session usage with API price estimates; not subscription billing",
         unpriced_models,
     })
 }
@@ -547,6 +634,7 @@ fn parse_codex_session_usage(path: &Path) -> Result<Option<SessionUsage>> {
     let reader = BufReader::new(file);
     let mut usage = TokenUsage::default();
     let mut model = None;
+    let mut models = BTreeSet::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -564,6 +652,7 @@ fn parse_codex_session_usage(path: &Path) -> Result<Option<SessionUsage>> {
                 .and_then(Value::as_str)
         {
             model = Some(value.to_string());
+            models.insert(value.to_string());
         }
 
         if entry.get("type").and_then(Value::as_str) != Some("event_msg")
@@ -594,53 +683,161 @@ fn parse_codex_session_usage(path: &Path) -> Result<Option<SessionUsage>> {
         return Ok(None);
     }
 
-    Ok(Some(SessionUsage { model, usage }))
+    let mut warnings = Vec::new();
+    if models.len() > 1 {
+        model = None;
+        warnings.push("mixed-model session: pricing unavailable".into());
+    }
+    Ok(Some(SessionUsage {
+        model,
+        usage,
+        warnings,
+    }))
 }
 
 fn parse_claude_session_usage(path: &Path) -> Result<Option<SessionUsage>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open claude session {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut usage = TokenUsage::default();
-    let mut model = None;
-
-    for line in reader.lines() {
+    let mut snapshots = HashMap::<(String, String), TokenUsage>::new();
+    let mut models = BTreeSet::new();
+    let mut warnings = Vec::new();
+    let mut legacy = 0;
+    let mut malformed = 0;
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            malformed += 1;
             continue;
         };
-
         let Some(message) = entry.get("message") else {
             continue;
         };
-        if let Some(value) = message.get("model").and_then(Value::as_str) {
-            model = Some(value.to_string());
+        if entry
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "assistant")
+            || message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role != "assistant")
+        {
+            continue;
         }
-        let Some(usage_value) = message.get("usage") else {
+        let model = message.get("model").and_then(Value::as_str);
+        if model.is_some_and(|name| name == "<synthetic>") {
+            continue;
+        }
+        let Some(value) = message.get("usage").filter(|v| v.is_object()) else {
             continue;
         };
-
-        usage.input_tokens += json_u64(usage_value.get("input_tokens"));
-        usage.output_tokens += json_u64(usage_value.get("output_tokens"));
-        usage.cache_creation_input_tokens +=
-            json_u64(usage_value.get("cache_creation_input_tokens"));
-        usage.cache_read_input_tokens += json_u64(usage_value.get("cache_read_input_tokens"));
-
-        let cache_creation = usage_value.get("cache_creation");
-        usage.cache_creation_5m_input_tokens +=
-            json_u64(cache_creation.and_then(|value| value.get("ephemeral_5m_input_tokens")));
-        usage.cache_creation_1h_input_tokens +=
-            json_u64(cache_creation.and_then(|value| value.get("ephemeral_1h_input_tokens")));
+        if ![
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .any(|field| value.get(field).is_some_and(Value::is_u64))
+        {
+            continue;
+        }
+        if let Some(model) = model {
+            models.insert(model.to_string());
+        } else {
+            models.insert("unknown".into());
+        }
+        let request_id = entry
+            .get("requestId")
+            .or_else(|| entry.get("request_id"))
+            .and_then(Value::as_str);
+        let key = if let Some(id) = message.get("id").and_then(Value::as_str) {
+            // Message IDs are stable across the streaming and final records;
+            // optional request metadata may be absent on one of those records.
+            ("message".to_string(), id.to_string())
+        } else if let Some(id) = request_id {
+            ("request".to_string(), id.to_string())
+        } else {
+            legacy += 1;
+            (format!("legacy-line-{line_number}"), String::new())
+        };
+        let creation = value.get("cache_creation");
+        let five = json_u64(creation.and_then(|v| v.get("ephemeral_5m_input_tokens")));
+        let hour = json_u64(creation.and_then(|v| v.get("ephemeral_1h_input_tokens")));
+        let current = TokenUsage {
+            input_tokens: json_u64(value.get("input_tokens")),
+            cache_creation_input_tokens: json_u64(value.get("cache_creation_input_tokens"))
+                .max(five.saturating_add(hour)),
+            cache_creation_5m_input_tokens: five,
+            cache_creation_1h_input_tokens: hour,
+            cache_read_input_tokens: json_u64(value.get("cache_read_input_tokens"))
+                .max(json_u64(value.get("cached_input_tokens"))),
+            output_tokens: json_u64(value.get("output_tokens"))
+                .max(json_u64(value.get("reasoning_output_tokens"))),
+            ..Default::default()
+        };
+        let previous = snapshots.entry(key).or_default();
+        previous.input_tokens = previous.input_tokens.max(current.input_tokens);
+        previous.cache_creation_input_tokens = previous
+            .cache_creation_input_tokens
+            .max(current.cache_creation_input_tokens);
+        previous.cache_creation_5m_input_tokens = previous
+            .cache_creation_5m_input_tokens
+            .max(current.cache_creation_5m_input_tokens);
+        previous.cache_creation_1h_input_tokens = previous
+            .cache_creation_1h_input_tokens
+            .max(current.cache_creation_1h_input_tokens);
+        previous.cache_read_input_tokens = previous
+            .cache_read_input_tokens
+            .max(current.cache_read_input_tokens);
+        previous.output_tokens = previous.output_tokens.max(current.output_tokens);
     }
-
-    if model.is_none() && usage.total_tokens() == 0 {
+    if snapshots.is_empty() {
         return Ok(None);
     }
-
-    Ok(Some(SessionUsage { model, usage }))
+    let mut usage = TokenUsage::default();
+    for snapshot in snapshots.values() {
+        usage.input_tokens = usage.input_tokens.saturating_add(snapshot.input_tokens);
+        // Max across stream snapshots can independently grow cache tiers.
+        usage.cache_creation_input_tokens = usage.cache_creation_input_tokens.saturating_add(
+            snapshot.cache_creation_input_tokens.max(
+                snapshot
+                    .cache_creation_5m_input_tokens
+                    .saturating_add(snapshot.cache_creation_1h_input_tokens),
+            ),
+        );
+        usage.cache_creation_5m_input_tokens = usage
+            .cache_creation_5m_input_tokens
+            .saturating_add(snapshot.cache_creation_5m_input_tokens);
+        usage.cache_creation_1h_input_tokens = usage
+            .cache_creation_1h_input_tokens
+            .saturating_add(snapshot.cache_creation_1h_input_tokens);
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(snapshot.cache_read_input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(snapshot.output_tokens);
+    }
+    if legacy > 0 {
+        warnings.push(format!(
+            "{legacy} legacy usage records lack message IDs; streaming deduplication unavailable"
+        ));
+    }
+    if malformed > 0 {
+        warnings.push(format!("{malformed} malformed transcript lines omitted"));
+    }
+    let model = if models.len() == 1 {
+        models.into_iter().next()
+    } else {
+        warnings.push("mixed-model session: pricing unavailable".into());
+        None
+    };
+    Ok(Some(SessionUsage {
+        model,
+        usage,
+        warnings,
+    }))
 }
 
 fn json_u64(value: Option<&Value>) -> u64 {
@@ -775,6 +972,12 @@ mod tests {
         assert_eq!(usage.usage.cache_read_input_tokens, 4);
         assert_eq!(usage.usage.cache_creation_5m_input_tokens, 5);
         assert_eq!(usage.usage.cache_creation_1h_input_tokens, 15);
+        assert!(
+            usage
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("deduplication unavailable"))
+        );
     }
 
     #[test]
@@ -1674,7 +1877,8 @@ mod tests {
         .unwrap();
 
         assert!(report.entries.is_empty());
-        assert!((report.total_estimated_cost_usd).abs() < f64::EPSILON);
+        assert!(report.total_estimated_cost_usd.is_none());
+        assert!(report.known_estimated_subtotal_usd.abs() < f64::EPSILON);
         assert!(report.unpriced_models.is_empty());
     }
 
@@ -1712,5 +1916,134 @@ mod tests {
         .unwrap();
 
         assert!(report.unpriced_models.contains("totally-unknown-model"));
+    }
+    #[test]
+    fn claude_usage_deduplicates_streaming_and_normalizes_cache_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("usage.jsonl");
+        let record = |output| {
+            serde_json::json!({"type":"assistant", "requestId":"r1", "message":{
+            "id":"m1", "model":"example-model", "usage":{"input_tokens":10,
+            "cached_input_tokens":4,"cache_read_input_tokens":4,"cache_creation_input_tokens":20,
+            "cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":15},
+            "output_tokens":output,"reasoning_output_tokens":2}}})
+            .to_string()
+        };
+        fs::write(&file, format!("{}\n{}\n{}\n{}\n", record(2), record(5), record(5),
+            serde_json::json!({"message":{"id":"fake","model":"<synthetic>","usage":{"input_tokens":999999}}}))).unwrap();
+        let parsed = parse_claude_session_usage(&file).unwrap().unwrap();
+        assert_eq!(parsed.usage.input_tokens, 10);
+        assert_eq!(parsed.usage.output_tokens, 5);
+        assert_eq!(parsed.usage.cache_read_input_tokens, 4);
+        assert_eq!(parsed.usage.cached_input_tokens, 0);
+        assert_eq!(parsed.usage.cache_creation_input_tokens, 20);
+        assert_eq!(parsed.usage.total_tokens(), 39);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn mixed_model_and_legacy_usage_remain_observed_but_unpriced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("usage.jsonl");
+        fs::write(
+            &file,
+            concat!(
+                "{\"message\":{\"model\":\"first-model\",\"usage\":{\"input_tokens\":10}}}\n",
+                "{\"message\":{\"model\":\"second-model\",\"usage\":{\"input_tokens\":20}}}\n",
+                "not-json\n"
+            ),
+        )
+        .unwrap();
+        let parsed = parse_claude_session_usage(&file).unwrap().unwrap();
+        assert_eq!(parsed.model, None);
+        assert_eq!(parsed.usage.input_tokens, 30);
+        assert!(parsed.warnings.iter().any(|w| w.contains("legacy")));
+        assert!(parsed.warnings.iter().any(|w| w.contains("mixed-model")));
+        assert!(parsed.warnings.iter().any(|w| w.contains("malformed")));
+    }
+
+    #[test]
+    fn shared_exact_session_is_counted_once_and_json_marks_unknown_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".batty/team_config/board/tasks")).unwrap();
+        let mut config = test_team_config(HashMap::new());
+        config.roles[1].agent = Some("claude".into());
+        config.roles[1].use_worktrees = false;
+        let members = hierarchy::resolve_hierarchy(&config).unwrap();
+        let identities: serde_json::Map<String, Value> = members
+            .iter()
+            .map(|member| {
+                (
+                    member.name.clone(),
+                    serde_json::json!({"session_id":"shared"}),
+                )
+            })
+            .collect();
+        fs::write(
+            root.join(".batty/launch-state.json"),
+            serde_json::to_vec(&identities).unwrap(),
+        )
+        .unwrap();
+        let projects = root.join("sessions");
+        let directory = projects.join(root.to_string_lossy().replace('/', "-"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("shared.jsonl"),
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"model\":\"unpriced-model\",\"usage\":{\"input_tokens\":10}}}\n").unwrap();
+        let report = collect_cost_report(
+            root,
+            &config,
+            &SessionRoots {
+                codex_sessions_root: root.join("none"),
+                claude_projects_root: projects,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].usage.input_tokens, 10);
+        assert!(report.warnings.iter().any(|w| w.contains("counted once")));
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["total_estimated_cost_usd"].is_null());
+        assert_eq!(json["known_estimated_subtotal_usd"], 0.0);
+        assert!(json["entries"][0]["estimated_cost_usd"].is_null());
+    }
+    #[test]
+    fn usage_identity_handles_optional_request_metadata_and_request_only_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("usage.jsonl");
+        let values = [
+            serde_json::json!({"requestId":"r1","message":{"id":"m1","model":"example","usage":{"input_tokens":10,"output_tokens":1}}}),
+            serde_json::json!({"message":{"id":"m1","model":"example","usage":{"input_tokens":10,"output_tokens":2}}}),
+            serde_json::json!({"requestId":"r2","message":{"model":"example","usage":{"input_tokens":20,"output_tokens":3}}}),
+            serde_json::json!({"requestId":"r2","message":{"model":"example","usage":{"input_tokens":20,"output_tokens":4}}}),
+        ];
+        fs::write(
+            &path,
+            values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = parse_claude_session_usage(&path).unwrap().unwrap();
+        assert_eq!(parsed.usage.input_tokens, 30);
+        assert_eq!(parsed.usage.output_tokens, 6);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn recorded_session_identity_does_not_fall_back_to_another_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let directory = projects.join(cwd.to_string_lossy().replace('/', "-"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("other.jsonl"), "{}").unwrap();
+        assert!(
+            discover_claude_session_file(&projects, &cwd, Some("missing"), false)
+                .unwrap()
+                .is_none()
+        );
     }
 }
