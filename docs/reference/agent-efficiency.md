@@ -37,7 +37,9 @@ and research, documentation and quality specialists. Its standup interval is
 inference and architect utilisation interventions are disabled, stall detection
 waits 15 minutes, restart attempts are capped at one, and automatic crash respawn
 is disabled. Verification remains enabled with two iterations and evidence.
-Existing explicit configuration values take precedence. These defaults also
+Routine Claude roles select the Sonnet alias with medium effort; the documentation
+specialist selects Haiku without an effort override. These are template choices,
+not forced defaults for other configurations. Existing explicit configuration values take precedence. These defaults also
 change omitted settings in existing teams; review `batty config` before starting.
 
 Transport Ping/Pong remains active when idle inference is disabled. Claude SDK

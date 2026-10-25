@@ -1659,3 +1659,26 @@ roles:
     assert_eq!(override_cfg.agent.as_deref(), Some("gemini"));
     assert_eq!(override_cfg.model.as_deref(), Some("claude-opus-4.6-1m"));
 }
+
+#[test]
+fn simple_template_resolves_efficient_role_options() {
+    let config: TeamConfig =
+        serde_yaml::from_str(include_str!("../templates/team_simple.yaml")).unwrap();
+    let options = crate::team::agent_options::all(&config).unwrap();
+    assert_eq!(options.len(), 7);
+    for member in options {
+        assert!(!member.idle_inference_enabled);
+        if member.member.starts_with("documentation-specialist") {
+            assert_eq!(member.model.as_deref(), Some("haiku"));
+            assert!(member.effort.is_none());
+        } else {
+            assert_eq!(member.model.as_deref(), Some("sonnet"));
+            assert_eq!(member.effort.as_deref(), Some("medium"));
+        }
+        assert_eq!(member.on_demand, member.member.contains("specialist"));
+    }
+    assert_eq!(
+        config.board.tag_roles.get("quality").map(String::as_str),
+        Some("quality-specialist")
+    );
+}
