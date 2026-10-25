@@ -997,11 +997,21 @@ impl TeamDaemon {
             return Ok(());
         }
 
-        let command = policy.command.trim();
-        if command.is_empty() {
-            warn!("main smoke command is empty; skipping");
+        let workflow = &self.config.team_config.workflow_policy;
+        let verification = workflow
+            .verification
+            .test_command
+            .as_deref()
+            .or(workflow.test_command.as_deref());
+        let Some(command) = crate::team::task_loop::resolve_main_smoke_command(
+            self.project_root(),
+            policy.command.as_deref(),
+            verification,
+        ) else {
+            warn!("no main smoke command for this project; set workflow_policy.main_smoke.command");
             return Ok(());
-        }
+        };
+        let command = command.as_str();
 
         let head = Self::short_head_commit(self.project_root())?;
         self.record_orchestrator_action(format!("main smoke: running `{command}` at {head}"));

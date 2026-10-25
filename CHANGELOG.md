@@ -27,6 +27,9 @@ All notable changes to Batty are documented here.
 
 ### Fixed
 
+- The main smoke check no longer defaults to `cargo check` in non-Rust projects, where it
+  always failed and paused dispatch. It falls back to the project's verification command,
+  or skips when there is none.
 - `batty init --template mixed` no longer asks for one agent backend and applies it
   to every role; it keeps the template's per-role backends unless `--agent` is passed.
 - Codex SDK uses actual provider thread IDs, first-turn role context and explicit
