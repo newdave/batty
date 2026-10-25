@@ -1400,7 +1400,7 @@ roles:
     let smoke = &config.workflow_policy.main_smoke;
     assert!(smoke.enabled);
     assert_eq!(smoke.interval_secs, 120);
-    assert_eq!(smoke.command, "cargo test --lib");
+    assert_eq!(smoke.command.as_deref(), Some("cargo test --lib"));
     assert!(!smoke.pause_dispatch_on_failure);
     assert!(smoke.auto_revert);
 }

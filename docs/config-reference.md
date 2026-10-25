@@ -224,7 +224,10 @@ This block controls execution quality and merge safety.
 
 - `enabled`: turn periodic `main` smoke checks on or off. Default: `true`
 - `interval_secs`: smoke-check cadence. Default: `600`
-- `command`: shell command run at the project root. Default: `cargo check`
+- `command`: shell command run at the project root. Default: `cargo check` when the
+  project has a `Cargo.toml`, otherwise the verification command (an explicit
+  `verification.test_command`, or a detected `make check` or `make test`). With none,
+  the smoke check is skipped rather than reporting `main` broken.
 - `pause_dispatch_on_failure`: stop auto-dispatch while `main` is broken. Default: `true`
 - `auto_revert`: optionally revert `HEAD` after a failing smoke run. Default: `false`
 

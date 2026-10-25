@@ -467,8 +467,10 @@ pub struct MainSmokePolicy {
     pub enabled: bool,
     #[serde(default = "default_main_smoke_interval_secs")]
     pub interval_secs: u64,
-    #[serde(default = "default_main_smoke_command")]
-    pub command: String,
+    /// Unset: `cargo check` for Rust projects, otherwise the project's
+    /// verification command.
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default = "default_main_smoke_pause_dispatch_on_failure")]
     pub pause_dispatch_on_failure: bool,
     #[serde(default = "default_main_smoke_auto_revert")]
@@ -480,7 +482,7 @@ impl Default for MainSmokePolicy {
         Self {
             enabled: default_main_smoke_enabled(),
             interval_secs: default_main_smoke_interval_secs(),
-            command: default_main_smoke_command(),
+            command: None,
             pause_dispatch_on_failure: default_main_smoke_pause_dispatch_on_failure(),
             auto_revert: default_main_smoke_auto_revert(),
         }
@@ -576,10 +578,6 @@ fn default_main_smoke_enabled() -> bool {
 
 fn default_main_smoke_interval_secs() -> u64 {
     600
-}
-
-fn default_main_smoke_command() -> String {
-    "cargo check".to_string()
 }
 
 fn default_main_smoke_pause_dispatch_on_failure() -> bool {

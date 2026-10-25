@@ -139,6 +139,24 @@ pub fn resolve_test_command(root: &Path, explicit: Option<&str>) -> Result<Strin
     )
 }
 
+/// Resolve the periodic main smoke command. An explicit setting wins; Rust
+/// projects keep the fast `cargo check`; other projects reuse their
+/// verification command. `None` means there is nothing safe to run.
+pub fn resolve_main_smoke_command(
+    root: &Path,
+    explicit: Option<&str>,
+    verification: Option<&str>,
+) -> Option<String> {
+    if let Some(command) = explicit {
+        let command = command.trim();
+        return (!command.is_empty()).then(|| command.to_string());
+    }
+    if root.join("Cargo.toml").is_file() {
+        return Some("cargo check".into());
+    }
+    resolve_test_command(root, verification).ok()
+}
+
 pub(crate) fn run_tests_in_worktree(
     worktree_dir: &Path,
     test_command: Option<&str>,
@@ -4224,6 +4242,32 @@ mod tests {
         assert_eq!(
             resolve_test_command(root, Some("custom verify")).unwrap(),
             "custom verify"
+        );
+    }
+
+    #[test]
+    fn main_smoke_command_follows_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_eq!(resolve_main_smoke_command(root, None, None), None);
+        assert_eq!(
+            resolve_main_smoke_command(root, None, Some("mise run test")).as_deref(),
+            Some("mise run test")
+        );
+        assert_eq!(resolve_main_smoke_command(root, Some("  "), None), None);
+        std::fs::write(root.join("Makefile"), "test:\n\ttrue\n").unwrap();
+        assert_eq!(
+            resolve_main_smoke_command(root, None, None).as_deref(),
+            Some("make test")
+        );
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(
+            resolve_main_smoke_command(root, None, Some("mise run test")).as_deref(),
+            Some("cargo check")
+        );
+        assert_eq!(
+            resolve_main_smoke_command(root, Some("make smoke"), None).as_deref(),
+            Some("make smoke")
         );
     }
 }
