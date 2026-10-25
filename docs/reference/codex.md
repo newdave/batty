@@ -18,7 +18,8 @@ The opt-in `mixed` template provides:
 | Research specialist      | Claude  | Sonnet alias                 | medium      |
 | Documentation specialist | Claude  | Haiku alias                  | No override |
 
-Use `batty init --template mixed` in a new workspace. The `simple` template keeps
+Use `batty init --template mixed` in a new workspace. Init keeps each role's
+backend; passing `--agent` instead sets one backend for every role. The `simple` template keeps
 its existing Claude allocation. For an existing team, edit the selected roles
 rather than force-initialising the repository or replacing its prompts:
 

@@ -143,6 +143,12 @@ fn input_u64(prompt: &str, default: u64) -> Result<u64> {
     Ok(s.parse::<u64>().unwrap_or(default))
 }
 
+/// Templates that assign a backend to each role. Init keeps those choices
+/// unless `--agent` is passed explicitly.
+fn template_has_per_role_backends(template: cli::InitTemplate) -> bool {
+    matches!(template, cli::InitTemplate::Mixed)
+}
+
 fn collect_init_overrides() -> Result<team::InitOverrides> {
     let mut ov = team::InitOverrides::default();
 
@@ -265,7 +271,8 @@ fn main() -> Result<()> {
             let created = if let Some(template_name) = from.as_deref() {
                 team::init_from_template(&root, template_name)?
             } else {
-                let template_name = match template.unwrap_or(cli::InitTemplate::Simple) {
+                let template_choice = template.unwrap_or(cli::InitTemplate::Simple);
+                let template_name = match template_choice {
                     cli::InitTemplate::Solo => "solo",
                     cli::InitTemplate::Pair => "pair",
                     cli::InitTemplate::Simple => "simple",
@@ -289,7 +296,12 @@ fn main() -> Result<()> {
                     .interact_text()?;
 
                 let selected_agent = if let Some(agent_name) = agent.as_deref() {
-                    agent_name
+                    Some(agent_name)
+                } else if template_has_per_role_backends(template_choice) {
+                    println!(
+                        "Keeping the template's agent backend for each role (pass --agent to use one backend for every role)."
+                    );
+                    None
                 } else {
                     let agents = agent::KNOWN_AGENT_NAMES;
                     let default_idx = agents.iter().position(|&a| a == "claude").unwrap_or(0);
@@ -298,7 +310,7 @@ fn main() -> Result<()> {
                         .items(agents)
                         .default(default_idx)
                         .interact()?;
-                    agents[agent_idx]
+                    Some(agents[agent_idx])
                 };
 
                 let overrides = collect_init_overrides()?;
@@ -307,7 +319,7 @@ fn main() -> Result<()> {
                     &root,
                     template_name,
                     Some(&project_name),
-                    Some(selected_agent),
+                    selected_agent,
                     force,
                     Some(&overrides),
                 )?
@@ -1620,6 +1632,26 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_mixed_template_keeps_per_role_backends() {
+        use cli::InitTemplate;
+        assert!(template_has_per_role_backends(InitTemplate::Mixed));
+        for template in [
+            InitTemplate::Solo,
+            InitTemplate::Pair,
+            InitTemplate::Simple,
+            InitTemplate::Squad,
+            InitTemplate::Large,
+            InitTemplate::Research,
+            InitTemplate::Software,
+            InitTemplate::Cleanroom,
+            InitTemplate::Batty,
+            InitTemplate::Python,
+        ] {
+            assert!(!template_has_per_role_backends(template), "{template:?}");
+        }
+    }
 
     #[test]
     fn board_list_counts_data_rows_only() {
