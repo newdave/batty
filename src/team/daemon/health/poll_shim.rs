@@ -96,6 +96,16 @@ fn wait_for_expected_disconnect_handoff(
 
 impl TeamDaemon {
     fn maybe_persist_member_session_id(&mut self, member_name: &str) {
+        // Codex SDK identities arrive only through thread.started. Before
+        // that event, directory discovery can select a previous member run.
+        if self.config.team_config.use_sdk_mode
+            && self
+                .shim_handles
+                .get(member_name)
+                .is_some_and(|handle| matches!(handle.agent_type.as_str(), "codex" | "codex-cli"))
+        {
+            return;
+        }
         let session_id = {
             let Some(watcher) = self.watchers.get_mut(member_name) else {
                 return;
@@ -211,6 +221,37 @@ impl TeamDaemon {
     /// Process a single shim event for a named agent.
     fn handle_shim_event(&mut self, member_name: &str, event: Event) -> Result<()> {
         match event {
+            Event::SessionStarted { session_id } => {
+                if uuid::Uuid::parse_str(&session_id).is_err() {
+                    return self.handle_shim_event(
+                        member_name,
+                        Event::ConfigurationRequired {
+                            message: "Codex reported an invalid thread identity".into(),
+                            code: Some("invalid_thread_id".into()),
+                        },
+                    );
+                }
+                let identities = load_launch_state(&self.config.project_root);
+                if identities.iter().any(|(other, identity)| {
+                    other != member_name
+                        && identity.agent == "codex-cli"
+                        && identity.session_id.as_deref() == Some(&session_id)
+                }) {
+                    return self.handle_shim_event(
+                        member_name,
+                        Event::ConfigurationRequired {
+                            message: "Codex thread identity is already owned by another member"
+                                .into(),
+                            code: Some("duplicate_thread_id".into()),
+                        },
+                    );
+                }
+                if let Some(watcher) = self.watchers.get_mut(member_name) {
+                    watcher.set_session_id(Some(session_id.clone()));
+                }
+                self.persist_member_session_id(member_name, &session_id)?;
+            }
+
             Event::Ready => {
                 let _ = append_shim_event_log(&self.config.project_root, member_name, "<- ready");
                 info!(member = member_name, "shim agent ready");
@@ -3239,6 +3280,48 @@ mod tests {
             !crate::team::bench::benched_engineer_names(tmp.path())
                 .unwrap()
                 .contains("lead")
+        );
+    }
+    #[test]
+    fn codex_reported_thread_updates_only_its_member_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut member = engineer_member("worker", None, false);
+        member.agent = Some("codex".into());
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![member])
+            .build();
+        daemon.watchers.insert(
+            "worker".into(),
+            crate::team::watcher::SessionWatcher::new(
+                "%mock",
+                "worker",
+                300,
+                Some(SessionTrackerConfig::Codex {
+                    cwd: tmp.path().into(),
+                }),
+            ),
+        );
+        let path = tmp.path().join(".batty/launch-state.json");
+        std::fs::write(
+            &path,
+            r#"{"worker":{"agent":"codex-cli","prompt":"role","session_id":null}}"#,
+        )
+        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        daemon
+            .handle_shim_event(
+                "worker",
+                Event::SessionStarted {
+                    session_id: id.clone(),
+                },
+            )
+            .unwrap();
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(state["worker"]["session_id"], id);
+        assert_eq!(
+            daemon.watchers["worker"].configured_session_id().as_deref(),
+            Some(id.as_str())
         );
     }
 }

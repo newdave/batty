@@ -47,6 +47,7 @@ struct CodexState {
     started_at: Instant,
     /// Thread ID from the first `thread.started` event, used for resume.
     thread_id: Option<String>,
+    launch_context: super::codex_session::LaunchContext,
     /// Accumulated agent response text for the current turn.
     accumulated_response: String,
     /// Message ID of the currently pending (in-flight) message.
@@ -78,12 +79,15 @@ struct CodexState {
 pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
     eprintln!("[shim-codex {}] started (spawn-per-message mode)", args.id);
 
+    let launch_context = super::codex_session::LaunchContext::load(&args.cwd, &args.id)?;
+
     // Shared state
     let state = Arc::new(Mutex::new(CodexState {
         state: ShimState::Idle,
         state_changed_at: Instant::now(),
         started_at: Instant::now(),
-        thread_id: None,
+        thread_id: launch_context.resume_session_id.clone(),
+        launch_context,
         accumulated_response: String::new(),
         pending_message_id: None,
         message_queue: VecDeque::new(),
@@ -195,6 +199,11 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                         let thread_id = st.thread_id.clone();
                         let program = st.program.clone();
                         let cwd = st.cwd.clone();
+                        let text = st.launch_context.prompt(
+                            st.thread_id.is_none(),
+                            &format_injected_message(&from, &body),
+                        );
+                        st.context_approaching_emitted = false;
                         drop(st);
 
                         cmd_channel.send(&Event::StateChanged {
@@ -207,7 +216,6 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                         }
 
                         // Spawn codex exec subprocess for this message
-                        let text = format_injected_message(&from, &body);
                         let (exec_program, exec_args) =
                             codex_types::codex_sdk_args(&program, thread_id.as_deref());
 
@@ -506,8 +514,36 @@ fn run_codex_exec(
             "thread.started" => {
                 if let Some(tid) = evt.thread_id {
                     let mut st = state.lock().unwrap();
+                    let invalid = uuid::Uuid::parse_str(&tid).is_err()
+                        || st
+                            .thread_id
+                            .as_ref()
+                            .is_some_and(|existing| existing != &tid);
+                    if invalid {
+                        st.configuration_error = Some((
+                            "Codex thread identity changed unexpectedly".into(),
+                            Some("thread_identity_mismatch".into()),
+                        ));
+                        drop(st);
+                        let _ = evt_channel.send(&Event::ConfigurationRequired {
+                            message: "Codex thread identity changed unexpectedly".into(),
+                            code: Some("thread_identity_mismatch".into()),
+                        });
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
+                    }
                     st.thread_id = Some(tid.clone());
-                    eprintln!("[shim-codex {shim_id}] thread started: {tid}");
+                    st.launch_context.resume_session_id = Some(tid.clone());
+                    let context = st.launch_context.clone();
+                    drop(st);
+                    if let Err(error) = context.save(cwd, shim_id) {
+                        let _ = evt_channel.send(&Event::Error {
+                            command: "PersistCodexThread".into(),
+                            reason: error.to_string(),
+                        });
+                    }
+                    let _ = evt_channel.send(&Event::SessionStarted { session_id: tid });
                 }
             }
 
@@ -716,6 +752,12 @@ fn run_codex_exec(
     let thread_id = st.thread_id.clone();
     let program = st.program.clone();
     let cwd_owned = st.cwd.clone();
+    let next_text = queued_msg.as_ref().map(|message| {
+        st.launch_context.prompt(
+            st.thread_id.is_none(),
+            &format_injected_message(&message.from, &message.body),
+        )
+    });
     let queue_depth = st.message_queue.len();
     drop(st);
 
@@ -738,7 +780,7 @@ fn run_codex_exec(
             summary: format!("delivering queued message ({queue_depth} remaining)"),
         });
 
-        let text = format_injected_message(&qm.from, &qm.body);
+        let text = next_text.unwrap_or_else(|| format_injected_message(&qm.from, &qm.body));
         let (exec_program, exec_args) = codex_types::codex_sdk_args(&program, thread_id.as_deref());
 
         // Recursive call for queued message (same thread)
@@ -954,6 +996,7 @@ mod tests {
             state_changed_at: Instant::now(),
             started_at: Instant::now(),
             thread_id: None,
+            launch_context: Default::default(),
             accumulated_response: String::new(),
             pending_message_id: None,
             message_queue: VecDeque::new(),
@@ -1039,6 +1082,61 @@ mod tests {
         assert!(
             model_configuration_error(&serde_json::json!({}), "refresh token was already used")
                 .is_none()
+        );
+    }
+    #[test]
+    fn fake_codex_exec_reports_and_persists_actual_thread() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let program = tmp.path().join("fake-codex");
+        std::fs::write(&program,format!("#!/bin/sh\n/bin/cat > /dev/null\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"{id}\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"done\"}}}}'\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(Mutex::new(CodexState {
+            state: ShimState::Working,
+            state_changed_at: Instant::now(),
+            started_at: Instant::now(),
+            thread_id: None,
+            launch_context: Default::default(),
+            accumulated_response: String::new(),
+            pending_message_id: Some("message-1".into()),
+            message_queue: VecDeque::new(),
+            cumulative_output_bytes: 0,
+            program: program.to_string_lossy().into(),
+            cwd: tmp.path().into(),
+            context_approaching_emitted: false,
+            quota_blocked_until: None,
+            configuration_error: None,
+        }));
+        let (parent, child) = protocol::socketpair().unwrap();
+        let mut parent = protocol::Channel::new(parent);
+        parent
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut child = protocol::Channel::new(child);
+        run_codex_exec(
+            "worker",
+            program.to_str().unwrap(),
+            &[],
+            "assigned work",
+            tmp.path(),
+            &state,
+            &mut child,
+            None,
+        );
+        assert_eq!(
+            state.lock().unwrap().thread_id.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            super::super::codex_session::LaunchContext::load(tmp.path(), "worker")
+                .unwrap()
+                .resume_session_id
+                .as_deref(),
+            Some(id.as_str())
+        );
+        assert!(
+            matches!(parent.recv::<Event>().unwrap().unwrap(),Event::SessionStarted{session_id} if session_id==id)
         );
     }
 }

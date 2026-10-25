@@ -224,7 +224,9 @@ fn collect_cost_report(
         let session_id = launch_state
             .get(&member.name)
             .and_then(|identity| identity.session_id.as_deref());
-        let allow_cwd_fallback = session_id.is_none()
+        let allow_cwd_fallback = !(team_config.use_sdk_mode
+            && launch_state.contains_key(&member.name))
+            && session_id.is_none()
             && session_target_counts
                 .get(&(agent_kind, session_cwd.clone()))
                 .copied()
@@ -527,13 +529,14 @@ fn discover_codex_session_file(
                     let Some(meta) = read_codex_session_meta(&entry)? else {
                         continue;
                     };
-                    if meta.cwd.as_deref() != Some(cwd.as_os_str()) {
+                    if let Some(wanted) = session_id {
+                        if meta.id.as_deref() == Some(wanted) {
+                            return Ok(Some(entry));
+                        }
                         continue;
                     }
-                    if let Some(wanted) = session_id
-                        && meta.id.as_deref() == Some(wanted)
-                    {
-                        return Ok(Some(entry));
+                    if meta.cwd.as_deref() != Some(cwd.as_os_str()) {
+                        continue;
                     }
                     let modified = fs::metadata(&entry)
                         .and_then(|metadata| metadata.modified())
@@ -2044,6 +2047,38 @@ mod tests {
             discover_claude_session_file(&projects, &cwd, Some("missing"), false)
                 .unwrap()
                 .is_none()
+        );
+    }
+    #[test]
+    fn codex_explicit_thread_survives_sdk_working_directory_difference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day = tmp.path().join("2026/10/25");
+        fs::create_dir_all(&day).unwrap();
+        let file = day.join("thread.jsonl");
+        fs::write(
+            &file,
+            r#"{"type":"session_meta","payload":{"id":"actual-id","cwd":"/actual/worktree"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            discover_codex_session_file(
+                tmp.path(),
+                Path::new("/context/directory"),
+                Some("actual-id"),
+                false
+            )
+            .unwrap(),
+            Some(file)
+        );
+        assert!(
+            discover_codex_session_file(
+                tmp.path(),
+                Path::new("/actual/worktree"),
+                Some("missing-id"),
+                false
+            )
+            .unwrap()
+            .is_none()
         );
     }
 }
