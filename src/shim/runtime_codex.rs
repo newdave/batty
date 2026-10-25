@@ -63,6 +63,7 @@ struct CodexState {
     context_approaching_emitted: bool,
     /// When a backend quota block expires, if known.
     quota_blocked_until: Option<u64>,
+    configuration_error: Option<(String, Option<String>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +92,7 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
         cwd: args.cwd.clone(),
         context_approaching_emitted: false,
         quota_blocked_until: None,
+        configuration_error: None,
     }));
 
     // PTY log writer (optional — writes readable text for tmux display)
@@ -162,6 +164,11 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
             } => {
                 let delivery_id = message_id.clone();
                 let mut st = state_cmd.lock().unwrap();
+                if let Some((message, code)) = st.configuration_error.clone() {
+                    drop(st);
+                    cmd_channel.send(&Event::ConfigurationRequired { message, code })?;
+                    continue;
+                }
                 if let Some(until) = st.quota_blocked_until {
                     let now = current_unix_secs();
                     if until > now {
@@ -452,6 +459,41 @@ fn run_codex_exec(
             continue;
         }
 
+        // Keep raw structured error codes: the compatibility event type only
+        // models the message and otherwise ignores future provider fields.
+        let raw: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if matches!(
+            raw.get("type").and_then(|v| v.as_str()),
+            Some("turn.failed" | "error")
+        ) {
+            let message = raw
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .or_else(|| raw.get("message").and_then(|v| v.as_str()))
+                .unwrap_or("unknown error");
+            if let Some(code) = model_configuration_error(&raw, message) {
+                let mut st = state.lock().unwrap();
+                st.pending_message_id = None;
+                st.state = ShimState::Idle;
+                st.state_changed_at = Instant::now();
+                st.configuration_error = Some((message.to_string(), code.clone()));
+                let drain = drain_queue_errors(&mut st.message_queue, ShimState::Idle);
+                drop(st);
+                let _ = evt_channel.send(&Event::ConfigurationRequired {
+                    message: message.into(),
+                    code,
+                });
+                for event in drain {
+                    let _ = evt_channel.send(&event);
+                }
+                // The reader must not wait indefinitely for a terminally
+                // misconfigured provider process that leaves stdout open.
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+
         let evt: CodexEvent = match serde_json::from_str(&line) {
             Ok(e) => e,
             Err(e) => {
@@ -518,7 +560,7 @@ fn run_codex_exec(
                 // been consumed. No amount of respawning fixes this — a
                 // human must re-login. Park the shim Idle and surface an
                 // AuthRequired event so the daemon stops dispatching.
-                if detect_auth_required(&error_msg) {
+                if detect_auth_required(&error_msg) || structured_auth_required(&raw) {
                     let mut st = state.lock().unwrap();
                     st.pending_message_id = None;
                     st.state = ShimState::Idle;
@@ -592,7 +634,7 @@ fn run_codex_exec(
                 // Non-recoverable auth failure short-circuits before quota
                 // detection so we never treat a dead refresh token as a
                 // transient billing issue.
-                if detect_auth_required(&error_msg) {
+                if detect_auth_required(&error_msg) || structured_auth_required(&raw) {
                     let mut st = state.lock().unwrap();
                     st.pending_message_id = None;
                     st.state = ShimState::Idle;
@@ -717,6 +759,45 @@ fn run_codex_exec(
 struct QuotaBlock {
     retry_at_epoch_secs: Option<u64>,
     retry_at_label: Option<String>,
+}
+
+/// Structured codes win over legacy text matching. Unknown structured codes
+/// are left to the existing transient/auth/quota handlers, not guessed terminal.
+fn model_configuration_error(raw: &serde_json::Value, message: &str) -> Option<Option<String>> {
+    let code = raw
+        .pointer("/error/code")
+        .or_else(|| raw.get("code"))
+        .or_else(|| raw.pointer("/error/type"))
+        .and_then(|v| v.as_str());
+    if let Some(code) = code {
+        return matches!(
+            code.to_ascii_lowercase().as_str(),
+            "model_not_found" | "unsupported_model" | "invalid_model" | "model_not_supported"
+        )
+        .then(|| Some(code.to_string()));
+    }
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("model_not_found")
+        || lower.contains("unsupported model")
+        || lower.contains("not supported when using codex")
+        || lower.contains("invalid model"))
+    .then_some(None)
+}
+
+fn structured_auth_required(raw: &serde_json::Value) -> bool {
+    raw.pointer("/error/code")
+        .or_else(|| raw.get("code"))
+        .or_else(|| raw.pointer("/error/type"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|code| {
+            matches!(
+                code.to_ascii_lowercase().as_str(),
+                "invalid_api_key"
+                    | "authentication_error"
+                    | "unauthorized"
+                    | "refresh_token_reused"
+            )
+        })
 }
 
 /// Detect the non-recoverable codex auth-credential error. The refresh token
@@ -881,6 +962,7 @@ mod tests {
             cwd: std::path::PathBuf::from("/tmp"),
             context_approaching_emitted: false,
             quota_blocked_until: None,
+            configuration_error: None,
         };
         assert_eq!(st.state, ShimState::Idle);
         assert!(st.thread_id.is_none());
@@ -916,5 +998,47 @@ mod tests {
     #[test]
     fn detect_quota_block_ignores_non_quota_failures() {
         assert!(detect_quota_block("stream error").is_none());
+    }
+    #[test]
+    fn configuration_errors_use_codes_before_legacy_text() {
+        for event_type in ["turn.failed", "error"] {
+            let event = serde_json::json!({"type":event_type,"error":{"code":"model_not_found","message":"unavailable"}});
+            assert_eq!(
+                model_configuration_error(&event, "unavailable"),
+                Some(Some("model_not_found".into()))
+            );
+        }
+        assert_eq!(
+            model_configuration_error(
+                &serde_json::json!({}),
+                "Model is not supported when using Codex"
+            ),
+            Some(None)
+        );
+        assert!(
+            model_configuration_error(
+                &serde_json::json!({"error":{"code":"rate_limit_exceeded"}}),
+                "unsupported model"
+            )
+            .is_none()
+        );
+        assert!(structured_auth_required(
+            &serde_json::json!({"error":{"code":"invalid_api_key"}})
+        ));
+        assert!(!structured_auth_required(
+            &serde_json::json!({"error":{"code":"model_not_found"}})
+        ));
+        assert!(
+            model_configuration_error(
+                &serde_json::json!({"error":{"code":"invalid_api_key"}}),
+                "invalid credentials"
+            )
+            .is_none()
+        );
+        assert!(model_configuration_error(&serde_json::json!({}), "stream error").is_none());
+        assert!(
+            model_configuration_error(&serde_json::json!({}), "refresh token was already used")
+                .is_none()
+        );
     }
 }

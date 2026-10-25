@@ -872,9 +872,22 @@ impl TeamDaemon {
     /// gate on this to avoid churn against an engineer that simply cannot
     /// make progress until the quota window elapses (#674).
     pub(in crate::team) fn member_backend_parked(&self, member_name: &str) -> bool {
+        if self
+            .config
+            .project_root
+            .join(".batty/backend-configuration")
+            .join(format!("{member_name}.json"))
+            .exists()
+        {
+            return true;
+        }
         if matches!(
             self.backend_health.get(member_name),
-            Some(BackendHealth::QuotaExhausted | BackendHealth::AuthRequired)
+            Some(
+                BackendHealth::QuotaExhausted
+                    | BackendHealth::AuthRequired
+                    | BackendHealth::ConfigurationRequired
+            )
         ) {
             return true;
         }
