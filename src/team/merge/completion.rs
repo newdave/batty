@@ -972,7 +972,7 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
                 )
             } else {
                 format!(
-                    "Verification could not accept this completion: no sufficient task evidence was found. Commits ahead of main: {total_commits}. Files changed: {files_changed}. Code files changed: {code_files_changed}. Diff stat: {}",
+                    "Verification could not accept this completion: no sufficient task evidence was found. Commits ahead of {trunk_branch}: {total_commits}. Files changed: {files_changed}. Code files changed: {code_files_changed}. Diff stat: {}",
                     if diff_stat.is_empty() {
                         "(empty)".to_string()
                     } else {
@@ -1412,7 +1412,7 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
 
                 if let Some(ref manager_name) = manager_name {
                     let rollup = format!(
-                        "Rollup: Task #{task_id} completed by {engineer}. Tests passed, merged to main.{}",
+                        "Rollup: Task #{task_id} completed by {engineer}. Tests passed, merged to {trunk_branch}.{}",
                         if board_update_ok {
                             ""
                         } else {
@@ -1454,7 +1454,7 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
                 let attempt = daemon.increment_retry(engineer);
                 if attempt <= 2 {
                     let msg = format!(
-                        "Merge conflict during rebase onto main (attempt {attempt}/2). Fix the conflicts in your worktree and try again:\n{conflict_info}"
+                        "Merge conflict during rebase onto {trunk_branch} (attempt {attempt}/2). Fix the conflicts in your worktree and try again:\n{conflict_info}"
                     );
                     daemon.queue_message("batty", engineer, &msg)?;
                     daemon.mark_member_working(engineer);
@@ -1511,7 +1511,7 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
                 );
 
                 let manager_notice = format!(
-                    "Task #{task_id} from {engineer} passed tests but could not be merged to main.\n{merge_info}\nDecide whether to retry the isolated merge path, inspect the integration-worktree failure, or redirect the engineer."
+                    "Task #{task_id} from {engineer} passed tests but could not be merged to {trunk_branch}.\n{merge_info}\nDecide whether to retry the isolated merge path, inspect the integration-worktree failure, or redirect the engineer."
                 );
                 if let Some(ref manager_name) = manager_name {
                     daemon.queue_message("daemon", manager_name, &manager_notice)?;
@@ -1520,7 +1520,7 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
                 }
 
                 let engineer_notice = format!(
-                    "Your task passed tests, but Batty could not merge it into main.\n{merge_info}\nWait for lead direction before making more changes."
+                    "Your task passed tests, but Batty could not merge it into {trunk_branch}.\n{merge_info}\nWait for lead direction before making more changes."
                 );
                 daemon.queue_message("daemon", engineer, &engineer_notice)?;
 

@@ -272,7 +272,8 @@ impl TeamDaemon {
                 .find(|m| m.name == engineer)
                 .is_some_and(|m| m.role_type == RoleType::Engineer);
             let remediation = assess_review_merge_remediation(&self.config.project_root, task);
-            let detail = remediation_branch_detail(task.id, &remediation);
+            let trunk_branch = self.config.team_config.trunk_branch();
+            let detail = remediation_branch_detail(task.id, &remediation, trunk_branch);
             if is_eng {
                 match remediation.kind {
                     ReviewMergeRemediationKind::Merge => {
@@ -309,7 +310,7 @@ impl TeamDaemon {
                             "review merge remediation suppressed"
                         );
                         suppressed_cmds.push(format!(
-                            "   #{} by {} -> merge suppressed\n   {}\n   Reason: {}.\n   Inspect `git log --oneline main..{}` before taking action.",
+                            "   #{} by {} -> merge suppressed\n   {}\n   Reason: {}.\n   Inspect `git log --oneline {trunk_branch}..{}` before taking action.",
                             task.id,
                             engineer,
                             detail,
@@ -515,7 +516,8 @@ fn stale_review_command(
     match next_step {
         ReviewNormalizationStep::Merge => {
             let remediation = assess_review_merge_remediation(project_root, task);
-            let detail = remediation_branch_detail(task_id, &remediation);
+            let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
+            let detail = remediation_branch_detail(task_id, &remediation, &trunk_branch);
             match remediation.kind {
                 ReviewMergeRemediationKind::Merge => format!(
                     "   #{} by {} -> merge ({})\n   {}\n   `batty merge {claimed_by}` && `kanban-md move --dir {board_dir_str} {task_id} done`",
@@ -531,7 +533,7 @@ fn stale_review_command(
                     normalize_review_command(board_dir, task_id)
                 ),
                 ReviewMergeRemediationKind::Suppress => format!(
-                    "   #{} by {} -> merge suppressed ({})\n   {}\n   Reason: {}.\n   Inspect `git log --oneline main..{}` before taking action.",
+                    "   #{} by {} -> merge suppressed ({})\n   {}\n   Reason: {}.\n   Inspect `git log --oneline {trunk_branch}..{}` before taking action.",
                     task_id,
                     claimed_by,
                     stale_reason,
@@ -564,6 +566,7 @@ fn normalize_review_command(board_dir: &std::path::Path, task_id: u32) -> String
 fn remediation_branch_detail(
     task_id: u32,
     remediation: &crate::team::review::ReviewMergeRemediation,
+    trunk_branch: &str,
 ) -> String {
     let expected_branch = remediation.expected_branch.as_deref().unwrap_or("missing");
     let actual_branch = remediation
@@ -575,13 +578,28 @@ fn remediation_branch_detail(
         .map(|count| count.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "Task #{task_id}: expected branch `{expected_branch}`, actual branch `{actual_branch}`, commits ahead of main: {commits_ahead}"
+        "Task #{task_id}: expected branch `{expected_branch}`, actual branch `{actual_branch}`, commits ahead of {trunk_branch}: {commits_ahead}"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remediation_branch_detail_names_configured_trunk() {
+        let remediation = crate::team::review::ReviewMergeRemediation {
+            kind: ReviewMergeRemediationKind::Suppress,
+            reason: "test".to_string(),
+            expected_branch: Some("eng-1/7".to_string()),
+            actual_branch: Some("eng-1/7".to_string()),
+            commits_ahead: Some(3),
+        };
+
+        let detail = remediation_branch_detail(7, &remediation, "develop");
+
+        assert!(detail.contains("commits ahead of develop: 3"), "{detail}");
+    }
     use crate::team::config::RoleType;
     use crate::team::hierarchy::MemberInstance;
 
