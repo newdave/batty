@@ -112,6 +112,9 @@ impl TeamDaemon {
         };
 
         let Some(session_id) = session_id else {
+            if self.config.team_config.use_sdk_mode {
+                return;
+            }
             let Some(member) = self
                 .config
                 .members
@@ -818,6 +821,38 @@ impl TeamDaemon {
                 ));
             }
 
+            Event::ConfigurationRequired { message: _, code } => {
+                self.backend_health.insert(
+                    member_name.to_string(),
+                    crate::agent::BackendHealth::ConfigurationRequired,
+                );
+                // Persist only a fixed diagnostic: provider messages may contain
+                // request details and must not enter this durable operator marker.
+                let directory = self
+                    .config
+                    .project_root
+                    .join(".batty/backend-configuration");
+                std::fs::create_dir_all(&directory)?;
+                let path = directory.join(format!("{member_name}.json"));
+                std::fs::write(
+                    &path,
+                    "{\"reason\":\"backend configuration requires repair\"}\n",
+                )?;
+
+                let _ = append_shim_event_log(
+                    &self.config.project_root,
+                    member_name,
+                    &format!(
+                        "<- configuration_required: {}",
+                        code.as_deref().unwrap_or("model_configuration")
+                    ),
+                );
+                self.record_orchestrator_action(format!(
+                    "configuration: {member_name} requires operator repair before retry ({})",
+                    code.as_deref().unwrap_or("model_configuration")
+                ));
+            }
+
             Event::AuthRequired { message } => {
                 let _ = append_shim_event_log(
                     &self.config.project_root,
@@ -1214,6 +1249,32 @@ impl TeamDaemon {
         }
         if self.active_task_id(member_name) != Some(task_id) {
             self.clear_zero_diff_completion(task_id);
+            return Ok(());
+        }
+
+        if self.config.team_config.workflow_policy.zero_diff_recovery
+            == crate::team::config::ZeroDiffRecovery::Park
+        {
+            // This is only the existing attribution guard's recovery action;
+            // it does not extend that guard to other deliverable contracts.
+            if self
+                .config
+                .members
+                .iter()
+                .any(|m| m.name == member_name && m.role_type == RoleType::Engineer)
+            {
+                crate::team::bench::bench_engineer(
+                    self.project_root(),
+                    member_name,
+                    Some("completion attribution requires operator review"),
+                )?;
+            }
+            self.record_task_escalated(
+                member_name,
+                task_id.to_string(),
+                Some("completion_attribution_recovery_required"),
+            );
+            self.record_orchestrator_action(format!("recovery: {member_name} parked after repeated unattributed completion on task #{task_id}; operator review required"));
             return Ok(());
         }
 
@@ -3148,6 +3209,36 @@ mod tests {
         assert!(
             !handoff_path.exists(),
             "cold respawn should consume the handoff file into the prompt"
+        );
+    }
+    #[test]
+    fn terminal_configuration_error_persists_generic_marker_for_non_engineer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![architect_member("lead")])
+            .build();
+        daemon
+            .handle_shim_event(
+                "lead",
+                Event::ConfigurationRequired {
+                    message: "private provider detail must not be persisted".into(),
+                    code: Some("model_not_found".into()),
+                },
+            )
+            .unwrap();
+        let marker = tmp.path().join(".batty/backend-configuration/lead.json");
+        let value = std::fs::read_to_string(marker).unwrap();
+        assert!(value.contains("backend configuration requires repair"));
+        assert!(!value.contains("private provider detail"));
+        assert_eq!(
+            daemon.backend_health.get("lead"),
+            Some(&crate::agent::BackendHealth::ConfigurationRequired)
+        );
+        assert!(daemon.member_backend_parked("lead"));
+        assert!(
+            !crate::team::bench::benched_engineer_names(tmp.path())
+                .unwrap()
+                .contains("lead")
         );
     }
 }

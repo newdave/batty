@@ -632,6 +632,26 @@ impl TeamDaemon {
                 .copied()
                 .unwrap_or(BackendHealth::Healthy);
 
+            let configuration_marker = self
+                .config
+                .project_root
+                .join(".batty/backend-configuration")
+                .join(format!("{member_name}.json"));
+            if configuration_marker.exists() {
+                self.backend_health
+                    .insert(member_name.clone(), BackendHealth::ConfigurationRequired);
+                continue;
+            }
+            if prev_health == BackendHealth::ConfigurationRequired {
+                // Operator cleared the durable marker. Recreate only this
+                // member's shim so its local terminal-error latch is cleared.
+                self.backend_health.insert(member_name.clone(), new_health);
+                if self.shim_handles.contains_key(member_name) {
+                    self.handle_shim_cold_respawn(member_name, "backend configuration reset")?;
+                }
+                continue;
+            }
+
             // #674 defect 1: do NOT transition from QuotaExhausted to a
             // better state just because `which codex` returned Healthy.
             // A successful binary probe (or even a successful poll_shim ping)
