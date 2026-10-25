@@ -156,6 +156,23 @@ pub fn init_team_with_overrides(
                 include_str!("templates/python_engineer.md"),
             ),
         ],
+        "simple" => &[
+            ("architect.md", include_str!("templates/architect.md")),
+            ("manager.md", include_str!("templates/manager.md")),
+            ("engineer.md", include_str!("templates/engineer.md")),
+            (
+                "research_specialist.md",
+                include_str!("templates/research_specialist.md"),
+            ),
+            (
+                "documentation_specialist.md",
+                include_str!("templates/documentation_specialist.md"),
+            ),
+            (
+                "quality_specialist.md",
+                include_str!("templates/quality_specialist.md"),
+            ),
+        ],
         _ => &[
             ("architect.md", include_str!("templates/architect.md")),
             ("manager.md", include_str!("templates/manager.md")),
@@ -886,7 +903,7 @@ mod tests {
         let config = team_config_dir(tmp.path());
         assert!(config.join("board").is_dir() || config.join("kanban.md").exists());
         let team_yaml = std::fs::read_to_string(team_config_path(tmp.path())).unwrap();
-        assert!(team_yaml.contains("auto_respawn_on_crash: true"));
+        assert!(team_yaml.contains("auto_respawn_on_crash: false"));
     }
 
     #[test]

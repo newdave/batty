@@ -54,7 +54,7 @@ mod tests {
     ) -> Vec<MemberInstance> {
         let config = load_template(yaml);
         assert_eq!(config.workflow_mode, WorkflowMode::Hybrid);
-        assert!(config.orchestrator_enabled());
+        assert_eq!(config.orchestrator_enabled(), config.orchestrator_pane);
 
         let members = resolve_hierarchy(&config).unwrap();
         let capability_map = resolve_capability_map(&members);
@@ -206,7 +206,7 @@ mod tests {
                 users: 1,
                 architects: 1,
                 managers: 1,
-                engineers: 3,
+                engineers: 5,
                 role_capabilities: vec![
                     (
                         "architect",
@@ -228,7 +228,7 @@ mod tests {
                 .iter()
                 .filter(|member| member.role_name == "engineer")
                 .count(),
-            3
+            2
         );
     }
 

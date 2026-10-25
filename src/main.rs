@@ -150,7 +150,7 @@ fn collect_init_overrides() -> Result<team::InitOverrides> {
     println!("── Orchestrator ──────────────────────────────────────────");
     println!("The orchestrator is a dedicated tmux pane that runs automated");
     println!("triage, review routing, dispatch-gap recovery, and standups.");
-    ov.orchestrator_pane = Some(confirm("Enable orchestrator pane?", true)?);
+    ov.orchestrator_pane = Some(confirm("Enable orchestrator pane?", false)?);
 
     println!();
     println!("── Board & Dispatch ──────────────────────────────────────");
@@ -194,14 +194,14 @@ fn collect_init_overrides() -> Result<team::InitOverrides> {
     println!("Architect utilization: nudges the architect when engineers are idle.");
     ov.architect_utilization_interventions = Some(confirm(
         "Enable architect utilization interventions?",
-        true,
+        false,
     )?);
 
     println!();
     println!("── Auto-Merge ───────────────────────────────────────────");
     println!("When enabled, completed engineer branches that pass tests and");
     println!("score above a confidence threshold are merged automatically.");
-    ov.auto_merge_enabled = Some(confirm("Enable auto-merge?", false)?);
+    ov.auto_merge_enabled = Some(confirm("Enable auto-merge?", true)?);
 
     println!();
     println!("── Timing (seconds) ─────────────────────────────────────");
@@ -210,17 +210,17 @@ fn collect_init_overrides() -> Result<team::InitOverrides> {
 
     ov.standup_interval_secs = Some(input_u64(
         "Standup interval (secs, how often agents report status)",
-        600,
+        1800,
     )?);
 
     ov.nudge_interval_secs = Some(input_u64(
         "Architect nudge interval (secs, idle ping for architect)",
-        900,
+        3600,
     )?);
 
     ov.stall_threshold_secs = Some(input_u64(
         "Stall threshold (secs, agent considered stuck after this)",
-        300,
+        900,
     )?);
 
     ov.review_nudge_threshold_secs = Some(input_u64(
