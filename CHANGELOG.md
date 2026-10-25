@@ -16,6 +16,8 @@ All notable changes to Batty are documented here.
 
 ### Changed
 
+- Routine template roles use Sonnet/medium and documentation uses Haiku. Shorter
+  role prompts bound scope, status exchanges, retries and completion packets.
 - The simple team uses two general engineers and three on-demand specialists,
   longer standup and nudge intervals, and bounded verification and recovery.
 - Idle inference, architect utilisation interventions and automatic crash

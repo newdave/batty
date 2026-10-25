@@ -43,6 +43,8 @@ roles:
   - name: architect
     role_type: architect
     agent: claude
+    model: sonnet
+    effort: medium
     instances: 1
     prompt: architect.md
     talks_to: [human, manager, research-specialist]
@@ -50,12 +52,16 @@ roles:
   - name: manager
     role_type: manager
     agent: claude
+    model: sonnet
+    effort: medium
     instances: 1
     prompt: manager.md
     talks_to: [architect, engineer, research-specialist, documentation-specialist, quality-specialist]
   - name: engineer
     role_type: engineer
     agent: claude
+    model: sonnet
+    effort: medium
     instances: 2
     prompt: engineer.md
     talks_to: [manager]
@@ -63,6 +69,8 @@ roles:
   - name: research-specialist
     role_type: engineer
     agent: claude
+    model: sonnet
+    effort: medium
     instances: 1
     prompt: research_specialist.md
     on_demand: true
@@ -71,6 +79,7 @@ roles:
   - name: documentation-specialist
     role_type: engineer
     agent: claude
+    model: haiku
     instances: 1
     prompt: documentation_specialist.md
     on_demand: true
@@ -79,6 +88,8 @@ roles:
   - name: quality-specialist
     role_type: engineer
     agent: claude
+    model: sonnet
+    effort: medium
     instances: 1
     prompt: quality_specialist.md
     on_demand: true
