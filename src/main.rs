@@ -269,6 +269,7 @@ fn main() -> Result<()> {
                     cli::InitTemplate::Solo => "solo",
                     cli::InitTemplate::Pair => "pair",
                     cli::InitTemplate::Simple => "simple",
+                    cli::InitTemplate::Mixed => "mixed",
                     cli::InitTemplate::Squad => "squad",
                     cli::InitTemplate::Large => "large",
                     cli::InitTemplate::Research => "research",
