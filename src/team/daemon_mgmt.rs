@@ -908,6 +908,17 @@ pub fn start_team(project_root: &Path, attach: bool) -> Result<String> {
     team_config.validate()?;
     team_config.validate_project_refs(project_root)?;
 
+    if team_config.workflow_policy.verification.auto_run_tests {
+        super::task_loop::resolve_test_command(
+            project_root,
+            team_config
+                .workflow_policy
+                .verification
+                .test_command
+                .as_deref()
+                .or(team_config.workflow_policy.test_command.as_deref()),
+        )?;
+    }
     let options = super::agent_options::all(&team_config)?;
     for option in options {
         if project_root
