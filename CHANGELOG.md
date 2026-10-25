@@ -2,6 +2,44 @@
 
 All notable changes to Batty are documented here.
 
+## Unreleased — 2026-10-25
+
+### Added
+
+- An opt-in mixed template with Codex/medium engineers and QA, Claude coordination
+  and research, and Haiku documentation. Backend overrides clear incompatible pins.
+- Per-member model and effort overrides, explicit tag-to-role routing, on-demand
+  specialists and ordered mixed-role layout zones.
+- Native preflight, bounded startup consistency checks, member-scoped backend
+  recovery, explicit live backend probes and acceptance evidence reports.
+- Machine-readable cost output with pricing coverage and attribution warnings.
+- Project-aware verification commands with explicit overrides, Makefile/Cargo
+  detection and pre-launch diagnostics for unsupported projects.
+
+### Changed
+
+- Routine template roles use Sonnet/medium and documentation uses Haiku. Shorter
+  role prompts bound scope, status exchanges, retries and completion packets.
+- The simple team uses two general engineers and three on-demand specialists,
+  longer standup and nudge intervals, and bounded verification and recovery.
+- Idle inference, architect utilisation interventions and automatic crash
+  respawn are disabled by default. Explicit configuration remains authoritative.
+
+### Fixed
+
+- Codex SDK uses actual provider thread IDs, first-turn role context and explicit
+  resume provenance; live token statistics follow deduplicated completed turns.
+- Codex exec failures no longer report successful task completion; shutdown stops
+  owned execution and queued delivery failures remain visible. Explicit Codex
+  probes are ephemeral and read-only.
+- Pinned session identities no longer follow unrelated newer transcripts.
+- Context pressure follows request usage and explicit provider window metadata.
+- Terminal configuration failures park the affected backend until repaired.
+- Session accounting deduplicates snapshots and inclusive token subsets, and
+  leaves incomplete or mixed-model pricing unknown.
+- Structured board writes share the backend lock, reject stale snapshots and
+  restore exact file permissions, with rollback after partial write failures.
+
 ## 0.11.63 — 2026-04-25
 
 Docs-quality follow-up for the launch-stability release. This release keeps

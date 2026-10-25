@@ -302,8 +302,46 @@ pub enum Command {
     },
 
     /// Estimate current run cost from agent session files
-    Cost,
+    Cost {
+        /// Emit observed usage and explicit unknown pricing as JSON
+        #[arg(long)]
+        json: bool,
+    },
 
+    /// Validate launch settings and provenance without starting agents or inference
+    Preflight {
+        #[arg(long)]
+        runtime: bool,
+    },
+
+    /// Reset a repaired terminal backend configuration error
+    BackendReset { member: String },
+    /// Make one explicit inference request to check a configured backend
+    BackendProbe {
+        member: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+
+    /// Record independent acceptance evidence (commits optional for non-code tasks)
+    OutcomeRecord {
+        task: u32,
+        #[arg(long)]
+        evidence: PathBuf,
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        defects: u32,
+    },
+    /// Summarise explicit acceptance within an inclusive Unix-time window
+    OutcomeReport {
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+        #[arg(long)]
+        until: Option<i64>,
+    },
     /// Dynamically scale team topology (add/remove agents)
     Scale {
         #[command(subcommand)]
@@ -821,8 +859,10 @@ pub enum InitTemplate {
     Solo,
     /// Architect + 1 engineer pair (2 panes)
     Pair,
-    /// 1 architect + 1 manager + 3 engineers (5 panes)
+    /// Architect, manager, two engineers and three on-demand specialists
     Simple,
+    /// Claude coordination and research; Codex engineering and QA; Haiku documentation
+    Mixed,
     /// 1 architect + 1 manager + 5 engineers with layout (7 panes)
     Squad,
     /// Human + architect + 3 managers + 15 engineers with Telegram (19 panes)
@@ -2321,7 +2361,7 @@ mod tests {
     #[test]
     fn cost_subcommand_parses() {
         let cli = Cli::parse_from(["batty", "cost"]);
-        assert!(matches!(cli.command, Command::Cost));
+        assert!(matches!(cli.command, Command::Cost { json: false }));
     }
 
     #[test]
@@ -3063,6 +3103,7 @@ mod tests {
             ("solo", InitTemplate::Solo),
             ("pair", InitTemplate::Pair),
             ("simple", InitTemplate::Simple),
+            ("mixed", InitTemplate::Mixed),
             ("squad", InitTemplate::Squad),
             ("large", InitTemplate::Large),
             ("research", InitTemplate::Research),

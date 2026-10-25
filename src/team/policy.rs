@@ -411,8 +411,8 @@ mod tests {
     #[test]
     fn default_policy_stall_and_health_fields() {
         let policy = WorkflowPolicy::default();
-        assert_eq!(policy.stall_threshold_secs, 300);
-        assert_eq!(policy.max_stall_restarts, 2);
+        assert_eq!(policy.stall_threshold_secs, 900);
+        assert_eq!(policy.max_stall_restarts, 1);
         assert_eq!(policy.health_check_interval_secs, 60);
         assert_eq!(policy.uncommitted_warn_threshold, 200);
     }

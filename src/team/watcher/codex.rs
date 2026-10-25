@@ -47,12 +47,10 @@ pub(super) fn discover_codex_session_file(
                         let Some(meta) = read_codex_session_meta(&entry)? else {
                             continue;
                         };
-                        if meta.cwd.as_deref() != Some(cwd.as_os_str()) {
-                            continue;
-                        }
                         let file_id = session_file_id(&entry);
-                        if file_id.as_deref() == Some(session_id)
-                            || meta.id.as_deref() == Some(session_id)
+                        if meta.id.as_deref() == Some(session_id)
+                            || (meta.cwd.as_deref() == Some(cwd.as_os_str())
+                                && file_id.as_deref() == Some(session_id))
                         {
                             return Ok(Some(entry));
                         }

@@ -52,6 +52,11 @@ Commands:
   queue                    Show pending dispatch queue entries
   dispatch                 Explain which engineer would receive the next dispatch
   cost                     Estimate current run cost from agent session files
+  preflight                Validate launch settings and provenance without starting agents or inference
+  backend-reset            Reset a repaired terminal backend configuration error
+  backend-probe            Make one explicit inference request to check a configured backend
+  outcome-record           Record independent acceptance evidence (commits optional for non-code tasks)
+  outcome-report           Summarise explicit acceptance within an inclusive Unix-time window
   scale                    Dynamically scale team topology (add/remove agents)
   reload                   Trigger an explicit topology reload for the running daemon
   research                 Run autonomous evaluator-driven research missions
@@ -184,6 +189,51 @@ Options:
           Print help
 ```
 
+## `batty backend-probe`
+
+Make one explicit inference request to check a configured backend
+
+```text
+Make one explicit inference request to check a configured backend
+
+Usage: batty backend-probe [OPTIONS] <MEMBER>
+
+Arguments:
+  <MEMBER>
+
+
+Options:
+      --timeout-secs <TIMEOUT_SECS>
+          [default: 30]
+
+  -v, --verbose...
+          Verbosity level (-v, -vv, -vvv)
+
+  -h, --help
+          Print help
+```
+
+## `batty backend-reset`
+
+Reset a repaired terminal backend configuration error
+
+```text
+Reset a repaired terminal backend configuration error
+
+Usage: batty backend-reset [OPTIONS] <MEMBER>
+
+Arguments:
+  <MEMBER>
+
+
+Options:
+  -v, --verbose...
+          Verbosity level (-v, -vv, -vvv)
+
+  -h, --help
+          Print help
+```
+
 ## `batty bench`
 
 Prevent an engineer from receiving new auto-dispatch work
@@ -245,7 +295,7 @@ Usage: batty board archive [OPTIONS]
 Options:
       --older-than <OLDER_THAN>
           Only archive tasks older than this (e.g. "7d", "24h", "2w", or ISO date)
-          
+
           [default: 0s]
 
       --dry-run
@@ -270,7 +320,7 @@ Usage: batty board deps [OPTIONS]
 Options:
       --format <FORMAT>
           Output format: tree (default), flat, or dot
-          
+
           [default: tree]
           [possible values: tree, flat, dot]
 
@@ -347,7 +397,7 @@ Usage: batty chat [OPTIONS]
 Options:
       --agent-type <AGENT_TYPE>
           Agent type: claude, codex, kiro, generic
-          
+
           [default: generic]
 
       --cmd <CMD>
@@ -355,7 +405,7 @@ Options:
 
       --cwd <CWD>
           Working directory for the agent
-          
+
           [default: .]
 
       --sdk-mode
@@ -380,7 +430,7 @@ Usage: batty completions [OPTIONS] <SHELL>
 Arguments:
   <SHELL>
           Shell to generate completion script for
-          
+
           [possible values: bash, zsh, fish]
 
 Options:
@@ -450,6 +500,9 @@ Estimate current run cost from agent session files
 Usage: batty cost [OPTIONS]
 
 Options:
+      --json
+          Emit observed usage and explicit unknown pricing as JSON
+
   -v, --verbose...
           Verbosity level (-v, -vv, -vvv)
 
@@ -729,7 +782,7 @@ Options:
 
       --port <PORT>
           Local port to bind for webhook delivery
-          
+
           [default: 8787]
 
   -v, --verbose...
@@ -760,7 +813,7 @@ Arguments:
 Options:
   -n, --limit <LIMIT>
           Maximum number of recent messages to show
-          
+
           [default: 20]
 
       --all
@@ -825,7 +878,8 @@ Options:
           Possible values:
           - solo:      Single agent, no hierarchy (1 pane)
           - pair:      Architect + 1 engineer pair (2 panes)
-          - simple:    1 architect + 1 manager + 3 engineers (5 panes)
+          - simple:    Architect, manager, two engineers and three on-demand specialists
+          - mixed:     Claude coordination and research; Codex engineering and QA; Haiku documentation
           - squad:     1 architect + 1 manager + 5 engineers with layout (7 panes)
           - large:     Human + architect + 3 managers + 15 engineers with Telegram (19 panes)
           - research:  PI + 3 sub-leads + 6 researchers — research lab style (10 panes)
@@ -940,7 +994,7 @@ Usage: batty nudge disable [OPTIONS] <NAME>
 Arguments:
   <NAME>
           Intervention name
-          
+
           [possible values: replenish, triage, review, dispatch, utilization, owned-task]
 
 Options:
@@ -963,7 +1017,7 @@ Usage: batty nudge enable [OPTIONS] <NAME>
 Arguments:
   <NAME>
           Intervention name
-          
+
           [possible values: replenish, triage, review, dispatch, utilization, owned-task]
 
 Options:
@@ -1037,7 +1091,7 @@ Options:
 
       --topic <TOPICS>
           Filter by stable public event topic
-          
+
           [possible values: completion, review, stall, merge, escalation, delivery-failure, lifecycle]
 
       --role <ROLES>
@@ -1173,6 +1227,62 @@ Options:
           Print help
 ```
 
+## `batty outcome-record`
+
+Record independent acceptance evidence (commits optional for non-code tasks)
+
+```text
+Record independent acceptance evidence (commits optional for non-code tasks)
+
+Usage: batty outcome-record [OPTIONS] --evidence <EVIDENCE> <TASK>
+
+Arguments:
+  <TASK>
+
+
+Options:
+      --evidence <EVIDENCE>
+
+
+      --commit <COMMIT>
+
+
+      --session <SESSION>
+
+
+      --defects <DEFECTS>
+          [default: 0]
+
+  -v, --verbose...
+          Verbosity level (-v, -vv, -vvv)
+
+  -h, --help
+          Print help
+```
+
+## `batty outcome-report`
+
+Summarise explicit acceptance within an inclusive Unix-time window
+
+```text
+Summarise explicit acceptance within an inclusive Unix-time window
+
+Usage: batty outcome-report [OPTIONS]
+
+Options:
+      --since <SINCE>
+          [default: 0]
+
+      --until <UNTIL>
+
+
+  -v, --verbose...
+          Verbosity level (-v, -vv, -vvv)
+
+  -h, --help
+          Print help
+```
+
 ## `batty parity`
 
 Show clean-room parity summary from PARITY.md
@@ -1206,6 +1316,26 @@ Pause nudges and standups
 Usage: batty pause [OPTIONS]
 
 Options:
+  -v, --verbose...
+          Verbosity level (-v, -vv, -vvv)
+
+  -h, --help
+          Print help
+```
+
+## `batty preflight`
+
+Validate launch settings and provenance without starting agents or inference
+
+```text
+Validate launch settings and provenance without starting agents or inference
+
+Usage: batty preflight [OPTIONS]
+
+Options:
+      --runtime
+
+
   -v, --verbose...
           Verbosity level (-v, -vv, -vvv)
 
@@ -1679,24 +1809,24 @@ Options:
 
       --format <FORMAT>
           Evaluator output contract
-          
+
           [default: json]
           [possible values: json, exit-code]
 
       --keep-policy <KEEP_POLICY>
           Rule for keeping or discarding candidate iterations
-          
+
           [default: pass-only]
           [possible values: pass-only, score-improvement, parity-improvement]
 
       --max-iterations <MAX_ITERATIONS>
           Stop after this many iterations
-          
+
           [default: 10]
 
       --worktree <WORKTREE>
           Worktree to mutate during the mission
-          
+
           [default: .]
 
   -v, --verbose...
@@ -1792,7 +1922,7 @@ Arguments:
 
   <DISPOSITION>
           Review disposition
-          
+
           [possible values: approve, request-changes, reject]
 
   [FEEDBACK]
@@ -1801,7 +1931,7 @@ Arguments:
 Options:
       --reviewer <REVIEWER>
           Reviewer name (default: human)
-          
+
           [default: human]
 
   -v, --verbose...
@@ -1963,12 +2093,12 @@ Options:
 
       --rows <ROWS>
           Terminal rows
-          
+
           [default: 50]
 
       --cols <COLS>
           Terminal columns
-          
+
           [default: 220]
 
       --pty-log-path <PTY_LOG_PATH>
@@ -1976,12 +2106,12 @@ Options:
 
       --graceful-shutdown-timeout-secs <GRACEFUL_SHUTDOWN_TIMEOUT_SECS>
           Seconds to wait for auto-commit before force-killing
-          
+
           [default: 5]
 
       --auto-commit-on-restart <AUTO_COMMIT_ON_RESTART>
           Auto-commit dirty worktrees before restart/shutdown
-          
+
           [default: true]
           [possible values: true, false]
 
@@ -2076,12 +2206,12 @@ Options:
 
       --duration-hours <DURATION_HOURS>
           Virtual session duration in hours when not using compact mode
-          
+
           [default: 8]
 
       --seed <SEED>
           Deterministic seed for fault scheduling and synthetic recovery timings
-          
+
           [default: 1]
 
       --json-out <JSON_OUT>
@@ -2165,7 +2295,7 @@ Arguments:
 
   <ACTION>
           Enable or disable auto-merge for this task
-          
+
           [possible values: enable, disable]
 
 Options:
@@ -2192,7 +2322,7 @@ Arguments:
 Options:
       --disposition <DISPOSITION>
           Review disposition
-          
+
           [possible values: approved, changes_requested, rejected]
 
       --feedback <FEEDBACK>
@@ -2250,7 +2380,7 @@ Arguments:
 
   <TARGET_STATE>
           Target state
-          
+
           [possible values: backlog, todo, in-progress, review, blocked, done, archived]
 
 Options:
@@ -2365,7 +2495,7 @@ Usage: batty telemetry events [OPTIONS]
 Options:
   -n, --limit <LIMIT>
           Maximum number of events to show
-          
+
           [default: 50]
 
   -v, --verbose...

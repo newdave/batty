@@ -122,6 +122,13 @@ pub enum Event {
     AuthRequired {
         message: String,
     },
+    /// A terminal backend setting error. Repair configuration before retrying;
+    /// re-authentication and repeated respawns do not resolve this condition.
+    ConfigurationRequired {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
     ScreenCapture {
         content: String,
         cursor_row: u16,
@@ -130,6 +137,10 @@ pub enum Event {
     State {
         state: ShimState,
         since_secs: u64,
+    },
+    /// Actual provider thread identity, never a locally invented placeholder.
+    SessionStarted {
+        session_id: String,
     },
     SessionStats {
         output_bytes: u64,
@@ -889,5 +900,17 @@ mod tests {
             attempts >= 1,
             "sanity check: send loop should have attempted at least once"
         );
+    }
+    #[test]
+    fn configuration_required_event_roundtrips_separately_from_auth() {
+        let event = Event::ConfigurationRequired {
+            message: "repair model setting".into(),
+            code: Some("unsupported_model".into()),
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert!(matches!(
+            serde_json::from_value::<Event>(value).unwrap(),
+            Event::ConfigurationRequired { code: Some(_), .. }
+        ));
     }
 }

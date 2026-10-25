@@ -52,12 +52,12 @@ fn parse_minimal_config() {
     assert_eq!(config.roles[0].role_type, RoleType::Architect);
     assert_eq!(config.roles[2].instances, 3);
     assert_eq!(config.workflow_mode, WorkflowMode::Legacy);
-    assert!(config.orchestrator_pane);
+    assert!(!config.orchestrator_pane);
     assert_eq!(
         config.event_log_max_bytes,
         super::super::DEFAULT_EVENT_LOG_MAX_BYTES
     );
-    assert!(config.auto_respawn_on_crash);
+    assert!(!config.auto_respawn_on_crash);
     assert_eq!(config.workflow_policy.graceful_shutdown_timeout_secs, 30);
     assert!(config.workflow_policy.auto_commit_on_restart);
     assert!(!config.workflow_policy.clean_room_mode);
@@ -138,7 +138,7 @@ roles:
         "openclaw"
     );
     assert_eq!(config.workflow_mode, WorkflowMode::Legacy);
-    assert!(config.orchestrator_pane);
+    assert!(!config.orchestrator_pane);
 }
 
 #[test]
@@ -310,13 +310,13 @@ roles:
     assert!(config.board.auto_dispatch);
     assert!(config.board.auto_replenish);
     assert_eq!(config.board.state_reconciliation_interval_secs, 30);
-    assert_eq!(config.standup.interval_secs, 300);
-    assert_eq!(config.standup.output_lines, 30);
+    assert_eq!(config.standup.interval_secs, 1800);
+    assert_eq!(config.standup.output_lines, 12);
     assert!(config.automation.timeout_nudges);
     assert!(config.automation.standups);
     assert!(config.automation.failure_pattern_detection);
     assert!(config.automation.triage_interventions);
-    assert_eq!(config.automation.intervention_idle_grace_secs, 60);
+    assert_eq!(config.automation.intervention_idle_grace_secs, 300);
     assert_eq!(config.workflow_policy.narration_threshold, 0.8);
     assert_eq!(config.workflow_policy.narration_nudge_max, 2);
     assert!(config.workflow_policy.narration_detection_enabled);
@@ -338,12 +338,12 @@ roles:
     assert!(config.cost.models.is_empty());
     assert_eq!(config.roles[0].instances, 1);
     assert_eq!(config.workflow_mode, WorkflowMode::Legacy);
-    assert!(config.orchestrator_pane);
+    assert!(!config.orchestrator_pane);
     assert_eq!(
         config.event_log_max_bytes,
         super::super::DEFAULT_EVENT_LOG_MAX_BYTES
     );
-    assert!(config.auto_respawn_on_crash);
+    assert!(!config.auto_respawn_on_crash);
 }
 
 #[test]
@@ -1658,4 +1658,27 @@ roles:
     assert_eq!(role.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(override_cfg.agent.as_deref(), Some("gemini"));
     assert_eq!(override_cfg.model.as_deref(), Some("claude-opus-4.6-1m"));
+}
+
+#[test]
+fn simple_template_resolves_efficient_role_options() {
+    let config: TeamConfig =
+        serde_yaml::from_str(include_str!("../templates/team_simple.yaml")).unwrap();
+    let options = crate::team::agent_options::all(&config).unwrap();
+    assert_eq!(options.len(), 7);
+    for member in options {
+        assert!(!member.idle_inference_enabled);
+        if member.member.starts_with("documentation-specialist") {
+            assert_eq!(member.model.as_deref(), Some("haiku"));
+            assert!(member.effort.is_none());
+        } else {
+            assert_eq!(member.model.as_deref(), Some("sonnet"));
+            assert_eq!(member.effort.as_deref(), Some("medium"));
+        }
+        assert_eq!(member.on_demand, member.member.contains("specialist"));
+    }
+    assert_eq!(
+        config.board.tag_roles.get("quality").map(String::as_str),
+        Some("quality-specialist")
+    );
 }

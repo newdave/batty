@@ -888,6 +888,13 @@ pub(super) fn force_kill_daemon(project_root: &Path) {
 /// spawn the daemon as a background process, and optionally attach.
 ///
 /// Returns the tmux session name.
+struct StartupLock(std::path::PathBuf);
+impl Drop for StartupLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub fn start_team(project_root: &Path, attach: bool) -> Result<String> {
     let config_path = team_config_path(project_root);
     if !config_path.exists() {
@@ -901,7 +908,41 @@ pub fn start_team(project_root: &Path, attach: bool) -> Result<String> {
     team_config.validate()?;
     team_config.validate_project_refs(project_root)?;
 
+    if team_config.workflow_policy.verification.auto_run_tests {
+        super::task_loop::resolve_test_command(
+            project_root,
+            team_config
+                .workflow_policy
+                .verification
+                .test_command
+                .as_deref()
+                .or(team_config.workflow_policy.test_command.as_deref()),
+        )?;
+    }
+    let options = super::agent_options::all(&team_config)?;
+    for option in options {
+        if project_root
+            .join(".batty/backend-configuration")
+            .join(format!("{}.json", option.member))
+            .is_file()
+        {
+            bail!(
+                "{} requires backend configuration repair; use batty backend-reset after correcting it",
+                option.member
+            );
+        }
+    }
     let members = hierarchy::resolve_hierarchy(&team_config)?;
+    let startup_lock_path = project_root.join(".batty/startup.lock");
+    std::fs::create_dir_all(project_root.join(".batty"))?;
+    let mut lock_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&startup_lock_path)
+        .context("another startup is in progress, or startup.lock needs operator inspection")?;
+    use std::io::Write;
+    let _startup_lock = StartupLock(startup_lock_path);
+    writeln!(lock_file, "{}", std::process::id())?;
     let session = format!("batty-{}", team_config.name);
 
     ensure_no_concurrent_batty_process(project_root)?;
@@ -941,11 +982,43 @@ pub fn start_team(project_root: &Path, attach: bool) -> Result<String> {
 
     // Spawn watchdog as a detached background process. It supervises the daemon
     // child and handles crash backoff/restart policy.
-    let pid = spawn_watchdog(project_root, resume)?;
+    let pid = match spawn_watchdog(project_root, resume) {
+        Ok(pid) => pid,
+        Err(error) => {
+            let _ = tmux::kill_session(&session);
+            return Err(error)
+                .context("startup rolled back newly-created session after watchdog failure");
+        }
+    };
     info!(pid, "watchdog process launched");
 
     // Give daemon a moment to start spawning agents
     std::thread::sleep(std::time::Duration::from_secs(2));
+
+    if let Some(seconds) = team_config.workflow_policy.startup_validation_timeout_secs {
+        let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+        let options = super::agent_options::all(&team_config)?;
+        loop {
+            let ready = super::preflight::runtime_diagnostics(project_root, &options)
+                .is_ok_and(|errors| errors.is_empty());
+            if ready {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                if !request_graceful_daemon_shutdown(project_root, DAEMON_SHUTDOWN_GRACE_PERIOD) {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                }
+                let _ = tmux::kill_session(&session);
+                bail!(
+                    "startup runtime validation timed out; this invocation's session was rolled back"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 
     if attach {
         tmux::attach(&session)?;
@@ -1769,5 +1842,21 @@ mod tests {
             observation.exit_category,
             DAEMON_EXIT_CATEGORY_UNRECOVERABLE
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_lock_tests {
+    use super::*;
+    #[test]
+    fn startup_lock_releases_on_error_scope_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("startup.lock");
+        std::fs::write(&path, "test").unwrap();
+        {
+            let _guard = StartupLock(path.clone());
+            assert!(path.exists());
+        }
+        assert!(!path.exists());
     }
 }

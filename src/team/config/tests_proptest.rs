@@ -162,7 +162,7 @@ proptest! {
         let config: TeamConfig = serde_yaml::from_str(&yaml).unwrap();
         // All optional fields should have defaults
         prop_assert_eq!(config.workflow_mode, WorkflowMode::Legacy);
-        prop_assert!(config.orchestrator_pane);
+        prop_assert!(!config.orchestrator_pane);
         prop_assert_eq!(config.orchestrator_position, OrchestratorPosition::Left);
         prop_assert!(config.layout.is_none());
         prop_assert!(config.agent.is_none());

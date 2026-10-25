@@ -150,7 +150,7 @@ fn collect_init_overrides() -> Result<team::InitOverrides> {
     println!("── Orchestrator ──────────────────────────────────────────");
     println!("The orchestrator is a dedicated tmux pane that runs automated");
     println!("triage, review routing, dispatch-gap recovery, and standups.");
-    ov.orchestrator_pane = Some(confirm("Enable orchestrator pane?", true)?);
+    ov.orchestrator_pane = Some(confirm("Enable orchestrator pane?", false)?);
 
     println!();
     println!("── Board & Dispatch ──────────────────────────────────────");
@@ -194,14 +194,14 @@ fn collect_init_overrides() -> Result<team::InitOverrides> {
     println!("Architect utilization: nudges the architect when engineers are idle.");
     ov.architect_utilization_interventions = Some(confirm(
         "Enable architect utilization interventions?",
-        true,
+        false,
     )?);
 
     println!();
     println!("── Auto-Merge ───────────────────────────────────────────");
     println!("When enabled, completed engineer branches that pass tests and");
     println!("score above a confidence threshold are merged automatically.");
-    ov.auto_merge_enabled = Some(confirm("Enable auto-merge?", false)?);
+    ov.auto_merge_enabled = Some(confirm("Enable auto-merge?", true)?);
 
     println!();
     println!("── Timing (seconds) ─────────────────────────────────────");
@@ -210,17 +210,17 @@ fn collect_init_overrides() -> Result<team::InitOverrides> {
 
     ov.standup_interval_secs = Some(input_u64(
         "Standup interval (secs, how often agents report status)",
-        600,
+        1800,
     )?);
 
     ov.nudge_interval_secs = Some(input_u64(
         "Architect nudge interval (secs, idle ping for architect)",
-        900,
+        3600,
     )?);
 
     ov.stall_threshold_secs = Some(input_u64(
         "Stall threshold (secs, agent considered stuck after this)",
-        300,
+        900,
     )?);
 
     ov.review_nudge_threshold_secs = Some(input_u64(
@@ -269,6 +269,7 @@ fn main() -> Result<()> {
                     cli::InitTemplate::Solo => "solo",
                     cli::InitTemplate::Pair => "pair",
                     cli::InitTemplate::Simple => "simple",
+                    cli::InitTemplate::Mixed => "mixed",
                     cli::InitTemplate::Squad => "squad",
                     cli::InitTemplate::Large => "large",
                     cli::InitTemplate::Research => "research",
@@ -1449,10 +1450,66 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Cost => {
-            team::cost::show_cost(&root)?;
+        Command::Cost { json } => {
+            if json {
+                team::cost::show_cost_json(&root)?;
+            } else {
+                team::cost::show_cost(&root)?;
+            }
         }
 
+        Command::Preflight { runtime } => {
+            let report = team::preflight::inspect(&root, runtime)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.diagnostics.is_empty() {
+                bail!("preflight found configuration or runtime drift");
+            }
+        }
+        Command::BackendReset { member } => {
+            team::preflight::reset_backend(&root, &member)?;
+            println!(
+                "Backend configuration error cleared for {member}; a running daemon can recover this member."
+            );
+        }
+
+        Command::BackendProbe {
+            member,
+            timeout_secs,
+        } => {
+            let result = team::backend_probe::run(
+                &root,
+                &member,
+                std::time::Duration::from_secs(timeout_secs),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::OutcomeRecord {
+            task,
+            evidence,
+            commit,
+            session,
+            defects,
+        } => {
+            team::outcomes::record(
+                &root,
+                task,
+                &evidence,
+                commit.as_deref(),
+                session.as_deref(),
+                defects,
+            )?;
+            println!("Acceptance evidence recorded for task #{task}");
+        }
+        Command::OutcomeReport { since, until } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&team::outcomes::report(
+                    &root,
+                    since,
+                    until.unwrap_or_else(|| chrono::Utc::now().timestamp())
+                )?)?
+            );
+        }
         Command::Scale { command } => {
             team::scale::run(&root, command)?;
         }

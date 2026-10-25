@@ -6,9 +6,6 @@
 
 use serde::Deserialize;
 
-pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
-pub const CODEX_DEFAULT_REASONING_EFFORT: &str = "high";
-
 // ---------------------------------------------------------------------------
 // Top-level thread events (one per JSONL line)
 // ---------------------------------------------------------------------------
@@ -33,13 +30,15 @@ pub struct CodexEvent {
     // turn.failed / error
     #[serde(default)]
     pub error: Option<CodexError>,
+    #[serde(default)]
+    pub message: Option<String>,
 
     // item.started / item.updated / item.completed
     #[serde(default)]
     pub item: Option<CodexItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CodexUsage {
     #[serde(default)]
     pub input_tokens: i64,
@@ -47,6 +46,26 @@ pub struct CodexUsage {
     pub cached_input_tokens: i64,
     #[serde(default)]
     pub output_tokens: i64,
+}
+
+impl CodexEvent {
+    pub fn error_message(&self) -> Option<&str> {
+        self.error
+            .as_ref()
+            .map(|error| error.message.as_str())
+            .or(self.message.as_deref())
+    }
+}
+
+impl CodexUsage {
+    pub fn merge_snapshot(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.max(other.input_tokens).max(0);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .max(other.cached_input_tokens)
+            .max(0);
+        self.output_tokens = self.output_tokens.max(other.output_tokens).max(0);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,47 +119,48 @@ impl CodexItem {
 /// `thread_id`: if provided, resumes an existing thread for multi-turn.
 /// The final `-` instructs Codex to read the prompt from stdin.
 pub fn codex_sdk_args(program: &str, thread_id: Option<&str>) -> (String, Vec<String>) {
-    let reasoning_config = format!("model_reasoning_effort=\"{CODEX_DEFAULT_REASONING_EFFORT}\"");
-    let mut args = vec![
-        "exec".to_string(),
-        "--json".to_string(),
-        "-m".to_string(),
-        CODEX_DEFAULT_MODEL.to_string(),
-        "-c".to_string(),
-        reasoning_config,
-        "--dangerously-bypass-approvals-and-sandbox".to_string(),
-    ];
-
-    if let Some(tid) = thread_id {
-        args.push("resume".to_string());
-        args.push(tid.to_string());
-    }
-
-    args.push("-".to_string());
-
-    (program.to_string(), args)
+    let model = std::env::var("BATTY_AGENT_MODEL").ok();
+    let effort = std::env::var("BATTY_AGENT_EFFORT").ok();
+    codex_sdk_args_with_options(program, thread_id, model.as_deref(), effort.as_deref())
 }
 
-/// Build the Codex exec command for SDK (JSONL) mode.
-///
-/// `thread_id`: if provided, resumes an existing thread for multi-turn.
-/// `prompt`: the message/task text to send.
-pub fn codex_sdk_command(program: &str, prompt: &str, thread_id: Option<&str>) -> String {
-    let escaped_prompt = prompt.replace('\'', "'\\''");
-    let reasoning_config = format!("model_reasoning_effort=\"{CODEX_DEFAULT_REASONING_EFFORT}\"");
-    match thread_id {
-        Some(tid) => {
-            let escaped_tid = tid.replace('\'', "'\\''");
-            format!(
-                "exec {program} exec --json -m {CODEX_DEFAULT_MODEL} -c '{reasoning_config}' --dangerously-bypass-approvals-and-sandbox resume '{escaped_tid}' '{escaped_prompt}'"
-            )
-        }
-        None => {
-            format!(
-                "exec {program} exec --json -m {CODEX_DEFAULT_MODEL} -c '{reasoning_config}' --dangerously-bypass-approvals-and-sandbox '{escaped_prompt}'"
-            )
-        }
+pub fn codex_sdk_args_with_options(
+    program: &str,
+    thread_id: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> (String, Vec<String>) {
+    let mut args = vec!["exec".to_string(), "--json".to_string()];
+    if let Some(model) = model {
+        args.extend(["-m".into(), model.into()]);
     }
+    if let Some(effort) = effort {
+        args.extend([
+            "-c".into(),
+            format!(
+                "model_reasoning_effort={}",
+                serde_json::to_string(effort).expect("string serialization")
+            ),
+        ]);
+    }
+    args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    if let Some(tid) = thread_id {
+        args.extend(["resume".into(), tid.into()]);
+    }
+    args.push("-".into());
+    (program.into(), args)
+}
+
+pub fn codex_sdk_command(program: &str, prompt: &str, thread_id: Option<&str>) -> String {
+    let (program, mut args) = codex_sdk_args(program, thread_id);
+    args.pop();
+    args.push(prompt.into());
+    let mut command = format!("exec {program}");
+    for arg in args {
+        command.push(' ');
+        command.push_str(&crate::team::agent_options::shell_quote(&arg));
+    }
+    command
 }
 
 // ---------------------------------------------------------------------------
@@ -224,9 +244,9 @@ mod tests {
     #[test]
     fn codex_sdk_command_new_session() {
         let cmd = codex_sdk_command("codex", "fix the bug", None);
-        assert!(cmd.contains("exec codex exec --json"));
-        assert!(cmd.contains("-m gpt-5.5"));
-        assert!(cmd.contains("-c 'model_reasoning_effort=\"high\"'"));
+        assert!(cmd.contains("exec codex 'exec' '--json'"));
+        assert!(!cmd.contains("-m "));
+        assert!(!cmd.contains("model_reasoning_effort"));
         assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(cmd.contains("'fix the bug'"));
         assert!(!cmd.contains("resume"));
@@ -235,9 +255,9 @@ mod tests {
     #[test]
     fn codex_sdk_command_resume() {
         let cmd = codex_sdk_command("codex", "next step", Some("tid-123"));
-        assert!(cmd.contains("-m gpt-5.5"));
-        assert!(cmd.contains("-c 'model_reasoning_effort=\"high\"'"));
-        assert!(cmd.contains("resume 'tid-123'"));
+        assert!(!cmd.contains("-m "));
+        assert!(!cmd.contains("model_reasoning_effort"));
+        assert!(cmd.contains("'resume' 'tid-123'"));
         assert!(cmd.contains("'next step'"));
     }
 
@@ -245,6 +265,16 @@ mod tests {
     fn codex_sdk_command_escapes_quotes() {
         let cmd = codex_sdk_command("codex", "fix user's bug", None);
         assert!(cmd.contains("user'\\''s"));
+    }
+
+    #[test]
+    fn explicit_codex_options_are_forwarded_without_backend_defaults() {
+        let (_, args) =
+            codex_sdk_args_with_options("codex", None, Some("custom/model"), Some("low"));
+        assert!(args.windows(2).any(|pair| pair == ["-m", "custom/model"]));
+        assert!(args.iter().any(|s| s == "model_reasoning_effort=\"low\""));
+        let (_, unset) = codex_sdk_args_with_options("codex", None, None, None);
+        assert!(!unset.contains(&"-m".to_string()) && !unset.contains(&"-c".to_string()));
     }
 
     #[test]
@@ -256,10 +286,6 @@ mod tests {
             vec![
                 "exec",
                 "--json",
-                "-m",
-                "gpt-5.5",
-                "-c",
-                "model_reasoning_effort=\"high\"",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "-"
             ]
@@ -275,15 +301,28 @@ mod tests {
             vec![
                 "exec",
                 "--json",
-                "-m",
-                "gpt-5.5",
-                "-c",
-                "model_reasoning_effort=\"high\"",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "resume",
                 "tid-123",
                 "-"
             ]
         );
+    }
+    #[test]
+    fn token_snapshots_are_deduplicated_and_cache_tokens_remain_a_subset() {
+        let mut usage = CodexUsage::default();
+        let snapshot = CodexUsage {
+            input_tokens: 10,
+            cached_input_tokens: 8,
+            output_tokens: 3,
+        };
+        usage.merge_snapshot(&snapshot);
+        usage.merge_snapshot(&snapshot);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 8);
+        assert_eq!(usage.output_tokens, 3);
+        let error: CodexEvent =
+            serde_json::from_str(r#"{"type":"error","message":"refresh token expired"}"#).unwrap();
+        assert_eq!(error.error_message(), Some("refresh token expired"));
     }
 }

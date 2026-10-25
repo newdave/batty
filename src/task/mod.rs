@@ -184,7 +184,7 @@ impl Task {
         let normalized = normalize_task_frontmatter_content(&contents)?;
         let contents = match normalized {
             Some((updated, _)) => {
-                std::fs::write(path, &updated)
+                crate::team::board_write::write_task_file(path, &contents, &updated)
                     .with_context(|| format!("failed to repair task file: {}", path.display()))?;
                 updated
             }
@@ -536,7 +536,7 @@ pub(crate) fn repair_task_frontmatter_compat(
     let Some((updated, repair)) = normalize_task_frontmatter_content(&contents)? else {
         return Ok(None);
     };
-    std::fs::write(task_path, updated)
+    crate::team::board_write::write_task_file(task_path, &contents, &updated)
         .with_context(|| format!("failed to repair task file: {}", task_path.display()))?;
     Ok(Some(repair))
 }

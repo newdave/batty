@@ -2178,6 +2178,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![
             RoleDef {
+                effort: None,
+                on_demand: false,
                 name: "human".to_string(),
                 role_type: RoleType::User,
                 agent: None,
@@ -2201,6 +2203,8 @@ mod tests {
                 use_worktrees: false,
             },
             RoleDef {
+                effort: None,
+                on_demand: false,
                 name: "eng".to_string(),
                 role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),
@@ -2272,6 +2276,8 @@ mod tests {
     fn telegram_assign_command_rejects_busy_engineer() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
+            effort: None,
+            on_demand: false,
             name: "eng".to_string(),
             role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
@@ -2327,6 +2333,8 @@ mod tests {
     fn telegram_assign_command_rejects_blocked_task() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
+            effort: None,
+            on_demand: false,
             name: "eng".to_string(),
             role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
@@ -2386,6 +2394,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![
             RoleDef {
+                effort: None,
+                on_demand: false,
                 name: "human".to_string(),
                 role_type: RoleType::User,
                 agent: None,
@@ -2409,6 +2419,8 @@ mod tests {
                 use_worktrees: false,
             },
             RoleDef {
+                effort: None,
+                on_demand: false,
                 name: "architect".to_string(),
                 role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
@@ -2576,6 +2588,8 @@ mod tests {
         std::fs::write(worktree_dir.join("README.md"), "dirty\n").unwrap();
 
         let roles = vec![RoleDef {
+            effort: None,
+            on_demand: false,
             name: "eng".to_string(),
             role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
@@ -2658,6 +2672,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![
             RoleDef {
+                effort: None,
+                on_demand: false,
                 name: "human".to_string(),
                 role_type: RoleType::User,
                 agent: None,
@@ -2681,6 +2697,8 @@ mod tests {
                 use_worktrees: false,
             },
             RoleDef {
+                effort: None,
+                on_demand: false,
                 name: "architect".to_string(),
                 role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
@@ -2704,6 +2722,8 @@ mod tests {
                 use_worktrees: false,
             },
             RoleDef {
+                effort: None,
+                on_demand: false,
                 name: "eng".to_string(),
                 role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),

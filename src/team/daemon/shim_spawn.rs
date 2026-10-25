@@ -156,11 +156,60 @@ pub(in crate::team) fn spawn_shim(
         );
     }
 
-    // Remove stale API key so Claude Code falls through to OAuth credentials.
-    // The env var takes precedence over ~/.claude/.credentials.json and an
-    // expired key silently blocks OAuth login.
-    cmd.env_remove("ANTHROPIC_API_KEY");
+    // Preserve API-key/custom authentication; only OAuth should drop a key.
+    if matches!(agent_type, "claude" | "claude-code") {
+        let config_path = crate::team::team_config_path(project_root);
+        if config_path.is_file() {
+            let config = crate::team::config::TeamConfig::load(&config_path)?;
+            let members = crate::team::hierarchy::resolve_hierarchy(&config)?;
+            if let Some(member) = members.iter().find(|m| m.name == member_name) {
+                if let Some(role) = config.role_def(&member.role_name) {
+                    if config.resolve_claude_auth(role).mode
+                        == crate::team::config::ClaudeAuthMode::Oauth
+                    {
+                        cmd.env_remove("ANTHROPIC_API_KEY");
+                    }
+                }
+            }
+        }
+    }
 
+    let options = crate::team::agent_options::resolve(project_root, member_name)?;
+    cmd.env(
+        "BATTY_IDLE_INFERENCE_ENABLED",
+        if options.idle_inference_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    if let Some(model) = options.model {
+        cmd.env("BATTY_AGENT_MODEL", model);
+    } else {
+        cmd.env_remove("BATTY_AGENT_MODEL");
+    }
+    if let Some(effort) = options.effort {
+        cmd.env("BATTY_AGENT_EFFORT", effort);
+    } else {
+        cmd.env_remove("BATTY_AGENT_EFFORT");
+    }
+
+    // SDK subprocesses do not execute the generated shell launcher. Preserve
+    // its member-scoped board wrappers so commands target the shared board.
+    if sdk_mode {
+        let slug = project_root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let wrappers = std::env::temp_dir().join(format!("batty-bin-{slug}-{member_name}"));
+        if wrappers.is_dir() {
+            let mut paths = vec![wrappers];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            cmd.env("PATH", std::env::join_paths(paths)?);
+        }
+    }
     // Set BATTY_MEMBER so detect_sender() works in SDK mode subprocesses
     cmd.env("BATTY_MEMBER", member_name);
     let mcp_isolation = crate::team::mcp::McpIsolation::for_member(project_root, member_name);

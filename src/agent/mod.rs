@@ -39,6 +39,8 @@ pub enum BackendHealth {
     /// agent can work again. Signalled by, e.g. codex's "refresh token was
     /// already used" error which cannot be resolved by respawning the shim.
     AuthRequired,
+    /// Backend settings must be repaired explicitly before dispatch resumes.
+    ConfigurationRequired,
 }
 
 impl BackendHealth {
@@ -48,6 +50,7 @@ impl BackendHealth {
             Self::Degraded => "degraded",
             Self::QuotaExhausted => "quota_exhausted",
             Self::AuthRequired => "auth_required",
+            Self::ConfigurationRequired => "configuration_required",
             Self::Unreachable => "unreachable",
         }
     }

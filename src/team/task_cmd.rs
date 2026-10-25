@@ -886,7 +886,7 @@ where
     updated.push_str("---\n");
     updated.push_str(body);
 
-    std::fs::write(task_path, updated)
+    crate::team::board_write::write_task_file(task_path, &content, &updated)
         .with_context(|| format!("failed to write {}", task_path.display()))?;
     Ok(())
 }
@@ -1354,7 +1354,7 @@ mod tests {
         let task_path = write_task_file(board_dir, 15, "in-progress");
         std::fs::write(
             &task_path,
-            "---\nid: 15\ntitle: Task 15\nstatus: in-progress\npriority: high\nclaimed_by: eng-1-2\nblocked: waiting on reviewer\nclass: standard\n---\n\nTask body.\n",
+            "---\nid: 15\ntitle: Task 15\nstatus: in-progress\npriority: high\nblocked: waiting on reviewer\nclass: standard\n---\n\nTask body.\n",
         )
         .unwrap();
 

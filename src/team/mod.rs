@@ -4,15 +4,20 @@
 //! session. The daemon monitors panes, routes messages between roles, and
 //! manages agent lifecycles.
 
+pub mod agent_options;
 pub mod allocation;
 pub mod artifact;
 pub mod auto_merge;
+pub mod backend_probe;
 #[cfg(test)]
 mod behavioral_tests;
 pub mod bench;
 pub mod board;
 #[allow(dead_code)]
 pub mod board_reconciliation;
+pub(crate) mod board_write;
+pub mod outcomes;
+pub mod preflight;
 #[cfg(test)]
 mod smoke_tests;
 // -- Decomposed submodules --

@@ -46,6 +46,7 @@ test = false
 doctest = false
 
 [dependencies]
+tempfile = "3"
 # CLI
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -110,7 +111,6 @@ live-agent = []
 scenario-test = []
 
 [dev-dependencies]
-tempfile = "3"
 serial_test = "3"
 proptest = "1"
 proptest-state-machine = "0.8"

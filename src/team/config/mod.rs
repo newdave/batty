@@ -403,6 +403,19 @@ impl TeamConfig {
                 },
             });
 
+            let options_valid =
+                crate::team::agent_options::validate_value("model", role.model.as_deref())
+                    .and_then(|_| {
+                        crate::team::agent_options::validate_value("effort", role.effort.as_deref())
+                    });
+            checks.push(ValidationCheck {
+                name: format!("role_launch_options:{}", role.name),
+                passed: options_valid.is_ok(),
+                detail: options_valid
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "valid optional launch overrides".into()),
+            });
             let has_agent =
                 role.role_type == RoleType::User || role.agent.is_some() || self.agent.is_some();
             checks.push(ValidationCheck {
