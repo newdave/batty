@@ -894,7 +894,6 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         {
             telemetry_db::record_test_results(conn, task_id, engineer, &verification_results, &[])?;
         }
-        let is_zero_commit = !has_required_evidence && total_commits == 0;
         // A narration-only completion is one that DID land real commits
         // but produced no code changes (e.g. docs-only, markdown-only,
         // or empty commits). A zero-commit attempt is a distinct
@@ -918,10 +917,11 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         } else {
             0
         };
+        // Zero-commit attempts escalate at max_iterations like any other failure.
+        // Without a cap, a member whose work already landed on trunk (so it can
+        // never get ahead of it again) is rejected forever.
         let should_escalate = if is_narration_only {
             narration_count >= 2
-        } else if is_zero_commit {
-            false
         } else {
             verification_state.reached_max_iterations()
         };
@@ -1002,7 +1002,14 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
                 verification_state.iteration,
                 manager_name,
             );
-            let manager_message = if !has_required_evidence && code_files_changed == 0 {
+            let manager_message = if !has_required_evidence && total_commits == 0 {
+                format!(
+                    "[daemon] Engineer {engineer} reported task #{task_id} complete {} times with no commits ahead of {trunk_branch}.\nIts work may already be on {trunk_branch}; if so, mark the task done, otherwise reassign it.\nAttempts: {}/{}",
+                    verification_state.iteration,
+                    verification_state.iteration,
+                    verification_state.max_iterations,
+                )
+            } else if !has_required_evidence && code_files_changed == 0 {
                 format!(
                     "[daemon] Engineer {engineer} hit the narration-only quality gate {} times on task #{task_id}.\nReason: completion diff is narration-only.\nAttempts: {}/{}\nDiff stat: {}\nLatest output:\n```\\n{}\\n```",
                     narration_count,
@@ -1053,7 +1060,12 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         }
 
         if should_escalate {
-            let block_reason = if !has_required_evidence && code_files_changed == 0 {
+            let block_reason = if !has_required_evidence && total_commits == 0 {
+                format!(
+                    "verification escalation after {} attempts: no commits ahead of {trunk_branch}",
+                    verification_state.iteration
+                )
+            } else if !has_required_evidence && code_files_changed == 0 {
                 format!(
                     "verification escalation after {} attempts: narration-only completion",
                     verification_state.iteration
@@ -2870,6 +2882,47 @@ mod tests {
             event.event == "task_escalated"
                 && event.task.as_deref() == Some("42")
                 && event.reason.as_deref() == Some("verification_failed")
+        }));
+    }
+
+    #[test]
+    fn zero_commit_completions_escalate_at_max_iterations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-merge-test");
+        write_task_file(&repo, 42, "zero-commit-loop");
+
+        let team_config_dir = repo.join(".batty").join("team_config");
+        let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+        setup_engineer_worktree(&repo, &worktree_dir, "eng-1", &team_config_dir).unwrap();
+        std::fs::remove_file(worktree_dir.join("Cargo.toml")).unwrap();
+
+        let mut daemon = setup_completion_daemon(&repo, "eng-1");
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .verification
+            .max_iterations = 2;
+        for _ in 0..2 {
+            daemon.set_active_task_for_test("eng-1", 42);
+            daemon.set_member_state_for_test("eng-1", MemberState::Working);
+            handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        }
+
+        let task_path = repo
+            .join(".batty")
+            .join("team_config")
+            .join("board")
+            .join("tasks")
+            .join("042-zero-commit-loop.md");
+        let task = crate::task::Task::from_file(&task_path).unwrap();
+        assert_eq!(task.status, "blocked");
+        let manager_messages =
+            inbox::pending_messages(&inbox::inboxes_root(&repo), "manager").unwrap();
+        assert!(manager_messages.iter().any(|message| {
+            message
+                .body
+                .contains("complete 2 times with no commits ahead of main")
         }));
     }
 
