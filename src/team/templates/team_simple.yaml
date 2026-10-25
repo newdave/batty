@@ -1,17 +1,20 @@
 name: my-project
+workflow_mode: hybrid
 use_shim: true
-auto_respawn_on_crash: true
-orchestrator_pane: true
+use_sdk_mode: true
+auto_respawn_on_crash: false
+orchestrator_pane: false
 orchestrator_position: left
-
 board:
   rotation_threshold: 20
-  auto_dispatch: false
-
+  auto_dispatch: true
+  tag_roles:
+    research: research-specialist
+    documentation: documentation-specialist
+    quality: quality-specialist
 standup:
-  interval_secs: 600
-  output_lines: 40
-
+  interval_secs: 1800
+  output_lines: 12
 automation:
   timeout_nudges: true
   standups: true
@@ -19,48 +22,81 @@ automation:
   review_interventions: true
   owned_task_interventions: true
   manager_dispatch_interventions: true
-  architect_utilization_interventions: true
-  intervention_idle_grace_secs: 60
-
+  architect_utilization_interventions: false
+  intervention_idle_grace_secs: 300
 automation_sender: human
-
 layout:
   zones:
-    - name: architect
+    - name: planning
       width_pct: 33
-    - name: managers
+      members: [architect, research-specialist]
+    - name: coordination
       width_pct: 33
-    - name: engineers
+      members: [manager, documentation-specialist]
+    - name: delivery
       width_pct: 34
-
+      members: [engineer, quality-specialist]
 roles:
   - name: human
     role_type: user
-    channel: telegram
-    channel_config:
-      target: "<your-telegram-chat-id>"
-      provider: openclaw
     talks_to: [architect]
-
   - name: architect
     role_type: architect
     agent: claude
     instances: 1
     prompt: architect.md
-    talks_to: [human, manager]
-    nudge_interval_secs: 900
-
+    talks_to: [human, manager, research-specialist]
+    nudge_interval_secs: 3600
   - name: manager
     role_type: manager
     agent: claude
     instances: 1
     prompt: manager.md
-    talks_to: [architect, engineer]
-
+    talks_to: [architect, engineer, research-specialist, documentation-specialist, quality-specialist]
   - name: engineer
     role_type: engineer
     agent: claude
-    instances: 3
+    instances: 2
     prompt: engineer.md
     talks_to: [manager]
     use_worktrees: true
+  - name: research-specialist
+    role_type: engineer
+    agent: claude
+    instances: 1
+    prompt: research_specialist.md
+    on_demand: true
+    talks_to: [manager, architect]
+    use_worktrees: true
+  - name: documentation-specialist
+    role_type: engineer
+    agent: claude
+    instances: 1
+    prompt: documentation_specialist.md
+    on_demand: true
+    talks_to: [manager]
+    use_worktrees: true
+  - name: quality-specialist
+    role_type: engineer
+    agent: claude
+    instances: 1
+    prompt: quality_specialist.md
+    on_demand: true
+    talks_to: [manager]
+    use_worktrees: true
+workflow_policy:
+  startup_validation_timeout_secs: 30
+  idle_inference_enabled: false
+  zero_diff_recovery: park
+  max_stall_restarts: 1
+  planning_cycle_cooldown_secs: 1800
+  handoff_screen_history: 1
+  stall_threshold_secs: 900
+  review_nudge_threshold_secs: 1800
+  review_timeout_secs: 7200
+  verification:
+    max_iterations: 2
+    auto_run_tests: true
+    require_evidence: true
+  auto_merge:
+    enabled: true

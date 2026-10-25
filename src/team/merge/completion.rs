@@ -2529,7 +2529,7 @@ mod tests {
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
         assert_eq!(engineer_messages.len(), 1);
-        assert!(engineer_messages[0].body.contains("Fix attempt 1/3"));
+        assert!(engineer_messages[0].body.contains("Fix attempt 1/2"));
         assert!(
             engineer_messages[0]
                 .body
@@ -2763,7 +2763,7 @@ mod tests {
         match command {
             Command::SendMessage { from, body, .. } => {
                 assert_eq!(from, "batty");
-                assert!(body.contains("Fix attempt 1/3"));
+                assert!(body.contains("Fix attempt 1/2"));
                 assert!(
                     body.contains("Verification failed because the test command did not pass.")
                 );
