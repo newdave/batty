@@ -145,7 +145,7 @@ pub struct SdkOutput {
     pub model_usage: Option<Value>,
 
     /// For `control_request` messages: the request ID to echo in responses.
-    #[serde(default)]
+    #[serde(default, alias = "requestId")]
     pub request_id: Option<String>,
 
     /// For `control_request` messages: the request payload.
@@ -164,24 +164,29 @@ pub struct SdkTokenUsage {
 }
 
 impl SdkTokenUsage {
-    /// Sum the usage fields into a single "context window footprint"
-    /// number suitable for the proactive context-pressure metric.
-    ///
-    /// `cached_input_tokens` (legacy) and `cache_read_input_tokens` (new)
-    /// are the SAME cached content reported under two field names — Claude
-    /// Code's stream-json keeps the legacy name for backwards compatibility
-    /// while also emitting the new one. Summing both double-counts cached
-    /// prompts against the context window and was producing 150-250%
-    /// reported usage for healthy 1M-context agents running against a
-    /// near-full cached prompt. Use `.max()` to de-dupe: whichever field is
-    /// larger captures the real cached footprint.
+    /// Claude reports cache-read aliases for the same input, and reasoning is
+    /// a subset of output, not additional context. Never add these twice.
     pub fn total_tokens(&self) -> u64 {
-        let cached = self.cached_input_tokens.max(self.cache_read_input_tokens);
         self.input_tokens
-            + cached
-            + self.cache_creation_input_tokens
-            + self.output_tokens
-            + self.reasoning_output_tokens
+            .saturating_add(self.cached_input_tokens.max(self.cache_read_input_tokens))
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.output_tokens.max(self.reasoning_output_tokens))
+    }
+
+    /// Merge cumulative streaming snapshots of one request without summing them.
+    pub fn merge_snapshot(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.max(other.input_tokens);
+        self.cached_input_tokens = self.cached_input_tokens.max(other.cached_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .max(other.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .max(other.cache_read_input_tokens);
+        self.output_tokens = self.output_tokens.max(other.output_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .max(other.reasoning_output_tokens);
     }
 }
 
@@ -217,14 +222,42 @@ impl SdkOutput {
                     .and_then(|value| value.as_str())
                     .map(String::from)
             })
+            .or_else(|| {
+                let models = self.model_usage.as_ref()?.as_object()?;
+                if models.len() != 1 {
+                    return None;
+                }
+                let (name, metadata) = models.iter().next()?;
+                metadata.is_object().then(|| name.clone())
+            })
     }
 
     pub fn token_usage(&self) -> Option<SdkTokenUsage> {
-        let usage = self.usage.as_ref()?;
+        let usage = self.usage.as_ref().filter(|v| v.is_object()).or_else(|| {
+            self.message
+                .as_ref()?
+                .get("usage")
+                .filter(|v| v.is_object())
+        })?;
+        // Missing counters are unknown, not a measured zero-token request.
+        if ![
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .any(|key| usage.get(key).is_some_and(Value::is_u64))
+        {
+            return None;
+        }
         let cache_creation = usage.get("cache_creation");
         let cache_creation_classified =
             json_u64(cache_creation.and_then(|value| value.get("ephemeral_5m_input_tokens")))
-                + json_u64(cache_creation.and_then(|value| value.get("ephemeral_1h_input_tokens")));
+                .saturating_add(json_u64(
+                    cache_creation.and_then(|value| value.get("ephemeral_1h_input_tokens")),
+                ));
         Some(SdkTokenUsage {
             input_tokens: json_u64(usage.get("input_tokens")),
             cached_input_tokens: json_u64(usage.get("cached_input_tokens")),
@@ -234,6 +267,20 @@ impl SdkOutput {
             output_tokens: json_u64(usage.get("output_tokens")),
             reasoning_output_tokens: json_u64(usage.get("reasoning_output_tokens")),
         })
+    }
+
+    /// Only provider-supplied window metadata is authoritative. Model aliases
+    /// and observed token counts cannot establish the active context limit.
+    pub fn context_limit_tokens(&self) -> Option<u64> {
+        let message_limit = self.message.as_ref().and_then(|m| m.get("context_window"));
+        let metadata = self
+            .model_usage
+            .as_ref()
+            .and_then(|m| self.model_name().and_then(|name| m.get(&name)).or(Some(m)));
+        message_limit
+            .and_then(Value::as_u64)
+            .or_else(|| metadata?.get("contextWindow").and_then(Value::as_u64))
+            .filter(|n| *n > 0)
     }
 
     pub fn usage_total_tokens(&self) -> u64 {
@@ -369,7 +416,7 @@ mod tests {
         // total_tokens() uses max(cached_input_tokens, cache_read_input_tokens)
         // to avoid double-counting the same cached content reported under both
         // the legacy and new field names. 10 + max(4,2) + 18 + 5 + 1 = 38.
-        assert_eq!(usage.total_tokens(), 38);
+        assert_eq!(usage.total_tokens(), 37);
     }
 
     #[test]
@@ -423,7 +470,7 @@ mod tests {
         assert_eq!(msg.model_name().as_deref(), Some("claude-opus-4-6-1m"));
         // usage_total_tokens() uses max(cached_input_tokens, cache_read_input_tokens)
         // to dedupe cache reporting. 10 + max(5,3) + 20 + 7 + 2 = 44.
-        assert_eq!(msg.usage_total_tokens(), 44);
+        assert_eq!(msg.usage_total_tokens(), 42);
     }
 
     #[test]
@@ -507,5 +554,33 @@ mod tests {
     fn extract_stream_text_no_delta() {
         let event = json!({"type": "content_block_start"});
         assert_eq!(extract_stream_text(&event), None);
+    }
+    #[test]
+    fn nested_assistant_usage_deduplicates_cache_and_reasoning() {
+        let msg: SdkOutput = serde_json::from_value(json!({"type":"assistant", "message":{
+            "id":"m1", "context_window":1000, "usage":{"input_tokens":10,
+            "cached_input_tokens":20,"cache_read_input_tokens":20,
+            "cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":30},
+            "output_tokens":40,"reasoning_output_tokens":15}}}))
+        .unwrap();
+        assert_eq!(msg.token_usage().unwrap().total_tokens(), 100);
+        assert_eq!(msg.context_limit_tokens(), Some(1000));
+        let unknown: SdkOutput =
+            serde_json::from_value(json!({"type":"assistant","usage":{}})).unwrap();
+        assert!(unknown.token_usage().is_none());
+        assert!(unknown.context_limit_tokens().is_none());
+    }
+    #[test]
+    fn provider_window_metadata_is_explicit_and_ambiguous_models_stay_unknown() {
+        let result: SdkOutput = serde_json::from_value(json!({"type":"result",
+            "modelUsage":{"provider-model":{"contextWindow":500000}},
+            "usage":{"input_tokens":9000000}}))
+        .unwrap();
+        assert_eq!(result.context_limit_tokens(), Some(500000));
+        assert_eq!(result.model_name().as_deref(), Some("provider-model"));
+        let ambiguous: SdkOutput = serde_json::from_value(json!({"type":"result",
+            "modelUsage":{"a":{"contextWindow":100},"b":{"contextWindow":200}}}))
+        .unwrap();
+        assert!(ambiguous.context_limit_tokens().is_none());
     }
 }
