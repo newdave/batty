@@ -12,9 +12,10 @@ pub mod auto_merge;
 mod behavioral_tests;
 pub mod bench;
 pub mod board;
-pub(crate) mod board_write;
 #[allow(dead_code)]
 pub mod board_reconciliation;
+pub(crate) mod board_write;
+pub mod preflight;
 #[cfg(test)]
 mod smoke_tests;
 // -- Decomposed submodules --
