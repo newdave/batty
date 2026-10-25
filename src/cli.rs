@@ -323,6 +323,25 @@ pub enum Command {
         timeout_secs: u64,
     },
 
+    /// Record independent acceptance evidence (commits optional for non-code tasks)
+    OutcomeRecord {
+        task: u32,
+        #[arg(long)]
+        evidence: PathBuf,
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        defects: u32,
+    },
+    /// Summarise explicit acceptance within an inclusive Unix-time window
+    OutcomeReport {
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+        #[arg(long)]
+        until: Option<i64>,
+    },
     /// Dynamically scale team topology (add/remove agents)
     Scale {
         #[command(subcommand)]

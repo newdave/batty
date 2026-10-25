@@ -1482,6 +1482,33 @@ fn main() -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        Command::OutcomeRecord {
+            task,
+            evidence,
+            commit,
+            session,
+            defects,
+        } => {
+            team::outcomes::record(
+                &root,
+                task,
+                &evidence,
+                commit.as_deref(),
+                session.as_deref(),
+                defects,
+            )?;
+            println!("Acceptance evidence recorded for task #{task}");
+        }
+        Command::OutcomeReport { since, until } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&team::outcomes::report(
+                    &root,
+                    since,
+                    until.unwrap_or_else(|| chrono::Utc::now().timestamp())
+                )?)?
+            );
+        }
         Command::Scale { command } => {
             team::scale::run(&root, command)?;
         }
