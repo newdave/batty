@@ -416,6 +416,7 @@ fn run_codex_exec(
             eprintln!("[shim-codex {shim_id}] failed to spawn codex exec: {e}");
             let mut st = state.lock().unwrap();
             let msg_id = st.pending_message_id.take();
+            let drained = fail_queued_messages(&mut st.message_queue);
             st.state = ShimState::Idle;
             st.state_changed_at = Instant::now();
             drop(st);
@@ -433,6 +434,9 @@ fn run_codex_exec(
                     id,
                     reason: "Codex process could not start".into(),
                 });
+            }
+            for event in drained {
+                let _ = evt_channel.send(&event);
             }
             return;
         }
@@ -772,7 +776,7 @@ fn run_codex_exec(
         }
         if !exit_status.is_some_and(|status| status.success()) || !turn_completed {
             let message_id = st.pending_message_id.take();
-            st.message_queue.clear();
+            let drained = fail_queued_messages(&mut st.message_queue);
             st.state = ShimState::Idle;
             st.state_changed_at = Instant::now();
             drop(st);
@@ -785,6 +789,9 @@ fn run_codex_exec(
                     id,
                     reason: "Codex turn failed".into(),
                 });
+            }
+            for event in drained {
+                let _ = evt_channel.send(&event);
             }
             let _ = evt_channel.send(&Event::StateChanged {
                 from: ShimState::Working,
@@ -1014,6 +1021,22 @@ fn current_unix_secs() -> u64 {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn fail_queued_messages(queue: &mut VecDeque<QueuedMessage>) -> Vec<Event> {
+    queue
+        .drain(..)
+        .map(|message| match message.message_id {
+            Some(id) => Event::DeliveryFailed {
+                id,
+                reason: "Codex execution failed before queued delivery".into(),
+            },
+            None => Event::Error {
+                command: "SendMessage".into(),
+                reason: "Codex execution failed before queued delivery".into(),
+            },
+        })
+        .collect()
+}
 
 struct CodexExecGuard {
     child: Arc<Mutex<Child>>,
@@ -1286,6 +1309,15 @@ mod tests {
     fn failed_codex_process_is_not_reported_as_a_completed_assignment() {
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_working_state(tmp.path());
+        state
+            .lock()
+            .unwrap()
+            .message_queue
+            .push_back(QueuedMessage {
+                from: "manager".into(),
+                body: "queued".into(),
+                message_id: Some("queued-1".into()),
+            });
         let (parent, child) = protocol::socketpair().unwrap();
         let mut parent = protocol::Channel::new(parent);
         parent
@@ -1294,21 +1326,24 @@ mod tests {
         let mut child = protocol::Channel::new(child);
         run_codex_exec(
             "worker",
-            "/bin/false",
-            &[],
+            "/bin/sh",
+            &["-c".into(), "exit 1".into()],
             "task",
             tmp.path(),
             &state,
             &mut child,
             None,
         );
-        let mut failure = false;
-        for _ in 0..3 {
+        let mut failed_ids = Vec::new();
+        for _ in 0..4 {
             let event = parent.recv::<Event>().unwrap().unwrap();
             assert!(!matches!(event, Event::Completion { .. }));
-            failure |= matches!(event, Event::DeliveryFailed { .. });
+            if let Event::DeliveryFailed { id, .. } = event {
+                failed_ids.push(id);
+            }
         }
-        assert!(failure);
+        failed_ids.sort();
+        assert_eq!(failed_ids, vec!["message-1", "queued-1"]);
         assert!(state.lock().unwrap().active_child.is_none());
     }
 
