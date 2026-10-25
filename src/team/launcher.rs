@@ -666,6 +666,23 @@ pub(super) fn write_launch_script(
         }
     }
 
+    if !sdk_mode && matches!(agent_name, "codex" | "codex-cli") {
+        if let Some(model) = model {
+            crate::team::agent_options::validate_value("model", Some(model))?;
+            agent_cmd.push_str(&format!(
+                " --model {}",
+                crate::team::agent_options::shell_quote(model)
+            ));
+        }
+        if let Some(effort) = options.effort.as_deref() {
+            let setting = format!("model_reasoning_effort={}", serde_json::to_string(effort)?);
+            agent_cmd.push_str(&format!(
+                " -c {}",
+                crate::team::agent_options::shell_quote(&setting)
+            ));
+        }
+    }
+
     if crate::team::team_config_path(project_root).is_file() {
         let directory = project_root.join(".batty/launch-options");
         std::fs::create_dir_all(&directory)?;
@@ -2211,5 +2228,34 @@ mod tests {
         let worktree_path = repo.join(".batty").join("worktrees").join("eng-1-1");
         assert!(worktree_path.exists());
         assert_eq!(work_dir, worktree_path);
+    }
+    #[test]
+    fn interactive_codex_honours_member_model_and_effort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::team::team_config_dir(root)).unwrap();
+        std::fs::write(crate::team::team_config_path(root),"name: sample\nroles:\n- name: worker\n  role_type: engineer\n  agent: codex\n  model: custom-model\n  effort: low\n").unwrap();
+        write_launch_script(
+            "worker",
+            "codex",
+            Some("custom-model"),
+            &default_claude_auth(),
+            "work",
+            None,
+            root,
+            root,
+            false,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        let slug = root.file_name().unwrap().to_string_lossy();
+        let script = std::fs::read_to_string(
+            std::env::temp_dir().join(format!("batty-launch-{slug}-worker.sh")),
+        )
+        .unwrap();
+        assert!(script.contains("--model 'custom-model'"));
+        assert!(script.contains("-c 'model_reasoning_effort=\"low\"'"));
     }
 }
