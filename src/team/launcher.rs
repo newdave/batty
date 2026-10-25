@@ -230,7 +230,7 @@ impl TeamDaemon {
             initial_state: initial_member_state(idle, member_resume),
             activate_watcher: should_activate_watcher_on_spawn(idle, member_resume),
             resume_summary,
-            persist_session_id: member_resume || normalized_agent != "claude-code",
+            persist_session_id: sdk_mode || member_resume || normalized_agent != "claude-code",
         })
     }
 
@@ -621,7 +621,7 @@ pub(super) fn write_launch_script(
         prompt.to_string()
     };
 
-    let agent_cmd = if sdk_mode {
+    let mut agent_cmd = if sdk_mode {
         match agent_name {
             "codex" | "codex-cli" => {
                 // Codex SDK uses spawn-per-message — the runtime handles subprocess
@@ -648,6 +648,32 @@ pub(super) fn write_launch_script(
     } else {
         adapter.launch_command(&effective_prompt, idle, resume, session_id)?
     };
+
+    let options = crate::team::agent_options::resolve(project_root, member_name)?;
+    if matches!(agent_name, "claude" | "claude-code") {
+        if let Some(model) = model {
+            anyhow::ensure!(!model.trim().is_empty(), "model must not be empty");
+            agent_cmd.push_str(&format!(
+                " --model {}",
+                crate::team::agent_options::shell_quote(model)
+            ));
+        }
+        if let Some(effort) = options.effort.as_deref() {
+            agent_cmd.push_str(&format!(
+                " --effort {}",
+                crate::team::agent_options::shell_quote(effort)
+            ));
+        }
+    }
+
+    if crate::team::team_config_path(project_root).is_file() {
+        let directory = project_root.join(".batty/launch-options");
+        std::fs::create_dir_all(&directory)?;
+        let target = directory.join(format!("{member_name}.json"));
+        let temporary = directory.join(format!("{member_name}.{}.tmp", std::process::id()));
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&options)?)?;
+        std::fs::rename(temporary, target)?;
+    }
 
     let wrapper_dir = std::env::temp_dir().join(format!("batty-bin-{project_slug}-{member_name}"));
     std::fs::create_dir_all(&wrapper_dir).ok();
