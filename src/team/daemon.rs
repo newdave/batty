@@ -431,6 +431,11 @@ pub struct TeamDaemon {
     pub(super) merge_queue: MergeQueue,
     /// When the last binary freshness check ran (#675). Gated to at most once per hour.
     pub(super) last_binary_freshness_check: Instant,
+    /// Consecutive-failure tracking for the Telegram / Discord pollers.
+    pub(super) telegram_health: crate::team::integration_health::PollHealth,
+    pub(super) discord_health: crate::team::integration_health::PollHealth,
+    /// Last daily telemetry retention pass.
+    pub(super) last_telemetry_retention: Instant,
     /// When the last tiered inbox expiry sweep ran (#658). Gated to at most once per minute.
     pub(super) last_tiered_inbox_sweep: Instant,
 }
@@ -789,6 +794,12 @@ impl TeamDaemon {
             merge_queue: MergeQueue::default(),
             // Start far enough in the past to trigger an immediate check at startup.
             last_binary_freshness_check: Instant::now() - Duration::from_secs(7200),
+            telegram_health: Default::default(),
+            discord_health: Default::default(),
+            // Run one retention pass shortly after startup.
+            last_telemetry_retention: Instant::now()
+                .checked_sub(Duration::from_secs(24 * 3600))
+                .unwrap_or_else(Instant::now),
             // First sweep runs on the first tick after startup.
             last_tiered_inbox_sweep: Instant::now() - Duration::from_secs(120),
         })

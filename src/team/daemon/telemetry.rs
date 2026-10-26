@@ -14,6 +14,12 @@ use super::super::events::{QualityMetricsInfo, TeamEvent, VerificationPhaseChang
 use super::*;
 
 const BINARY_FRESHNESS_INTERVAL: Duration = Duration::from_secs(3600);
+/// How often the telemetry retention pass runs.
+const TELEMETRY_RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// Tail window for "recent event" lookups; avoids parsing the whole log.
+const EVENT_TAIL_BYTES: u64 = 256 * 1024;
+/// Tail window for finding a task's assignment-start event.
+const ASSIGNMENT_LOOKUP_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinaryFreshnessTrigger {
@@ -56,6 +62,29 @@ impl TeamDaemon {
 
         if let Err(error) = self.event_sink.emit(event) {
             warn!(error = %error, "failed to write daemon event; continuing");
+        }
+    }
+
+    /// Prune old telemetry rows and checkpoint the WAL, at most once per 24h.
+    pub(super) fn maybe_run_telemetry_retention(&mut self) {
+        if self.last_telemetry_retention.elapsed() < TELEMETRY_RETENTION_INTERVAL {
+            return;
+        }
+        self.last_telemetry_retention = std::time::Instant::now();
+        let Some(conn) = &self.telemetry_db else {
+            return;
+        };
+        match crate::team::telemetry_db::run_retention(
+            conn,
+            crate::team::now_unix(),
+            crate::team::telemetry_db::DEFAULT_RETENTION_DAYS,
+        ) {
+            Ok(report) => info!(
+                events_deleted = report.events_deleted,
+                review_queue_deleted = report.review_queue_deleted,
+                "telemetry retention pass complete"
+            ),
+            Err(error) => warn!(error = %error, "telemetry retention pass failed"),
         }
     }
 
@@ -170,14 +199,17 @@ impl TeamDaemon {
 
     fn recent_daemon_binary_stale_event(&self) -> bool {
         let now = crate::team::now_unix();
-        crate::team::events::read_events(&crate::team::team_events_path(&self.config.project_root))
-            .map(|events| {
-                events.into_iter().rev().any(|event| {
-                    event.event == "daemon_binary_stale"
-                        && now.saturating_sub(event.ts) < BINARY_FRESHNESS_INTERVAL.as_secs()
-                })
+        crate::team::events::read_events_tail(
+            &crate::team::team_events_path(&self.config.project_root),
+            EVENT_TAIL_BYTES,
+        )
+        .map(|events| {
+            events.into_iter().rev().any(|event| {
+                event.event == "daemon_binary_stale"
+                    && now.saturating_sub(event.ts) < BINARY_FRESHNESS_INTERVAL.as_secs()
             })
-            .unwrap_or(false)
+        })
+        .unwrap_or(false)
     }
 
     /// Sweep expired messages from the tiered inbox sub-queues (#658).
@@ -466,9 +498,10 @@ impl TeamDaemon {
             return;
         };
 
-        let started_at = crate::team::events::read_events(&crate::team::team_events_path(
-            &self.config.project_root,
-        ))
+        let started_at = crate::team::events::read_events_tail(
+            &crate::team::team_events_path(&self.config.project_root),
+            ASSIGNMENT_LOOKUP_TAIL_BYTES,
+        )
         .ok()
         .and_then(|events| {
             crate::team::quality_metrics::assignment_started_at(&events, role, task_id)
@@ -1397,6 +1430,9 @@ mod tests {
             last_shim_health_check: Instant::now(),
             merge_queue: crate::team::daemon::MergeQueue::default(),
             last_binary_freshness_check: Instant::now(),
+            telegram_health: Default::default(),
+            discord_health: Default::default(),
+            last_telemetry_retention: Instant::now(),
             last_tiered_inbox_sweep: Instant::now(),
         };
 
@@ -1881,6 +1917,9 @@ mod tests {
             last_shim_health_check: Instant::now(),
             merge_queue: crate::team::daemon::MergeQueue::default(),
             last_binary_freshness_check: Instant::now(),
+            telegram_health: Default::default(),
+            discord_health: Default::default(),
+            last_telemetry_retention: Instant::now(),
             last_tiered_inbox_sweep: Instant::now(),
         };
 
@@ -1896,5 +1935,48 @@ mod tests {
         assert_eq!(event.task.as_deref(), Some("42"));
 
         let _ = crate::tmux::kill_session(&session);
+    }
+
+    /// Daemon events must go through `emit_event` so they reach SQLite (and
+    /// Grafana) and the failure tracker, not just events.jsonl.
+    #[test]
+    fn event_sink_emit_only_called_from_emit_event_module() {
+        fn visit(dir: &Path, offenders: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, offenders);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if !name.ends_with(".rs")
+                    || name == "tests.rs"
+                    || name.ends_with("_tests.rs")
+                    || path.ends_with("daemon/telemetry.rs")
+                {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let production = source
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .collect::<String>();
+                if production.contains("event_sink.emit(") {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+
+        let mut offenders = Vec::new();
+        visit(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut offenders,
+        );
+        assert!(
+            offenders.is_empty(),
+            "event_sink.emit( must only be used in daemon/telemetry.rs (use emit_event): {offenders:?}"
+        );
     }
 }

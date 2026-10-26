@@ -4,9 +4,11 @@
 //! via the Telegram Bot API. Access control is enforced by numeric user IDs.
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
+use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::config::ChannelConfig;
@@ -26,7 +28,14 @@ pub struct TelegramBot {
     last_update_offset: i64,
     /// False until the first poll has acknowledged the startup backlog.
     seeded: bool,
+    /// Chunks already delivered for multi-chunk messages whose send failed
+    /// part-way, keyed by hash of (chat, text). A retry resumes after the last
+    /// delivered chunk instead of re-sending the earlier ones.
+    chunk_progress: Mutex<HashMap<u64, usize>>,
 }
+
+/// Bound on remembered partially-sent messages.
+const MAX_CHUNK_PROGRESS_ENTRIES: usize = 64;
 
 impl TelegramBot {
     /// Create a new `TelegramBot` with the given token and allowed user IDs.
@@ -36,6 +45,7 @@ impl TelegramBot {
             allowed_user_ids,
             last_update_offset: 0,
             seeded: false,
+            chunk_progress: Mutex::new(HashMap::new()),
         }
     }
 
@@ -67,11 +77,32 @@ impl TelegramBot {
     ///
     /// Messages longer than 4096 characters are split into multiple messages.
     /// POST `https://api.telegram.org/bot{token}/sendMessage`
+    ///
+    /// If a later chunk fails, the chunks already delivered are remembered so a
+    /// retry of the same message resumes after them rather than duplicating.
     pub fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
+        self.send_chunks(chat_id, text, |chunk| {
+            self.send_message_chunk(chat_id, chunk)
+        })
+    }
+
+    fn send_chunks(
+        &self,
+        chat_id: &str,
+        text: &str,
+        mut send_chunk: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
         let chunks = split_message(text, Self::MAX_MESSAGE_LEN);
         let total_chunks = chunks.len();
+        let progress_key = outbound_chunk_message_id(chat_id, text, 0, total_chunks);
+        let start = self
+            .chunk_progress
+            .lock()
+            .map(|progress| progress.get(&progress_key).copied().unwrap_or(0))
+            .unwrap_or(0)
+            .min(total_chunks);
 
-        for (index, chunk) in chunks.into_iter().enumerate() {
+        for (index, chunk) in chunks.into_iter().enumerate().skip(start) {
             let chunk_id = outbound_chunk_message_id(chat_id, chunk, index, total_chunks);
             debug!(
                 chat_id,
@@ -80,9 +111,26 @@ impl TelegramBot {
                 chunk_id,
                 "sending telegram message chunk"
             );
-            self.send_message_chunk(chat_id, chunk)?;
+            if let Err(error) = send_chunk(chunk) {
+                if index > 0 {
+                    self.set_chunk_progress(progress_key, index);
+                }
+                return Err(error);
+            }
+        }
+        if let Ok(mut progress) = self.chunk_progress.lock() {
+            progress.remove(&progress_key);
         }
         Ok(())
+    }
+
+    fn set_chunk_progress(&self, key: u64, delivered: usize) {
+        if let Ok(mut progress) = self.chunk_progress.lock() {
+            if progress.len() >= MAX_CHUNK_PROGRESS_ENTRIES && !progress.contains_key(&key) {
+                progress.clear();
+            }
+            progress.insert(key, delivered);
+        }
     }
 
     /// Send a single message chunk (must be <= 4096 chars).
@@ -94,7 +142,8 @@ impl TelegramBot {
             "text": text,
         });
 
-        let resp = ureq::post(&url)
+        let resp = super::http::agent()
+            .post(&url)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string());
 
@@ -109,7 +158,8 @@ impl TelegramBot {
                 Ok(())
             }
             Err(ureq::Error::Status(status, response)) => {
-                let detail = response.into_string().unwrap_or_default();
+                let detail =
+                    redact_token(&response.into_string().unwrap_or_default(), &self.bot_token);
                 warn!(status, detail = %detail, "sendMessage failed");
                 bail!("Telegram sendMessage failed with status {status}: {detail}");
             }
@@ -143,7 +193,7 @@ impl TelegramBot {
             self.bot_token
         );
 
-        let resp = ureq::get(&url).call();
+        let resp = super::http::agent().get(&url).call();
 
         let body: serde_json::Value = match resp {
             Ok(r) => r.into_json()?,
@@ -360,17 +410,15 @@ fn prompt_bot_token() -> Result<String> {
 /// Replace every occurrence of the bot token in `text`. Telegram puts the
 /// token in the request path, and ureq includes the URL in its error text.
 fn redact_token(text: &str, token: &str) -> String {
-    if token.is_empty() {
-        return text.to_string();
-    }
-    text.replace(token, "<redacted>")
+    super::http::redact_secret(text, token)
 }
 
 /// Validate a bot token by calling the getMe API.
 /// Returns the bot username on success.
-fn validate_bot_token(token: &str) -> Result<String> {
+pub(crate) fn validate_bot_token(token: &str) -> Result<String> {
     let url = format!("https://api.telegram.org/bot{token}/getMe");
-    let resp: serde_json::Value = ureq::get(&url)
+    let resp: serde_json::Value = super::http::agent()
+        .get(&url)
         .call()
         .map_err(|e| anyhow::anyhow!(redact_token(&e.to_string(), token)))?
         .into_json()?;
@@ -1020,5 +1068,71 @@ roles:
         let second = outbound_chunk_message_id("12345", chunks[1], 1, chunks.len());
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn send_chunks_resumes_after_last_delivered_chunk() {
+        let bot = TelegramBot::new("tok".into(), vec![]);
+        let text = "a".repeat(10_000); // 3 chunks
+        let mut sent = Vec::new();
+        let result = bot.send_chunks("1", &text, |chunk| {
+            if sent.len() == 2 {
+                anyhow::bail!("boom");
+            }
+            sent.push(chunk.len());
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(sent.len(), 2);
+
+        let mut resumed = Vec::new();
+        bot.send_chunks("1", &text, |chunk| {
+            resumed.push(chunk.len());
+            Ok(())
+        })
+        .unwrap();
+        // Only the third chunk is resent.
+        assert_eq!(resumed, vec![10_000 - 2 * 4096]);
+
+        // Progress is cleared after success: a fresh send starts from chunk 0.
+        let mut again = 0;
+        bot.send_chunks("1", &text, |_| {
+            again += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(again, 3);
+    }
+
+    #[test]
+    fn send_chunks_first_chunk_failure_retries_from_start() {
+        let bot = TelegramBot::new("tok".into(), vec![]);
+        let text = "a".repeat(5000);
+        assert!(bot.send_chunks("1", &text, |_| anyhow::bail!("x")).is_err());
+        let mut count = 0;
+        bot.send_chunks("1", &text, |_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn send_chunks_progress_is_per_chat_and_text() {
+        let bot = TelegramBot::new("tok".into(), vec![]);
+        let text = "a".repeat(5000);
+        let mut n = 0;
+        let _ = bot.send_chunks("1", &text, |_| {
+            n += 1;
+            if n == 2 { anyhow::bail!("x") } else { Ok(()) }
+        });
+        let mut other = 0;
+        bot.send_chunks("2", &text, |_| {
+            other += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(other, 2);
     }
 }

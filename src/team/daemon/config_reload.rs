@@ -173,13 +173,11 @@ impl TeamDaemon {
             diff.removed.len()
         );
         self.record_orchestrator_action(format!("runtime: topology changed — {reason}"));
-        if let Err(e) = self.event_sink.emit(TeamEvent::topology_changed(
+        self.emit_event(TeamEvent::topology_changed(
             diff.added.len() as u32,
             diff.removed.len() as u32,
             &reason,
-        )) {
-            warn!(error = %e, "failed to emit topology_changed event");
-        }
+        ));
 
         // Reconcile: apply the diff
         self.reconcile_topology(diff, new_config, new_members)?;

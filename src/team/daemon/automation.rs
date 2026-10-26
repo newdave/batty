@@ -1851,12 +1851,10 @@ impl TeamDaemon {
                     ));
                 }
 
-                if let Err(error) = self.event_sink.emit(TeamEvent::review_escalated(
+                self.emit_event(TeamEvent::review_escalated(
                     &task.id.to_string(),
                     &format!("review timeout after {age}s"),
-                )) {
-                    warn!(error = %error, "failed to emit review_escalated event");
-                }
+                ));
 
                 // Transition to blocked
                 let _ = super::super::task_cmd::transition_task_with_attribution(
@@ -1896,12 +1894,7 @@ impl TeamDaemon {
                     task.id,
                 ));
 
-                if let Err(error) = self
-                    .event_sink
-                    .emit(TeamEvent::review_nudge_sent(reviewer, &task.id.to_string()))
-                {
-                    warn!(error = %error, "failed to emit review_nudge_sent event");
-                }
+                self.emit_event(TeamEvent::review_nudge_sent(reviewer, &task.id.to_string()));
 
                 self.review_nudge_sent.insert(task.id);
             }

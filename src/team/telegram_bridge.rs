@@ -37,9 +37,17 @@ impl TeamDaemon {
             .expect("checked telegram bot presence")
             .poll_updates()
         {
-            Ok(msgs) => msgs,
+            Ok(msgs) => {
+                if let Some(transition) = self.telegram_health.record_success() {
+                    self.report_integration_health("telegram", transition, "");
+                }
+                msgs
+            }
             Err(error) => {
                 debug!(error = %error, "telegram poll failed");
+                if let Some(transition) = self.telegram_health.record_failure() {
+                    self.report_integration_health("telegram", transition, &error.to_string());
+                }
                 return Ok(());
             }
         };
@@ -518,6 +526,30 @@ impl TeamDaemon {
         })
     }
 
+    /// Warn and emit a team event when a chat integration's poll health flips.
+    pub(super) fn report_integration_health(
+        &mut self,
+        integration: &str,
+        transition: crate::team::integration_health::HealthTransition,
+        error: &str,
+    ) {
+        use crate::team::integration_health::HealthTransition;
+        match transition {
+            HealthTransition::BecameUnhealthy { failures } => {
+                warn!(integration, failures, error, "chat integration unhealthy");
+                self.emit_event(TeamEvent::integration_unhealthy(
+                    integration,
+                    failures,
+                    error,
+                ));
+            }
+            HealthTransition::Recovered { failures } => {
+                info!(integration, failures, "chat integration recovered");
+                self.emit_event(TeamEvent::integration_recovered(integration, failures));
+            }
+        }
+    }
+
     pub(super) fn deliver_user_channel_inbox(&mut self) -> Result<()> {
         let root = inbox::inboxes_root(&self.config.project_root);
         let user_roles: Vec<String> = self
@@ -561,11 +593,16 @@ impl TeamDaemon {
                 }
 
                 info!(from = %msg.from, to = %user_name, id = %msg.id, "delivered to user channel");
-                if let Err(error) = inbox::mark_delivered(&root, user_name, &msg.id) {
-                    warn!(user = %user_name, id = %msg.id, error = %error, "failed to mark delivered");
-                }
-
+                let marked = inbox::mark_delivered(&root, user_name, &msg.id);
                 self.record_message_routed(&msg.from, user_name);
+                if let Err(error) = marked {
+                    // The message was sent but stays pending. Stop here so this
+                    // poll does not deliver further messages (and compound the
+                    // duplicates); the channel's recent-send dedup suppresses
+                    // the resend on the next poll.
+                    warn!(user = %user_name, id = %msg.id, error = %error, "failed to mark delivered; stopping delivery for this poll");
+                    break;
+                }
             }
         }
 
@@ -1292,6 +1329,9 @@ mod tests {
             last_shim_health_check: Instant::now(),
             merge_queue: crate::team::daemon::MergeQueue::default(),
             last_binary_freshness_check: Instant::now(),
+            telegram_health: Default::default(),
+            discord_health: Default::default(),
+            last_telemetry_retention: Instant::now(),
             last_tiered_inbox_sweep: Instant::now(),
         };
 
@@ -1451,6 +1491,9 @@ mod tests {
             last_shim_health_check: Instant::now(),
             merge_queue: crate::team::daemon::MergeQueue::default(),
             last_binary_freshness_check: Instant::now(),
+            telegram_health: Default::default(),
+            discord_health: Default::default(),
+            last_telemetry_retention: Instant::now(),
             last_tiered_inbox_sweep: Instant::now(),
         };
 
@@ -1629,6 +1672,9 @@ mod tests {
             last_shim_health_check: Instant::now(),
             merge_queue: crate::team::daemon::MergeQueue::default(),
             last_binary_freshness_check: Instant::now(),
+            telegram_health: Default::default(),
+            discord_health: Default::default(),
+            last_telemetry_retention: Instant::now(),
             last_tiered_inbox_sweep: Instant::now(),
         };
 
@@ -3040,5 +3086,39 @@ mod tests {
         assert!(summary.contains("Members: idle=1, working=1"));
         assert!(summary.contains("Inbox: 1"));
         assert!(summary.contains("Board: active=1, review=1"));
+    }
+
+    #[test]
+    fn report_integration_health_emits_unhealthy_and_recovered_events() {
+        use crate::team::integration_health::HealthTransition;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = daemon_config_with_roles(tmp.path(), Vec::new());
+        let mut daemon = TeamDaemon::new(config).unwrap();
+
+        daemon.report_integration_health(
+            "telegram",
+            HealthTransition::BecameUnhealthy { failures: 5 },
+            "timed out",
+        );
+        daemon.report_integration_health(
+            "telegram",
+            HealthTransition::Recovered { failures: 6 },
+            "",
+        );
+
+        let events =
+            crate::team::events::read_events(&crate::team::team_events_path(tmp.path())).unwrap();
+        let unhealthy = events
+            .iter()
+            .find(|event| event.event == "integration_unhealthy")
+            .expect("unhealthy event");
+        assert_eq!(unhealthy.step.as_deref(), Some("telegram"));
+        assert_eq!(unhealthy.error.as_deref(), Some("timed out"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "integration_recovered")
+        );
     }
 }

@@ -11,6 +11,7 @@ use super::standup::MemberState;
 
 mod checks;
 pub(super) mod cleanup;
+mod integration_checks;
 mod shim_checks;
 mod util;
 
@@ -21,6 +22,7 @@ use checks::{
 use cleanup::{
     apply_cleanup_plan, detect_cleanup_plan, render_cleanup_plan, render_cleanup_summary,
 };
+use integration_checks::build_integration_checks;
 use shim_checks::build_shim_checks;
 use util::{
     file_size, launch_state_path, load_daemon_state, load_launch_state, load_team_config,
@@ -161,6 +163,7 @@ pub fn build_report(project_root: &Path, fix: bool) -> Result<String> {
     let board_git_checks = build_board_git_checks(project_root);
     let board_dependency_graph = build_board_dependency_graph(project_root);
     let performance_checks = build_performance_checks(project_root);
+    let integration_checks = build_integration_checks(team_config.as_ref());
     let orphan_test_sessions = crate::tmux::list_sessions_with_prefix("batty-test-");
     let use_shim = team_config.as_ref().is_some_and(|c| c.use_shim);
     let shim_checks = if use_shim {
@@ -197,6 +200,7 @@ pub fn build_report(project_root: &Path, fix: bool) -> Result<String> {
         board_git_checks: &board_git_checks,
         board_dependency_graph: &board_dependency_graph,
         performance_checks: &performance_checks,
+        integration_checks: &integration_checks,
         orphan_test_sessions: &orphan_test_sessions,
         shim_checks: shim_checks.as_ref(),
         log_sizes: &log_sizes,
@@ -212,6 +216,7 @@ struct DoctorReportData<'a> {
     board_git_checks: &'a [CheckLine],
     board_dependency_graph: &'a [String],
     performance_checks: &'a [CheckLine],
+    integration_checks: &'a [CheckLine],
     orphan_test_sessions: &'a [String],
     shim_checks: Option<&'a shim_checks::ShimHealthReport>,
     log_sizes: &'a [LogSize],
@@ -227,6 +232,7 @@ fn render_report(report: DoctorReportData<'_>) -> String {
         board_git_checks,
         board_dependency_graph,
         performance_checks,
+        integration_checks,
         orphan_test_sessions,
         shim_checks,
         log_sizes,
@@ -360,6 +366,22 @@ fn render_report(report: DoctorReportData<'_>) -> String {
         ));
     }
     out.push('\n');
+
+    if !integration_checks.is_empty() {
+        out.push_str("== Chat Integrations ==\n");
+        for line in integration_checks {
+            out.push_str(&format!(
+                "{}: {}\n",
+                match line.level {
+                    CheckLevel::Pass => "PASS",
+                    CheckLevel::Warn => "WARN",
+                    CheckLevel::Fail => "FAIL",
+                },
+                line.message
+            ));
+        }
+        out.push('\n');
+    }
 
     out.push_str("== Orphaned Test Sessions ==\n");
     if orphan_test_sessions.is_empty() {

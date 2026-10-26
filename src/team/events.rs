@@ -288,6 +288,28 @@ impl TeamEvent {
         }
     }
 
+    /// A chat integration (telegram/discord) has failed `failures` consecutive
+    /// polls.
+    pub fn integration_unhealthy(integration: &str, failures: u32, error: &str) -> Self {
+        Self {
+            step: Some(integration.into()),
+            error: Some(error.into()),
+            details: Some(format!("{failures} consecutive poll failures")),
+            ..Self::base("integration_unhealthy")
+        }
+    }
+
+    /// A chat integration polled successfully after being reported unhealthy.
+    pub fn integration_recovered(integration: &str, failures: u32) -> Self {
+        Self {
+            step: Some(integration.into()),
+            details: Some(format!(
+                "recovered after {failures} consecutive poll failures"
+            )),
+            ..Self::base("integration_recovered")
+        }
+    }
+
     pub fn daemon_panic(reason: &str) -> Self {
         Self {
             reason: Some(reason.into()),
@@ -1456,6 +1478,45 @@ pub fn read_events(path: &Path) -> Result<Vec<TeamEvent>> {
         }
     }
     Ok(events)
+}
+
+/// Read only the last `max_bytes` of the event log and parse the complete
+/// lines in that window. Cheap alternative to [`read_events`] for daemon
+/// lookups that only care about recent events; a leading partial line (cut by
+/// the window) is dropped.
+pub fn read_events_tail(path: &Path, max_bytes: u64) -> Result<Vec<TeamEvent>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("failed to open event log"),
+    };
+    let len = file.metadata().context("failed to stat event log")?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))
+        .context("failed to seek event log")?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.take(len - start)
+        .read_to_end(&mut buf)
+        .context("failed to read event log tail")?;
+
+    let mut window = &buf[..];
+    if start > 0 {
+        // The window began mid-line (unless it landed exactly on a line start,
+        // which we cannot tell cheaply); skip to the first full line.
+        match window.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => window = &window[newline + 1..],
+            None => return Ok(Vec::new()),
+        }
+    }
+    let text = String::from_utf8_lossy(window);
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<TeamEvent>(line).ok())
+        .collect())
 }
 
 #[cfg(test)]
@@ -2906,5 +2967,75 @@ mod tests {
             let json = serde_json::to_string(variant).unwrap();
             assert_eq!(json, format!("\"{}\"", name));
         }
+    }
+
+    #[test]
+    fn read_events_tail_missing_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            read_events_tail(&tmp.path().join("none.jsonl"), 1024)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_events_tail_returns_all_when_window_covers_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let mut sink = EventSink::new(&path).unwrap();
+        for i in 0..5 {
+            sink.emit(TeamEvent::task_assigned("eng", &format!("task {i}")))
+                .unwrap();
+        }
+        let events = read_events_tail(&path, 1 << 20).unwrap();
+        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), read_events(&path).unwrap().len());
+    }
+
+    #[test]
+    fn read_events_tail_drops_partial_leading_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let mut sink = EventSink::new(&path).unwrap();
+        for i in 0..20 {
+            sink.emit(TeamEvent::task_assigned("eng", &format!("task {i}")))
+                .unwrap();
+        }
+        let line_len = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .len() as u64
+            + 1;
+        // Window of ~3.5 lines: cuts a line in half, so only complete lines remain.
+        let events = read_events_tail(&path, line_len * 3 + line_len / 2).unwrap();
+        assert!(!events.is_empty() && events.len() <= 3, "{}", events.len());
+        assert_eq!(events.last().unwrap().task.as_deref(), Some("task 19"));
+    }
+
+    #[test]
+    fn read_events_tail_window_without_newline_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let mut sink = EventSink::new(&path).unwrap();
+        sink.emit(TeamEvent::task_assigned("eng", "a long task title"))
+            .unwrap();
+        assert!(read_events_tail(&path, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn integration_health_events_carry_integration_and_counts() {
+        let unhealthy = TeamEvent::integration_unhealthy("telegram", 5, "boom");
+        assert_eq!(unhealthy.event, "integration_unhealthy");
+        assert_eq!(unhealthy.step.as_deref(), Some("telegram"));
+        assert_eq!(unhealthy.error.as_deref(), Some("boom"));
+        assert!(unhealthy.details.unwrap().contains('5'));
+
+        let recovered = TeamEvent::integration_recovered("discord", 7);
+        assert_eq!(recovered.event, "integration_recovered");
+        assert_eq!(recovered.step.as_deref(), Some("discord"));
+        assert!(recovered.details.unwrap().contains('7'));
     }
 }

@@ -269,6 +269,11 @@ impl DiscordBot {
         ))
     }
 
+    /// Strip the bot token from text destined for logs or error messages.
+    fn redact(&self, text: &str) -> String {
+        super::http::redact_secret(text, &self.bot_token)
+    }
+
     pub fn commands_channel_id(&self) -> &str {
         &self.commands_channel_id
     }
@@ -352,7 +357,8 @@ impl DiscordBot {
         body: &serde_json::Value,
     ) -> Result<()> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
-        let response = ureq::request("PATCH", &url)
+        let response = super::http::agent()
+            .request("PATCH", &url)
             .set("Authorization", &format!("Bot {}", self.bot_token))
             .set("Content-Type", "application/json")
             .send_string(&body.to_string());
@@ -366,7 +372,7 @@ impl DiscordBot {
                 Ok(())
             }
             Err(ureq::Error::Status(status, response)) => {
-                let detail = response.into_string().unwrap_or_default();
+                let detail = self.redact(&response.into_string().unwrap_or_default());
                 warn!(
                     status,
                     detail = %detail,
@@ -378,19 +384,23 @@ impl DiscordBot {
             }
             Err(ureq::Error::Transport(error)) => {
                 warn!(
-                    error = %error,
+                    error = %self.redact(&error.to_string()),
                     channel_id,
                     message_id,
                     "Discord edit transport failed"
                 );
-                bail!("Discord edit transport failed: {error}");
+                bail!(
+                    "Discord edit transport failed: {}",
+                    self.redact(&error.to_string())
+                );
             }
         }
     }
 
     pub fn pin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/pins/{message_id}");
-        let response = ureq::request("PUT", &url)
+        let response = super::http::agent()
+            .request("PUT", &url)
             .set("Authorization", &format!("Bot {}", self.bot_token))
             .call();
 
@@ -403,7 +413,7 @@ impl DiscordBot {
                 Ok(())
             }
             Err(ureq::Error::Status(status, response)) => {
-                let detail = response.into_string().unwrap_or_default();
+                let detail = self.redact(&response.into_string().unwrap_or_default());
                 warn!(
                     status,
                     detail = %detail,
@@ -415,12 +425,15 @@ impl DiscordBot {
             }
             Err(ureq::Error::Transport(error)) => {
                 warn!(
-                    error = %error,
+                    error = %self.redact(&error.to_string()),
                     channel_id,
                     message_id,
                     "Discord pin transport failed"
                 );
-                bail!("Discord pin transport failed: {error}");
+                bail!(
+                    "Discord pin transport failed: {}",
+                    self.redact(&error.to_string())
+                );
             }
         }
     }
@@ -440,7 +453,8 @@ impl DiscordBot {
             ),
         };
 
-        let response = ureq::get(&url)
+        let response = super::http::agent()
+            .get(&url)
             .set("Authorization", &format!("Bot {}", self.bot_token))
             .call();
 
@@ -449,13 +463,16 @@ impl DiscordBot {
                 .into_json()
                 .context("failed to parse Discord messages response")?,
             Err(ureq::Error::Status(status, response)) => {
-                let detail = response.into_string().unwrap_or_default();
+                let detail = self.redact(&response.into_string().unwrap_or_default());
                 warn!(status, detail = %detail, "Discord poll failed");
                 bail!("Discord messages failed with status {status}: {detail}");
             }
             Err(ureq::Error::Transport(error)) => {
-                warn!(error = %error, "Discord poll transport failed");
-                bail!("Discord messages transport failed: {error}");
+                warn!(error = %self.redact(&error.to_string()), "Discord poll transport failed");
+                bail!(
+                    "Discord messages transport failed: {}",
+                    self.redact(&error.to_string())
+                );
             }
         };
 
@@ -497,25 +514,30 @@ impl DiscordBot {
     }
 
     fn get_json(&self, url: &str) -> Result<serde_json::Value> {
-        let response = ureq::get(url)
+        let response = super::http::agent()
+            .get(url)
             .set("Authorization", &format!("Bot {}", self.bot_token))
             .call();
 
         match response {
             Ok(resp) => resp.into_json().context("failed to parse Discord response"),
             Err(ureq::Error::Status(status, response)) => {
-                let detail = response.into_string().unwrap_or_default();
+                let detail = self.redact(&response.into_string().unwrap_or_default());
                 bail!("Discord request failed with status {status}: {detail}");
             }
             Err(ureq::Error::Transport(error)) => {
-                bail!("Discord request transport failed: {error}");
+                bail!(
+                    "Discord request transport failed: {}",
+                    self.redact(&error.to_string())
+                );
             }
         }
     }
 
     fn post_message(&self, channel_id: &str, body: &serde_json::Value) -> Result<String> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-        let response = ureq::post(&url)
+        let response = super::http::agent()
+            .post(&url)
             .set("Authorization", &format!("Bot {}", self.bot_token))
             .set("Content-Type", "application/json")
             .send_string(&body.to_string());
@@ -534,13 +556,16 @@ impl DiscordBot {
                 Ok(message_id)
             }
             Err(ureq::Error::Status(status, response)) => {
-                let detail = response.into_string().unwrap_or_default();
+                let detail = self.redact(&response.into_string().unwrap_or_default());
                 warn!(status, detail = %detail, channel_id, "Discord send failed");
                 bail!("Discord send failed with status {status}: {detail}");
             }
             Err(ureq::Error::Transport(error)) => {
-                warn!(error = %error, channel_id, "Discord send transport failed");
-                bail!("Discord send transport failed: {error}");
+                warn!(error = %self.redact(&error.to_string()), channel_id, "Discord send transport failed");
+                bail!(
+                    "Discord send transport failed: {}",
+                    self.redact(&error.to_string())
+                );
             }
         }
     }
@@ -812,7 +837,8 @@ pub fn severity_for_event(event: &str) -> Severity {
         | "dispatch_overlap_skipped"
         | "pattern_detected"
         | "narration_rejection"
-        | "review_aging" => Warn,
+        | "review_aging"
+        | "integration_unhealthy" => Warn,
 
         // Red — something is broken or blocked and someone needs to act.
         "task_escalated"
@@ -1726,5 +1752,25 @@ roles:
         assert!(role_author_label("eng-1-1").contains("🔧"));
         assert!(role_author_label("sam-designer-1").contains("🎨"));
         assert_eq!(role_author_label("unknown-role"), "unknown-role");
+    }
+
+    #[test]
+    fn discord_transport_errors_are_redacted() {
+        let bot = DiscordBot::new("secret-token-xyz".into(), vec![], "1".into());
+        assert_eq!(
+            bot.redact("GET https://x/?t=secret-token-xyz failed: secret-token-xyz"),
+            "GET https://x/?t=<redacted> failed: <redacted>"
+        );
+    }
+
+    #[test]
+    fn discord_requests_fail_fast_and_never_leak_token() {
+        // Port 1 refuses connections immediately; the error must not echo the token.
+        let bot = DiscordBot::new("secret-token-xyz".into(), vec![], "1".into());
+        let error = bot
+            .get_json("http://127.0.0.1:1/users/@me?token=secret-token-xyz")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("secret-token-xyz"), "{error}");
     }
 }

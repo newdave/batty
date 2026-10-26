@@ -718,6 +718,9 @@ pub fn validate_team(project_root: &Path, verbose: bool) -> Result<()> {
         }
     } else {
         team_config.validate()?;
+        for warning in team_config.channel_warnings() {
+            println!("[WARN] {warning}");
+        }
     }
     team_config.validate_project_refs(project_root)?;
 

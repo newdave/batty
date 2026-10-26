@@ -1,7 +1,9 @@
 //! Team configuration parsed from `.batty/team_config/team.yaml`.
 
+mod channels;
 mod types;
 
+pub use channels::*;
 pub use types::*;
 
 use std::collections::HashSet;
@@ -342,6 +344,10 @@ impl TeamConfig {
             }
         }
 
+        if let Some(error) = self.channel_error() {
+            bail!("{error}");
+        }
+
         Ok(())
     }
 
@@ -532,7 +538,22 @@ impl TeamConfig {
             });
         }
 
-        // 8. Backend health checks (warnings, not failures)
+        // 8. Channel configuration. Warnings (missing credentials) do not fail
+        // validation, so they are reported as passing checks tagged "WARN".
+        for check in self.channel_checks() {
+            let (passed, detail) = match check.level {
+                ChannelCheckLevel::Pass => (true, check.detail),
+                ChannelCheckLevel::Warn => (true, format!("WARN: {}", check.detail)),
+                ChannelCheckLevel::Error => (false, check.detail),
+            };
+            checks.push(ValidationCheck {
+                name: check.name,
+                passed,
+                detail,
+            });
+        }
+
+        // 9. Backend health checks (warnings, not failures)
         for (agent_name, health) in self.backend_health_results() {
             let healthy = health.is_healthy();
             checks.push(ValidationCheck {

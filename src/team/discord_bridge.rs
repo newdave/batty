@@ -60,9 +60,17 @@ impl TeamDaemon {
             .expect("checked discord bot presence")
             .poll_commands()
         {
-            Ok(messages) => messages,
+            Ok(messages) => {
+                if let Some(transition) = self.discord_health.record_success() {
+                    self.report_integration_health("discord", transition, "");
+                }
+                messages
+            }
             Err(error) => {
                 warn!(error = %error, "discord poll failed");
+                if let Some(transition) = self.discord_health.record_failure() {
+                    self.report_integration_health("discord", transition, &error.to_string());
+                }
                 return Ok(());
             }
         };

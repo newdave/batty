@@ -170,6 +170,54 @@ pub fn open(project_root: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Default retention for row-per-event telemetry tables.
+pub const DEFAULT_RETENTION_DAYS: u64 = 90;
+
+/// Rows removed by a retention pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub events_deleted: usize,
+    pub review_queue_deleted: usize,
+}
+
+/// Delete timestamped event/metric rows older than `retention_days` and
+/// truncate the WAL.
+///
+/// Only append-style tables (`events`, `review_queue_metrics`) are pruned.
+/// Aggregates keyed by task/role/test (`task_metrics`, `agent_metrics`,
+/// `session_summary`, `task_cycle_times`, `test_case_metrics`,
+/// `non_engineer_stall_metrics`) are small, rebuildable or still referenced by
+/// dashboards, so they are left alone.
+pub fn run_retention(
+    conn: &Connection,
+    now_ts: u64,
+    retention_days: u64,
+) -> Result<RetentionReport> {
+    let cutoff = now_ts.saturating_sub(retention_days.saturating_mul(86_400)) as i64;
+    let events_deleted = conn
+        .execute("DELETE FROM events WHERE timestamp < ?1", [cutoff])
+        .context("failed to prune old telemetry events")?;
+    let review_queue_deleted = conn
+        .execute(
+            "DELETE FROM review_queue_metrics WHERE timestamp < ?1",
+            [cutoff],
+        )
+        .context("failed to prune old review queue metrics")?;
+    checkpoint_wal(conn)?;
+    Ok(RetentionReport {
+        events_deleted,
+        review_queue_deleted,
+    })
+}
+
+/// Fold the WAL back into the main database file and truncate it.
+pub fn checkpoint_wal(conn: &Connection) -> Result<()> {
+    // The pragma returns a (busy, log, checkpointed) row.
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .context("failed to checkpoint telemetry WAL")?;
+    Ok(())
+}
+
 /// Open the telemetry database in read-only mode for CLI queries (#676).
 ///
 /// Skips schema initialization (which requires a write lock) to avoid
@@ -2900,5 +2948,78 @@ mod tests {
         .unwrap();
         let summaries = query_session_summaries(&conn).unwrap();
         assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn run_retention_prunes_old_events_and_review_snapshots_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".batty")).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let now: u64 = 200 * 86_400;
+        let old = (now - 91 * 86_400) as i64;
+        let recent = (now - 10 * 86_400) as i64;
+        for ts in [old, old, recent] {
+            conn.execute(
+                "INSERT INTO events (timestamp, event_type, payload) VALUES (?1, 'x', '{}')",
+                [ts],
+            )
+            .unwrap();
+        }
+        for ts in [old, recent] {
+            conn.execute(
+                "INSERT INTO review_queue_metrics
+                 (timestamp, queue_depth, over_slo_count, review_slo_secs)
+                 VALUES (?1, 1, 0, 60)",
+                [ts],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO task_metrics (task_id, started_at) VALUES ('1', ?1)",
+            [old],
+        )
+        .unwrap();
+
+        let report = run_retention(&conn, now, DEFAULT_RETENTION_DAYS).unwrap();
+        assert_eq!(
+            report,
+            RetentionReport {
+                events_deleted: 2,
+                review_queue_deleted: 1
+            }
+        );
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count("events"), 1);
+        assert_eq!(count("review_queue_metrics"), 1);
+        // Aggregates are untouched.
+        assert_eq!(count("task_metrics"), 1);
+    }
+
+    #[test]
+    fn run_retention_is_noop_on_empty_db_and_saturates_small_clock() {
+        let conn = open_in_memory().unwrap();
+        let report = run_retention(&conn, 5, DEFAULT_RETENTION_DAYS).unwrap();
+        assert_eq!(report, RetentionReport::default());
+    }
+
+    #[test]
+    fn checkpoint_wal_succeeds_on_file_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".batty")).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        conn.execute(
+            "INSERT INTO events (timestamp, event_type, payload) VALUES (1, 'x', '{}')",
+            [],
+        )
+        .unwrap();
+        checkpoint_wal(&conn).unwrap();
+        let wal = tmp.path().join(".batty").join("telemetry.db-wal");
+        let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_len, 0);
     }
 }

@@ -370,6 +370,10 @@ impl TeamDaemon {
             daemon.maybe_check_binary_freshness();
             Ok(())
         });
+        self.run_recoverable_step("maybe_run_telemetry_retention", |daemon| {
+            daemon.maybe_run_telemetry_retention();
+            Ok(())
+        });
         self.run_recoverable_step("maybe_reconcile_stale_worktrees", |daemon| {
             daemon.maybe_reconcile_stale_worktrees()
         });

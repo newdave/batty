@@ -163,9 +163,7 @@ impl TeamDaemon {
         }
 
         // Log event
-        if let Err(e) = self.event_sink.emit(TeamEvent::agent_spawned(&member.name)) {
-            warn!(error = %e, "failed to emit agent_spawned event");
-        }
+        self.emit_event(TeamEvent::agent_spawned(&member.name));
 
         self.record_orchestrator_action(format!("topology: added member {}", member.name));
         Ok(())
@@ -279,9 +277,7 @@ impl TeamDaemon {
         } else {
             "removed (was idle)"
         };
-        if let Err(e) = self.event_sink.emit(TeamEvent::agent_removed(name, reason)) {
-            warn!(error = %e, "failed to emit agent_removed event");
-        }
+        self.emit_event(TeamEvent::agent_removed(name, reason));
 
         self.record_orchestrator_action(format!("topology: removed member {name}"));
         Ok(())
