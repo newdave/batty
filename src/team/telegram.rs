@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::config::ChannelConfig;
 
@@ -24,6 +24,8 @@ pub struct TelegramBot {
     bot_token: String,
     allowed_user_ids: Vec<i64>,
     last_update_offset: i64,
+    /// False until the first poll has acknowledged the startup backlog.
+    seeded: bool,
 }
 
 impl TelegramBot {
@@ -33,6 +35,7 @@ impl TelegramBot {
             bot_token,
             allowed_user_ids,
             last_update_offset: 0,
+            seeded: false,
         }
     }
 
@@ -126,9 +129,18 @@ impl TelegramBot {
     ///
     /// Unauthorized messages are silently dropped (logged at debug level).
     pub fn poll_updates(&mut self) -> Result<Vec<InboundMessage>> {
+        // The first poll after startup uses offset=-1, which returns only the
+        // newest update and acknowledges everything before it. Its messages
+        // are skipped so commands handled by a previous run (and replayed by
+        // Telegram until acknowledged) are not executed again.
+        let offset = if self.seeded {
+            self.last_update_offset
+        } else {
+            -1
+        };
         let url = format!(
-            "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=0",
-            self.bot_token, self.last_update_offset
+            "https://api.telegram.org/bot{}/getUpdates?offset={offset}&timeout=0",
+            self.bot_token
         );
 
         let resp = ureq::get(&url).call();
@@ -144,9 +156,28 @@ impl TelegramBot {
 
         let (messages, new_offset) =
             parse_updates_response(&body, &self.allowed_user_ids, self.last_update_offset);
-        self.last_update_offset = new_offset;
+        Ok(self.advance_update_cursor(messages, new_offset))
+    }
 
-        Ok(messages)
+    /// Advance the update offset and return the messages to process. The
+    /// first poll after startup only seeds the offset and processes nothing.
+    fn advance_update_cursor(
+        &mut self,
+        messages: Vec<InboundMessage>,
+        new_offset: i64,
+    ) -> Vec<InboundMessage> {
+        self.last_update_offset = new_offset;
+        if !self.seeded {
+            self.seeded = true;
+            if !messages.is_empty() {
+                info!(
+                    skipped = messages.len(),
+                    "seeded Telegram update offset; ignoring messages sent before startup"
+                );
+            }
+            return Vec::new();
+        }
+        messages
     }
 }
 
@@ -532,6 +563,24 @@ fn split_message(text: &str, max_len: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_poll_seeds_offset_without_replaying_backlog() {
+        let mut bot = TelegramBot::new("token".to_string(), vec![42]);
+        let message = |text: &str| InboundMessage {
+            from_user_id: 42,
+            chat_id: 42,
+            text: text.to_string(),
+        };
+
+        let first = bot.advance_update_cursor(vec![message("/merge 7")], 101);
+        assert!(first.is_empty(), "startup backlog must not be processed");
+        assert_eq!(bot.last_update_offset, 101);
+
+        let second = bot.advance_update_cursor(vec![message("/status")], 102);
+        assert_eq!(second.len(), 1);
+        assert_eq!(bot.last_update_offset, 102);
+    }
 
     #[test]
     fn redact_token_removes_token_from_ureq_error_text() {

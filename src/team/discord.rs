@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::env_file;
 
@@ -426,13 +426,16 @@ impl DiscordBot {
     }
 
     pub fn poll_commands(&mut self) -> Result<Vec<InboundMessage>> {
+        // With no cursor yet (fresh daemon start), only fetch the newest
+        // message to seed the cursor. Processing the backlog would re-run old
+        // commands such as $merge or $assign on every restart.
         let url = match &self.last_message_id {
             Some(last_id) => format!(
                 "{DISCORD_API_BASE}/channels/{}/messages?limit=100&after={last_id}",
                 self.commands_channel_id
             ),
             None => format!(
-                "{DISCORD_API_BASE}/channels/{}/messages?limit=100",
+                "{DISCORD_API_BASE}/channels/{}/messages?limit=1",
                 self.commands_channel_id
             ),
         };
@@ -458,11 +461,35 @@ impl DiscordBot {
 
         let (messages, latest_message_id, message_content_fault) =
             parse_messages_response(&json, &self.allowed_user_ids)?;
+        self.last_message_content_fault = message_content_fault;
+        Ok(self.advance_command_cursor(messages, latest_message_id))
+    }
+
+    /// Advance the command cursor and return the messages to process. The
+    /// first poll after startup only seeds the cursor and processes nothing.
+    fn advance_command_cursor(
+        &mut self,
+        messages: Vec<InboundMessage>,
+        latest_message_id: Option<String>,
+    ) -> Vec<InboundMessage> {
+        let seeding = self.last_message_id.is_none();
         if let Some(message_id) = latest_message_id {
             self.last_message_id = Some(message_id);
+        } else if seeding {
+            // Empty channel: start from the beginning so the first command
+            // posted after startup is processed rather than used as the seed.
+            self.last_message_id = Some("0".to_string());
         }
-        self.last_message_content_fault = message_content_fault;
-        Ok(messages)
+        if seeding {
+            if !messages.is_empty() {
+                info!(
+                    skipped = messages.len(),
+                    "seeded Discord command cursor; ignoring messages sent before startup"
+                );
+            }
+            return Vec::new();
+        }
+        messages
     }
 
     pub fn take_message_content_fault(&mut self) -> Option<DiscordMessageContentFault> {
@@ -1378,6 +1405,41 @@ mod tests {
         assert_eq!(embed.color, color_for_role("system"));
         assert_eq!(embed.author_name, None);
         assert_eq!(embed.footer.as_deref(), Some("batty · command surface"));
+    }
+
+    #[test]
+    fn first_poll_seeds_cursor_without_replaying_backlog() {
+        let mut bot = DiscordBot::new("token".to_string(), vec![42], "55".to_string());
+        let message = |id: &str| InboundMessage {
+            message_id: id.to_string(),
+            channel_id: "55".to_string(),
+            from_user_id: 42,
+            text: "$merge 7".to_string(),
+        };
+
+        let first = bot.advance_command_cursor(vec![message("1001")], Some("1001".to_string()));
+        assert!(first.is_empty(), "startup backlog must not be processed");
+        assert_eq!(bot.last_message_id.as_deref(), Some("1001"));
+
+        let second = bot.advance_command_cursor(vec![message("1002")], Some("1002".to_string()));
+        assert_eq!(second, vec![message("1002")]);
+        assert_eq!(bot.last_message_id.as_deref(), Some("1002"));
+    }
+
+    #[test]
+    fn empty_channel_seeds_cursor_so_first_command_is_processed() {
+        let mut bot = DiscordBot::new("token".to_string(), vec![42], "55".to_string());
+        assert!(bot.advance_command_cursor(Vec::new(), None).is_empty());
+        assert_eq!(bot.last_message_id.as_deref(), Some("0"));
+
+        let message = InboundMessage {
+            message_id: "2001".to_string(),
+            channel_id: "55".to_string(),
+            from_user_id: 42,
+            text: "$status".to_string(),
+        };
+        let next = bot.advance_command_cursor(vec![message.clone()], Some("2001".to_string()));
+        assert_eq!(next, vec![message]);
     }
 
     #[test]
