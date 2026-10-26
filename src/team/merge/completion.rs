@@ -489,6 +489,15 @@ fn relativize_worktree_path(project_root: &Path, worktree_dir: &Path) -> String 
     }
 }
 
+/// Current board status string for a task, if it can be loaded.
+fn task_status(board_dir: &Path, task_id: u32) -> Option<String> {
+    load_tasks_from_dir(&board_dir.join("tasks"))
+        .ok()?
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.status)
+}
+
 fn move_task_to_review(
     daemon: &mut TeamDaemon,
     board_dir: &Path,
@@ -535,22 +544,29 @@ fn move_task_to_review(
             error = %error,
             "failed to move task to review — attempting force via in-progress first"
         );
-        // If the task is in an unexpected state (e.g. blocked), try
-        // transitioning through in-progress first, then to review.
-        // This prevents the stuck loop where completion fires repeatedly
-        // but the state transition always fails.
-        let _ = crate::team::task_cmd::transition_task_with_attribution(
-            board_dir,
-            task_id,
-            "in-progress",
-            crate::team::task_cmd::StatusTransitionAttribution::daemon("daemon.merge.completion"),
-        );
-        if let Err(error2) = crate::team::task_cmd::transition_task_with_attribution(
-            board_dir,
-            task_id,
-            "review",
-            crate::team::task_cmd::StatusTransitionAttribution::daemon("daemon.merge.completion"),
-        ) {
+        // If the task is in an unexpected state (e.g. blocked or backlog), walk
+        // the legal path (Backlog -> Todo -> InProgress -> Review) so completion
+        // does not fail on the same transition forever.
+        let current = task_status(board_dir, task_id);
+        let steps: &[&str] = match current.as_deref() {
+            Some("backlog") => &["todo", "in-progress", "review"],
+            _ => &["in-progress", "review"],
+        };
+        let mut last_error = None;
+        for step in steps {
+            if let Err(step_error) = crate::team::task_cmd::transition_task_with_attribution(
+                board_dir,
+                task_id,
+                step,
+                crate::team::task_cmd::StatusTransitionAttribution::daemon(
+                    "daemon.merge.completion",
+                ),
+            ) {
+                last_error = Some(step_error);
+                break;
+            }
+        }
+        if let Some(error2) = last_error {
             warn!(
                 engineer,
                 task_id,
@@ -587,9 +603,26 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         return Ok(());
     }
 
+    let board_dir = daemon.board_dir();
+    if let Some(status) = task_status(&board_dir, task_id)
+        && matches!(status.as_str(), "done" | "archived")
+    {
+        info!(
+            engineer,
+            task_id,
+            status,
+            "ignoring completion: task is already terminal; clearing stale assignment"
+        );
+        daemon.retry_counts.remove(engineer);
+        daemon.verification_states.remove(engineer);
+        daemon.narration_rejection_counts.remove(&task_id);
+        daemon.clear_active_task(engineer);
+        daemon.set_member_idle(engineer);
+        return Ok(());
+    }
+
     let worktree_dir = daemon.worktree_dir(engineer);
     let trunk_branch = daemon.config.team_config.trunk_branch().to_string();
-    let board_dir = daemon.board_dir();
     let board_dir_str = board_dir.to_string_lossy().to_string();
     let manager_name = daemon.manager_name(engineer);
 
@@ -1094,17 +1127,34 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
                 task_id.to_string(),
                 Some("verification_failed"),
             );
-            crate::team::task_cmd::transition_task_with_attribution(
+            // A failed transition (task already Done, or still Backlog) must not
+            // leave the verification state behind, or the same escalation
+            // would fire on every completion.
+            let blocked = crate::team::task_cmd::transition_task_with_attribution(
                 &board_dir,
                 task_id,
                 "blocked",
                 crate::team::task_cmd::StatusTransitionAttribution::daemon(
                     "daemon.merge.completion.verification",
                 ),
-            )?;
-            let mut blocked_fields = std::collections::HashMap::new();
-            blocked_fields.insert("blocked_on".to_string(), block_reason);
-            crate::team::task_cmd::cmd_update(&board_dir, task_id, blocked_fields)?;
+            );
+            match blocked {
+                Ok(()) => {
+                    let mut blocked_fields = std::collections::HashMap::new();
+                    blocked_fields.insert("blocked_on".to_string(), block_reason);
+                    if let Err(error) =
+                        crate::team::task_cmd::cmd_update(&board_dir, task_id, blocked_fields)
+                    {
+                        warn!(engineer, task_id, error = %error, "failed to record blocked_on");
+                    }
+                }
+                Err(error) => warn!(
+                    engineer,
+                    task_id,
+                    error = %error,
+                    "could not block task after verification escalation; clearing assignment anyway"
+                ),
+            }
             daemon.retry_counts.remove(engineer);
             daemon.verification_states.remove(engineer);
             daemon.clear_active_task(engineer);
@@ -2932,6 +2982,73 @@ mod tests {
                 .body
                 .contains("complete 2 times with no commits ahead of main")
         }));
+    }
+
+    fn set_task_status(repo: &Path, file: &str, from: &str, to: &str) {
+        let path = repo.join(".batty/team_config/board/tasks").join(file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replacen(&format!("status: {from}"), &format!("status: {to}"), 1),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn completion_on_done_task_is_noop_and_clears_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-merge-test");
+        write_task_file(&repo, 42, "already-done");
+        set_task_status(&repo, "042-already-done.md", "in-progress", "done");
+        let team_config_dir = repo.join(".batty").join("team_config");
+        let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+        setup_engineer_worktree(&repo, &worktree_dir, "eng-1", &team_config_dir).unwrap();
+
+        let mut daemon = setup_completion_daemon(&repo, "eng-1");
+        daemon.set_active_task_for_test("eng-1", 42);
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+
+        assert!(daemon.active_task_id("eng-1").is_none());
+        let task =
+            crate::task::Task::from_file(&team_config_dir.join("board/tasks/042-already-done.md"))
+                .unwrap();
+        assert_eq!(task.status, "done");
+    }
+
+    #[test]
+    fn verification_escalation_on_backlog_task_clears_state_and_does_not_repeat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-merge-test");
+        write_task_file(&repo, 42, "backlog-loop");
+        set_task_status(&repo, "042-backlog-loop.md", "in-progress", "backlog");
+        let team_config_dir = repo.join(".batty").join("team_config");
+        let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+        setup_engineer_worktree(&repo, &worktree_dir, "eng-1", &team_config_dir).unwrap();
+        std::fs::remove_file(worktree_dir.join("Cargo.toml")).unwrap();
+
+        let mut daemon = setup_completion_daemon(&repo, "eng-1");
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .verification
+            .max_iterations = 1;
+        for _ in 0..4 {
+            daemon.set_active_task_for_test("eng-1", 42);
+            daemon.set_member_state_for_test("eng-1", MemberState::Working);
+            handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        }
+
+        assert!(!daemon.verification_states.contains_key("eng-1"));
+        let events = read_events(&team_config_dir.join("events.jsonl")).unwrap();
+        let escalations = events
+            .iter()
+            .filter(|e| e.event == "verification_max_iterations_reached")
+            .count();
+        assert!(escalations >= 1);
+        // Each re-assigned attempt starts a fresh state, but a failed block
+        // transition must not make the state sticky.
+        assert!(escalations <= 4);
     }
 
     #[test]
