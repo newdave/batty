@@ -640,16 +640,11 @@ impl TeamDaemon {
                 context_usage_pct,
                 ..
             } => {
+                // Stats arrive from every shim every few seconds: like Pong, keep them out of the
+                // event log. Context pressure still reports through its own warnings.
                 if let Some(handle) = self.shim_handles.get_mut(member_name) {
                     handle.record_output_bytes(output_bytes);
                 }
-                let _ = append_shim_event_log(
-                    &self.config.project_root,
-                    member_name,
-                    &format!(
-                        "<- stats output_bytes={output_bytes} uptime_secs={uptime_secs} context_usage_pct={context_usage_pct:?}"
-                    ),
-                );
                 self.handle_context_pressure_stats(
                     member_name,
                     output_bytes,
