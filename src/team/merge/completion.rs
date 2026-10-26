@@ -29,8 +29,8 @@ use crate::team::test_results::{TestResults, TestRunOutput};
 use crate::team::verification::{EvidenceKind, VerificationPhase, VerificationState};
 
 use super::git_ops::{
-    code_files_changed_from_trunk, commits_ahead_of_trunk, diff_stat_from_trunk,
-    files_changed_from_trunk, now_unix, run_git_with_context,
+    abort_failed_merge, code_files_changed_from_trunk, commits_ahead_of_trunk,
+    diff_stat_from_trunk, files_changed_from_trunk, now_unix, run_git_with_context,
 };
 use super::lock::{
     MergeLock, MergeMode, MergeOutcome, MergeSuccess, infer_merge_mode_from_failure,
@@ -1815,6 +1815,7 @@ fn merge_engineer_branch_in_repo(
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        abort_failed_merge(repo_root);
         return Ok(MergeOutcome::MergeFailure(format!(
             "merge failed in {}: {stderr}",
             repo_root.display()

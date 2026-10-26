@@ -29,6 +29,31 @@ pub(crate) fn run_git_with_context(
         })
 }
 
+/// Abort an in-progress merge left behind by a failed `git merge`, so the
+/// checkout does not stay in a MERGING state with conflict markers.
+pub(crate) fn abort_failed_merge(repo_dir: &Path) {
+    let merging = run_git_with_context(
+        repo_dir,
+        &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        "check for in-progress merge",
+    )
+    .is_ok_and(|output| output.status.success());
+    if !merging {
+        return;
+    }
+    match run_git_with_context(repo_dir, &["merge", "--abort"], "abort failed merge") {
+        Ok(output) if output.status.success() => {
+            info!(repo = %repo_dir.display(), "aborted failed merge");
+        }
+        Ok(output) => warn!(
+            repo = %repo_dir.display(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "failed to abort merge"
+        ),
+        Err(error) => warn!(repo = %repo_dir.display(), error = %error, "failed to abort merge"),
+    }
+}
+
 pub(crate) fn describe_git_failure(
     repo_dir: &Path,
     args: &[&str],
@@ -290,6 +315,49 @@ pub(crate) fn force_clean_worktree(worktree_dir: &Path, engineer_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abort_failed_merge_clears_conflicted_merge_state() {
+        use crate::team::test_support::{git, git_ok, init_git_repo};
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "abort-merge-test");
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        git_ok(&repo, &["add", "file.txt"]);
+        git_ok(&repo, &["commit", "-m", "base"]);
+        git_ok(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("file.txt"), "feature\n").unwrap();
+        git_ok(&repo, &["commit", "-am", "feature"]);
+        git_ok(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("file.txt"), "main\n").unwrap();
+        git_ok(&repo, &["commit", "-am", "main"]);
+
+        assert!(
+            !git(&repo, &["merge", "feature", "--no-edit"])
+                .status
+                .success()
+        );
+        abort_failed_merge(&repo);
+
+        assert!(
+            !git(&repo, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+                .status
+                .success()
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+            "main\n"
+        );
+        assert!(git(&repo, &["status", "--porcelain"]).stdout.is_empty());
+    }
+
+    #[test]
+    fn abort_failed_merge_is_noop_without_merge_in_progress() {
+        use crate::team::test_support::{git, init_git_repo};
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "abort-merge-noop");
+        abort_failed_merge(&repo);
+        assert!(git(&repo, &["status", "--porcelain"]).status.success());
+    }
 
     #[test]
     fn commits_ahead_of_main_error_includes_command_and_intent() {

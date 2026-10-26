@@ -18,7 +18,9 @@ use crate::team::task_loop::{
 };
 use crate::team::verification::{self, VerifyStatus};
 
-use super::git_ops::{describe_git_failure, force_clean_worktree, run_git_with_context};
+use super::git_ops::{
+    abort_failed_merge, describe_git_failure, force_clean_worktree, run_git_with_context,
+};
 use super::lock::{MergeMode, MergeOutcome, MergeSuccess};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +310,7 @@ fn merge_branch_into_root_trunk(
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        abort_failed_merge(project_root);
         bail!(
             "{}",
             describe_git_failure(
@@ -1207,13 +1210,15 @@ overall_parity: 100%
         let result = merge_engineer_branch(&repo, "eng-2").unwrap();
 
         assert!(matches!(result, MergeOutcome::Success(_)), "{result:?}");
-        let merged = String::from_utf8(
-            git(&repo, &["show", "main:.cargo/config.toml"]).stdout,
-        )
-        .unwrap();
+        let merged =
+            String::from_utf8(git(&repo, &["show", "main:.cargo/config.toml"]).stdout).unwrap();
         assert_eq!(merged, "[build]\njobs = 4\n");
         if !engineer_only_touches_config {
-            assert!(git(&repo, &["cat-file", "-e", "main:feature.txt"]).status.success());
+            assert!(
+                git(&repo, &["cat-file", "-e", "main:feature.txt"])
+                    .status
+                    .success()
+            );
         }
     }
 
