@@ -1234,6 +1234,163 @@ pub fn reset_worktree_to_base_if_clean_from_trunk(
     Ok(WorktreeResetReason::CleanReset)
 }
 
+/// Abort any in-progress merge, rebase or cherry-pick. Each abort is a no-op
+/// when that operation is not in progress.
+pub(crate) fn abort_in_progress_git_operations(worktree_path: &Path) {
+    for op in ["merge", "rebase", "cherry-pick"] {
+        let _ = run_git(worktree_path, [op, "--abort"]);
+    }
+}
+
+/// Converging recovery for background health checks (merge-conflict and
+/// stale-branch recovery). Unlike [`reset_worktree_to_base_if_clean_from_trunk`],
+/// which refuses dirty lanes forever, this first aborts any in-progress
+/// merge/rebase/cherry-pick (whose conflicted paths are what make the lane
+/// "dirty"), then auto-saves remaining dirty work as a WIP commit on the
+/// current branch and archives that branch's commits before resetting to
+/// `base_branch`. When the dirty work cannot be preserved the reset is
+/// skipped (`PreserveFailedResetSkipped`) so nothing is lost.
+pub(crate) fn recover_worktree_to_base_preserving(
+    worktree_path: &Path,
+    base_branch: &str,
+    subsystem: &str,
+    trunk_branch: &str,
+) -> Result<WorktreeResetReason> {
+    abort_in_progress_git_operations(worktree_path);
+    let current_branch = git_current_branch(worktree_path).ok();
+    let commit_message = format!(
+        "wip: auto-save before {subsystem} [{}]",
+        current_branch.as_deref().unwrap_or("detached")
+    );
+    let reason = prepare_worktree_for_reset(
+        worktree_path,
+        &commit_message,
+        Duration::from_secs(5),
+        PreserveFailureMode::SkipReset,
+        subsystem,
+    )?;
+    if !reason.reset_performed() {
+        return Ok(reason);
+    }
+    match current_branch.as_deref() {
+        Some(branch) if branch != base_branch => {
+            // The current branch ref survives `checkout -B base`, but archive
+            // anyway so a later cleanup of that branch cannot drop the work.
+            archive_branch_if_commits_ahead(worktree_path, branch, trunk_branch, subsystem)?;
+        }
+        Some(_) => {}
+        None => {
+            if rev_list_count(worktree_path, &format!("{trunk_branch}..HEAD")).unwrap_or(0) > 0 {
+                archive_preserved_base_branch_head(worktree_path, "detached")?;
+            }
+        }
+    }
+    archive_branch_if_commits_ahead_across_repos(
+        worktree_path,
+        base_branch,
+        trunk_branch,
+        subsystem,
+    );
+    checkout_base_branch_across_repos(worktree_path, base_branch, trunk_branch, subsystem)?;
+    Ok(reason)
+}
+
+/// Self-heal a member worktree that is checked out on a branch other than
+/// `expected_branch` (another member's branch, a stale task branch, or a
+/// detached HEAD) before dispatching `expected_branch`.
+///
+/// Dirty work is auto-saved on the stray branch and the stray branch's
+/// commits ahead of trunk are archived to `preserved/...`. When the stray
+/// branch carries the same task id (e.g. `other-member/28` → `me/28`) and
+/// `expected_branch` does not exist yet, the expected branch is created from
+/// the stray HEAD so the work carries over. Returns the archive branch name
+/// when one was created. Fails (without touching branches) if dirty work
+/// cannot be preserved.
+pub(crate) fn heal_stray_task_branch(
+    worktree_path: &Path,
+    expected_branch: &str,
+    base_branch: &str,
+    trunk_branch: &str,
+) -> Result<Option<String>> {
+    let subsystem = "dispatch/stray-branch-heal";
+    let current_branch = git_current_branch(worktree_path).ok();
+    if current_branch
+        .as_deref()
+        .is_some_and(|branch| branch == expected_branch || branch == base_branch)
+    {
+        return Ok(None);
+    }
+    abort_in_progress_git_operations(worktree_path);
+    let label = current_branch.as_deref().unwrap_or("detached");
+    let reason = prepare_worktree_for_reset(
+        worktree_path,
+        &format!("wip: auto-save before switching to {expected_branch} [{label}]"),
+        Duration::from_secs(5),
+        PreserveFailureMode::SkipReset,
+        subsystem,
+    )?;
+    if !reason.reset_performed() {
+        bail!(
+            "worktree {} is on '{}' with dirty changes that could not be preserved; refusing to switch to '{}'",
+            worktree_path.display(),
+            label,
+            expected_branch
+        );
+    }
+
+    let archive = match current_branch.as_deref() {
+        Some(branch) => {
+            archive_branch_if_commits_ahead(worktree_path, branch, trunk_branch, subsystem)?
+        }
+        None if rev_list_count(worktree_path, &format!("{trunk_branch}..HEAD")).unwrap_or(0)
+            > 0 =>
+        {
+            Some(archive_preserved_base_branch_head(
+                worktree_path,
+                &format!("detached-{expected_branch}"),
+            )?)
+        }
+        None => None,
+    };
+
+    let task_suffix = |branch: &str| {
+        branch
+            .rsplit_once('/')
+            .map(|(_, suffix)| suffix.to_string())
+    };
+    let same_task = current_branch
+        .as_deref()
+        .and_then(task_suffix)
+        .is_some_and(|suffix| Some(suffix) == task_suffix(expected_branch));
+    if same_task && !ref_exists(worktree_path, &format!("refs/heads/{expected_branch}"))? {
+        crate::team::task_loop::log_worktree_mutation_audit(
+            worktree_path,
+            subsystem,
+            "git checkout -b",
+            &[],
+        );
+        let checkout = run_git(worktree_path, ["checkout", "-b", expected_branch])?;
+        if !checkout.status.success() {
+            bail!(
+                "failed to create '{}' from stray branch '{}' in {}: {}",
+                expected_branch,
+                label,
+                worktree_path.display(),
+                String::from_utf8_lossy(&checkout.stderr).trim()
+            );
+        }
+    }
+    info!(
+        worktree = %worktree_path.display(),
+        stray_branch = label,
+        expected_branch,
+        archive = archive.as_deref().unwrap_or("-"),
+        carried_over = same_task,
+        "healed worktree checked out on stray branch"
+    );
+    Ok(archive)
+}
+
 fn archive_preserved_base_branch_head(worktree_path: &Path, base_branch: &str) -> Result<String> {
     let slug = base_branch.replace('/', "-");
     let stamp = SystemTime::now()
@@ -2811,5 +2968,144 @@ mod tests {
                 repo.display()
             );
         }
+    }
+
+    fn worktree_on_branch_with_commit(repo: &Path, name: &str, branch: &str) -> PathBuf {
+        let wt_path = repo.join(name);
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                wt_path.to_str().unwrap(),
+                "main",
+            ],
+        );
+        fs::write(wt_path.join("work.txt"), format!("{branch} work\n")).unwrap();
+        git(&wt_path, &["add", "work.txt"]);
+        git(&wt_path, &["commit", "-q", "-m", "stray work"]);
+        wt_path
+    }
+
+    fn list_branches(repo: &Path, pattern: &str) -> Vec<String> {
+        let out = run_git(
+            repo,
+            ["branch", "--list", "--format=%(refname:short)", pattern],
+        )
+        .unwrap()
+        .stdout;
+        String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn git_succeeds(repo: &Path, args: &[&str]) -> bool {
+        run_git(repo, args).unwrap().status.success()
+    }
+
+    #[test]
+    fn heal_stray_task_branch_carries_same_task_work_to_expected_branch() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        let wt_path = worktree_on_branch_with_commit(tmp.path(), "wt-heal", "eng-a/28");
+        fs::write(wt_path.join("dirty.txt"), "uncommitted\n").unwrap();
+
+        let archive =
+            heal_stray_task_branch(&wt_path, "eng-b/28", "eng-main/eng-b", "main").unwrap();
+
+        assert_eq!(git_current_branch(&wt_path).unwrap(), "eng-b/28");
+        assert!(archive.is_some_and(|name| name.starts_with("preserved/eng-a-28-")));
+        // Committed and dirty work from the stray branch carried over.
+        assert!(git_succeeds(&wt_path, &["show", "HEAD:work.txt"]));
+        assert!(git_succeeds(&wt_path, &["show", "HEAD:dirty.txt"]));
+        assert!(!has_uncommitted_changes(&wt_path).unwrap());
+    }
+
+    #[test]
+    fn heal_stray_task_branch_archives_foreign_branch_before_dispatch_reset() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        let wt_path = worktree_on_branch_with_commit(tmp.path(), "wt-foreign", "doc-1/3");
+
+        let archive = heal_stray_task_branch(&wt_path, "eng-b/5", "eng-main/eng-b", "main")
+            .unwrap()
+            .expect("stray commits must be archived");
+        assert!(git_succeeds(
+            tmp.path(),
+            &["show", &format!("{archive}:work.txt")]
+        ));
+
+        // The normal dispatch path can now switch to the member's own branch.
+        let reset = ensure_worktree_branch_for_dispatch(&wt_path, "eng-b/5").unwrap();
+        assert!(reset.changed);
+        assert_eq!(git_current_branch(&wt_path).unwrap(), "eng-b/5");
+    }
+
+    #[test]
+    fn heal_stray_task_branch_is_noop_on_expected_branch() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        let wt_path = worktree_on_branch_with_commit(tmp.path(), "wt-noop", "eng-b/9");
+        assert_eq!(
+            heal_stray_task_branch(&wt_path, "eng-b/9", "eng-main/eng-b", "main").unwrap(),
+            None
+        );
+        assert!(list_branches(tmp.path(), "preserved/*").is_empty());
+    }
+
+    #[test]
+    fn recover_worktree_to_base_preserving_aborts_conflicted_merge_and_resets() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        let wt_path = tmp.path().join("wt-conflict");
+        git(
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "eng-1/7",
+                wt_path.to_str().unwrap(),
+                "main",
+            ],
+        );
+        fs::write(wt_path.join("README.md"), "task change\n").unwrap();
+        git(&wt_path, &["commit", "-q", "-am", "task change"]);
+        fs::write(tmp.path().join("README.md"), "main change\n").unwrap();
+        git(tmp.path(), &["commit", "-q", "-am", "main change"]);
+        assert!(
+            !git_succeeds(&wt_path, &["merge", "main"]),
+            "setup requires a conflicted merge"
+        );
+        fs::write(wt_path.join("notes.txt"), "agent notes\n").unwrap();
+        // The clean-only reset refuses this lane every time, which is what
+        // made merge-conflict recovery loop forever.
+        assert_eq!(
+            reset_worktree_to_base_if_clean(&wt_path, "eng-main/eng-1", "test").unwrap(),
+            WorktreeResetReason::PreserveFailedResetSkipped
+        );
+
+        let reason = recover_worktree_to_base_preserving(
+            &wt_path,
+            "eng-main/eng-1",
+            "merge-conflict recovery",
+            "main",
+        )
+        .unwrap();
+
+        assert_eq!(reason, WorktreeResetReason::PreservedBeforeReset);
+        assert_eq!(git_current_branch(&wt_path).unwrap(), "eng-main/eng-1");
+        assert!(!crate::team::task_loop::git_has_unresolved_conflicts(&wt_path).unwrap());
+        assert!(!has_uncommitted_changes(&wt_path).unwrap());
+        // Dirty notes were auto-saved on the task branch and archived.
+        assert!(git_succeeds(tmp.path(), &["show", "eng-1/7:notes.txt"]));
+        assert!(!list_branches(tmp.path(), "preserved/eng-1-7-*").is_empty());
     }
 }

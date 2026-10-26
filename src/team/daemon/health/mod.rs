@@ -115,7 +115,12 @@ impl TeamDaemon {
             "Continuing Task #{}: {}\nPrevious session exhausted context; resume from the current worktree state and continue.\n\n{}",
             task.id, task.title, task.description
         );
-        if let Some(branch) = task.branch.as_deref() {
+        // Never point a member at another member's branch (stale after reassignment).
+        if let Some(branch) = task.branch.as_deref().filter(|branch| {
+            task.claimed_by
+                .as_deref()
+                .is_none_or(|owner| branch.starts_with(&format!("{owner}/")))
+        }) {
             message.push_str(&format!("\n\nBranch: {branch}"));
         }
         if let Some(worktree_path) = task.worktree_path.as_deref() {
@@ -530,6 +535,13 @@ mod tests {
         let msg = TeamDaemon::restart_assignment_message(&task);
         assert!(msg.contains("Branch: eng-2/99"));
         assert!(msg.contains("Worktree: /tmp/worktrees/eng-2"));
+
+        // A branch left behind by the previous assignee must not be handed to
+        // the new owner (it would check out another member's branch).
+        let mut reassigned = task.clone();
+        reassigned.claimed_by = Some("eng-3".into());
+        let msg = TeamDaemon::restart_assignment_message(&reassigned);
+        assert!(!msg.contains("Branch:"), "{msg}");
     }
 
     // ── cooldown key tests ──

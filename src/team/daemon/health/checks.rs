@@ -35,6 +35,22 @@ fn conflict_paths(repo_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// After a background worktree recovery is blocked (e.g. dirty work could not
+/// be preserved), wait this long before retrying instead of every poll.
+const WORKTREE_RECOVERY_BACKOFF: Duration = Duration::from_secs(1800);
+
+fn worktree_recovery_backoff_key(member: &str, repo_label: &str) -> String {
+    format!("worktree-recovery-blocked::{member}::{repo_label}")
+}
+
+impl TeamDaemon {
+    fn worktree_recovery_backed_off(&self, key: &str) -> bool {
+        self.intervention_cooldowns
+            .get(key)
+            .is_some_and(|blocked_at| blocked_at.elapsed() < WORKTREE_RECOVERY_BACKOFF)
+    }
+}
+
 fn git_ref_exists(repo_dir: &Path, rev: &str) -> bool {
     std::process::Command::new("git")
         .args(["rev-parse", "--verify", rev])
@@ -388,18 +404,33 @@ impl TeamDaemon {
 
                 // Check for merge conflicts first — these block all git operations.
                 if git_has_unresolved_conflicts(repo_path).unwrap_or(false) {
+                    let backoff_key = worktree_recovery_backoff_key(name, repo_name);
+                    if self.worktree_recovery_backed_off(&backoff_key) {
+                        continue;
+                    }
                     warn!(
                         member = %name,
                         repo = repo_name,
                         worktree = %repo_path.display(),
                         "worktree has unresolved merge conflicts; auto-recovering via merge --abort and reset"
                     );
-                    match crate::worktree::reset_worktree_to_base_if_clean_from_trunk(
+                    // Abort first, then auto-save any remaining dirty work before
+                    // resetting. The clean-only reset refused conflicted lanes
+                    // forever (conflicted paths count as dirty) and looped.
+                    let outcome = crate::worktree::recover_worktree_to_base_preserving(
                         repo_path,
                         &base,
                         "merge-conflict recovery",
                         &trunk_branch,
-                    ) {
+                    );
+                    if !outcome
+                        .as_ref()
+                        .is_ok_and(|reason| reason.reset_performed())
+                    {
+                        self.intervention_cooldowns
+                            .insert(backoff_key, Instant::now());
+                    }
+                    match outcome {
                         Err(error) => {
                             warn!(
                                 member = %name,
@@ -515,18 +546,46 @@ impl TeamDaemon {
                     &trunk_branch,
                 ) {
                     Ok(true) => {
+                        let backoff_key = worktree_recovery_backoff_key(name, repo_name);
+                        if self.worktree_recovery_backed_off(&backoff_key) {
+                            continue;
+                        }
+                        let lane_dirty =
+                            crate::team::task_loop::worktree_has_user_changes(repo_path)
+                                .unwrap_or(true);
+                        if lane_dirty && self.states.get(name) == Some(&MemberState::Working) {
+                            // Don't switch branches under an agent that is editing.
+                            debug!(
+                                member = %name,
+                                repo = repo_name,
+                                branch = %current_branch,
+                                "stale branch has dirty changes while member is working; deferring reset"
+                            );
+                            continue;
+                        }
                         info!(
                             member = %name,
                             repo = repo_name,
                             branch = %current_branch,
                             "stale branch detected; resetting worktree"
                         );
-                        match crate::worktree::reset_worktree_to_base_if_clean_from_trunk(
+                        // Idle lane with no active task: auto-save dirty work on the
+                        // stale branch (archived) and reset, instead of refusing
+                        // every poll.
+                        let outcome = crate::worktree::recover_worktree_to_base_preserving(
                             repo_path,
                             &base,
                             "stale-branch recovery",
                             &trunk_branch,
-                        ) {
+                        );
+                        if !outcome
+                            .as_ref()
+                            .is_ok_and(|reason| reason.reset_performed())
+                        {
+                            self.intervention_cooldowns
+                                .insert(backoff_key, Instant::now());
+                        }
+                        match outcome {
                             Ok(reason) if reason.reset_performed() => {
                                 self.record_orchestrator_action(format!(
                                     "runtime: auto-reset {}'s {} worktree — branch {} already on {} ({})",
@@ -907,7 +966,10 @@ fn prune_legacy_worktree_target_dirs(project_root: &Path) -> Result<Vec<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::super::super::*;
-    use super::{claude_oauth_healthy, parse_claude_oauth_expiry_ms};
+    use super::{
+        WORKTREE_RECOVERY_BACKOFF, claude_oauth_healthy, parse_claude_oauth_expiry_ms,
+        worktree_recovery_backoff_key,
+    };
     use crate::team::config::{RoleType, WorkflowPolicy};
     use crate::team::hierarchy::MemberInstance;
     use crate::team::standup::MemberState;
@@ -2446,6 +2508,126 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].body.contains("failed cherry-pick"));
         assert!(messages[0].body.contains("conflict.txt"));
+    }
+
+    fn staleness_engineer(name: &str) -> MemberInstance {
+        MemberInstance {
+            name: name.to_string(),
+            role_name: "eng".to_string(),
+            role_type: RoleType::Engineer,
+            agent: Some("claude".to_string()),
+            prompt: None,
+            reports_to: None,
+            use_worktrees: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn check_worktree_staleness_converges_on_conflicted_engineer_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "staleness-eng-conflict");
+        let eng_name = "eng-conflict";
+        let base = format!("eng-main/{eng_name}");
+        let task_branch = format!("{eng_name}/7");
+        let wt_dir = repo.join(".batty").join("worktrees").join(eng_name);
+        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+        std::fs::write(repo.join("conflict.txt"), "base\n").unwrap();
+        git_ok(&repo, &["add", "conflict.txt"]);
+        git_ok(&repo, &["commit", "-m", "add conflict file"]);
+        git_ok(&repo, &["branch", &base]);
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &task_branch,
+                wt_dir.to_str().unwrap(),
+                &base,
+            ],
+        );
+        std::fs::write(wt_dir.join("conflict.txt"), "task\n").unwrap();
+        git_ok(&wt_dir, &["commit", "-am", "task change"]);
+        std::fs::write(repo.join("conflict.txt"), "main\n").unwrap();
+        git_ok(&repo, &["commit", "-am", "main change"]);
+        let merge = Command::new("git")
+            .current_dir(&wt_dir)
+            .args(["merge", "main"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "setup requires a conflicted merge");
+        std::fs::write(wt_dir.join("notes.txt"), "agent notes\n").unwrap();
+
+        let mut daemon = make_test_daemon(&repo, vec![staleness_engineer(eng_name)]);
+        daemon.is_git_repo = true;
+        daemon.check_worktree_staleness().unwrap();
+
+        assert!(!crate::team::task_loop::git_has_unresolved_conflicts(&wt_dir).unwrap());
+        assert_eq!(git_stdout(&wt_dir, &["branch", "--show-current"]), base);
+        assert_eq!(
+            git_stdout(&repo, &["show", &format!("{task_branch}:notes.txt")]),
+            "agent notes",
+            "dirty work must be preserved on the task branch"
+        );
+
+        // A second poll has nothing left to recover (no repeat loop).
+        daemon.check_worktree_staleness().unwrap();
+        assert_eq!(git_stdout(&wt_dir, &["branch", "--show-current"]), base);
+    }
+
+    #[test]
+    fn check_worktree_staleness_backs_off_after_blocked_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "staleness-backoff");
+        let eng_name = "eng-backoff";
+        let mut daemon = make_test_daemon(&repo, vec![staleness_engineer(eng_name)]);
+        let key = worktree_recovery_backoff_key(eng_name, "root");
+        assert!(!daemon.worktree_recovery_backed_off(&key));
+        daemon
+            .intervention_cooldowns
+            .insert(key.clone(), Instant::now());
+        assert!(daemon.worktree_recovery_backed_off(&key));
+        daemon.intervention_cooldowns.insert(
+            key.clone(),
+            Instant::now() - WORKTREE_RECOVERY_BACKOFF - Duration::from_secs(1),
+        );
+        assert!(!daemon.worktree_recovery_backed_off(&key));
+    }
+
+    #[test]
+    fn check_worktree_staleness_preserves_dirty_idle_stale_branch_and_resets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "staleness-dirty-stale");
+        let eng_name = "eng-dirty-stale";
+        let base = format!("eng-main/{eng_name}");
+        let task_branch = format!("{eng_name}/12");
+        let wt_dir = repo.join(".batty").join("worktrees").join(eng_name);
+        std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+        git_ok(&repo, &["branch", &base]);
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &task_branch,
+                wt_dir.to_str().unwrap(),
+                &base,
+            ],
+        );
+        // Branch is fully merged (same tip as main) but the lane is dirty.
+        std::fs::write(wt_dir.join("leftover.txt"), "leftover\n").unwrap();
+
+        let mut daemon = make_test_daemon(&repo, vec![staleness_engineer(eng_name)]);
+        daemon.is_git_repo = true;
+        daemon.check_worktree_staleness().unwrap();
+
+        assert_eq!(git_stdout(&wt_dir, &["branch", "--show-current"]), base);
+        assert_eq!(
+            git_stdout(&repo, &["show", &format!("{task_branch}:leftover.txt")]),
+            "leftover"
+        );
     }
 
     #[test]

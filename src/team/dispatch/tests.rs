@@ -1024,6 +1024,106 @@ fn worktree_gate_resets_base_branch_that_remains_ahead_after_rebase() {
 }
 
 #[test]
+fn prepare_assignment_launch_self_heals_worktree_on_previous_assignees_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(&tmp, "dispatch-stray-heal");
+    let worktree_dir = repo.join(".batty").join("worktrees").join("eng-2");
+    let team_config_dir = repo.join(".batty").join("team_config");
+    let base_branch = engineer_base_branch_name("eng-2");
+    setup_engineer_worktree(&repo, &worktree_dir, &base_branch, &team_config_dir).unwrap();
+    // Task #28 moved from eng-1 to eng-2; eng-2's lane ended up on eng-1's
+    // branch with retry work for the same task.
+    git_ok(&worktree_dir, &["checkout", "-b", "eng-1/28"]);
+    std::fs::write(worktree_dir.join("retry.txt"), "retry work\n").unwrap();
+    git_ok(&worktree_dir, &["add", "retry.txt"]);
+    git_ok(&worktree_dir, &["commit", "-m", "retry work"]);
+    crate::team::test_support::write_owned_task_file_with_context(
+        &repo,
+        28,
+        "reassigned-task",
+        "in-progress",
+        "eng-2",
+        "eng-1/28",
+        ".batty/worktrees/eng-1",
+    );
+
+    let mut daemon = TestDaemonBuilder::new(repo.as_path())
+        .members(vec![
+            manager_member("manager", None),
+            engineer_member("eng-2", Some("manager"), true),
+        ])
+        .build();
+
+    let launch = daemon
+        .prepare_assignment_launch("eng-2", "Task #28: retry", Some(28))
+        .unwrap();
+
+    assert_eq!(launch.branch.as_deref(), Some("eng-2/28"));
+    assert_eq!(current_worktree_branch(&worktree_dir).unwrap(), "eng-2/28");
+    assert_eq!(
+        std::fs::read_to_string(worktree_dir.join("retry.txt")).unwrap(),
+        "retry work\n",
+        "same-task work on the stray branch should carry over"
+    );
+}
+
+#[test]
+fn worktree_gate_archives_stray_branch_commits_before_reset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(&tmp, "dispatch-queue-stray-branch");
+    write_open_task_file(&repo, 101, "queued-task", "todo");
+    let team_config_dir = repo.join(".batty").join("team_config");
+    let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+    let base_branch = engineer_base_branch_name("eng-1");
+    setup_engineer_worktree(&repo, &worktree_dir, &base_branch, &team_config_dir).unwrap();
+    // Worktree ended up on another member's branch with unmerged work.
+    git_ok(&worktree_dir, &["checkout", "-b", "eng-9/55"]);
+    std::fs::write(worktree_dir.join("STRAY.txt"), "stray\n").unwrap();
+    git_ok(&worktree_dir, &["add", "STRAY.txt"]);
+    git_ok(&worktree_dir, &["commit", "-m", "stray work"]);
+    let stray_head = git_stdout(&worktree_dir, &["rev-parse", "HEAD"]);
+
+    let mut daemon = TestDaemonBuilder::new(&repo)
+        .members(vec![
+            manager_member("manager", None),
+            engineer_member("eng-1", Some("manager"), true),
+        ])
+        .board(BoardConfig {
+            auto_dispatch: true,
+            dispatch_stabilization_delay_secs: 0,
+            ..BoardConfig::default()
+        })
+        .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
+        .build();
+    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.idle_started_at.insert(
+        "eng-1".to_string(),
+        Instant::now() - Duration::from_secs(60),
+    );
+
+    daemon.maybe_auto_dispatch().unwrap();
+
+    assert_eq!(
+        crate::worktree::git_current_branch(&worktree_dir).unwrap(),
+        base_branch
+    );
+    let archives = git_stdout(
+        &repo,
+        &[
+            "branch",
+            "--list",
+            "--format=%(objectname)",
+            "preserved/eng-9-55-*",
+        ],
+    );
+    assert_eq!(
+        archives.trim(),
+        stray_head,
+        "stray branch work must be archived before the reset"
+    );
+}
+
+#[test]
 fn queue_escalates_after_repeated_validation_failures() {
     let tmp = tempfile::tempdir().unwrap();
     write_open_task_file(tmp.path(), 101, "queued-task", "todo");

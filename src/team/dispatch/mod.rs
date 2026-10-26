@@ -228,11 +228,47 @@ impl TeamDaemon {
         let task_branch = use_worktrees.then(|| engineer_task_branch_name(engineer, task, task_id));
         if use_worktrees && let Some(mismatch) = self.claimed_task_branch_mismatch(engineer)? {
             let base_branch = engineer_base_branch_name(engineer);
-            let launching_claimed_task_from_base = task_branch
+            let launching_claimed_task = task_branch
                 .as_deref()
-                .is_some_and(|branch| branch == mismatch.expected_branch)
-                && mismatch.current_branch == base_branch;
-            if !launching_claimed_task_from_base {
+                .is_some_and(|branch| branch == mismatch.expected_branch);
+            let launching_claimed_task_from_base =
+                launching_claimed_task && mismatch.current_branch == base_branch;
+            // Self-heal: the worktree is on a stray branch (another member's
+            // branch or a stale task) while we are launching the claimed task
+            // itself. Preserve the stray work, then let the normal dispatch
+            // path switch to `<engineer>/<task>`.
+            let healed = !launching_claimed_task_from_base
+                && launching_claimed_task
+                && !self.is_multi_repo
+                && match crate::worktree::heal_stray_task_branch(
+                    &self.worktree_dir(engineer),
+                    &mismatch.expected_branch,
+                    &base_branch,
+                    self.config.team_config.trunk_branch(),
+                ) {
+                    Ok(archive) => {
+                        self.emit_event(TeamEvent::worktree_refreshed(
+                            engineer,
+                            &format!(
+                                "healed stray branch '{}' before dispatching task #{} on '{}' (archive: {})",
+                                mismatch.current_branch,
+                                mismatch.task_id,
+                                mismatch.expected_branch,
+                                archive.as_deref().unwrap_or("none")
+                            ),
+                        ));
+                        true
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            engineer,
+                            error = %error,
+                            "failed to self-heal stray worktree branch"
+                        );
+                        false
+                    }
+                };
+            if !launching_claimed_task_from_base && !healed {
                 self.alert_claimed_task_branch_mismatch(engineer, &mismatch, None)?;
                 bail!(
                     "engineer '{}' worktree is on '{}' but claimed task #{} expects '{}'; correct the branch manually before dispatch",

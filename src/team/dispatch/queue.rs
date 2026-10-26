@@ -274,6 +274,17 @@ struct ChangedPathsFrontmatter {
     changed_paths: Vec<String>,
 }
 
+/// A clean worktree already on `<engineer>/<task_id>` is fit to dispatch that
+/// same task: the launch path keeps the branch (and its commits) as-is.
+/// Treating it as "not ready" used to force a reset to the base branch, after
+/// which dispatch recreated the task branch from trunk and the work was
+/// archived away from the agent.
+fn worktree_on_clean_own_task_branch(worktree_dir: &Path, engineer: &str, task_id: u32) -> bool {
+    crate::worktree::git_current_branch(worktree_dir)
+        .is_ok_and(|branch| branch == format!("{engineer}/{task_id}"))
+        && crate::team::task_loop::worktree_has_user_changes(worktree_dir).is_ok_and(|dirty| !dirty)
+}
+
 fn board_tasks_dir(project_root: &Path) -> std::path::PathBuf {
     project_root
         .join(".batty")
@@ -1379,6 +1390,10 @@ impl TeamDaemon {
                         &worktree_dir,
                         &entry.engineer,
                         self.config.team_config.trunk_branch(),
+                    ) && !worktree_on_clean_own_task_branch(
+                        &worktree_dir,
+                        &entry.engineer,
+                        entry.task_id,
                     ) {
                         entry.validation_failures += 1;
                         entry.last_failure = Some(error.to_string());
@@ -1394,6 +1409,12 @@ impl TeamDaemon {
                         let base_branch = format!("eng-main/{}", entry.engineer);
 
                         // SAFETY: if worktree has commits ahead of trunk, try rebase not reset.
+                        // Only the base branch is rebased: rebasing a task branch (or another
+                        // member's branch) can never make it "ready", which requires the base.
+                        let current_branch =
+                            crate::worktree::git_current_branch(&worktree_dir).ok();
+                        let on_base_branch =
+                            current_branch.as_deref() == Some(base_branch.as_str());
                         let has_work = crate::worktree::commits_ahead(
                             &worktree_dir,
                             self.config.team_config.trunk_branch(),
@@ -1403,7 +1424,7 @@ impl TeamDaemon {
                             || crate::worktree::has_uncommitted_changes(&worktree_dir)
                                 .unwrap_or(false);
 
-                        if has_work {
+                        if has_work && on_base_branch {
                             info!(
                                 engineer = %entry.engineer,
                                 "dispatch queue: worktree has work; trying rebase instead of reset"
@@ -1439,15 +1460,48 @@ impl TeamDaemon {
                                 }
                             }
                             }
-                            // Rebase failed — abort and fall through to reset
+                            // Rebase failed or was insufficient — abort and fall through to a
+                            // reset that archives the base branch's commits first.
                             let _ = std::process::Command::new("git")
                                 .args(["rebase", "--abort"])
                                 .current_dir(&worktree_dir)
                                 .output();
                             warn!(
                                 engineer = %entry.engineer,
-                                "dispatch queue: rebase failed; falling through to reset (work may be lost)"
+                                "dispatch queue: rebase did not make worktree ready; archiving base-branch commits and resetting"
                             );
+                        }
+
+                        // Preserve commits on a non-base branch before switching away from it.
+                        // Dirty lanes are refused by the clean-only reset below.
+                        if let Some(branch) = current_branch.as_deref().filter(|_| !on_base_branch)
+                            && let Err(archive_err) =
+                                crate::worktree::archive_branch_if_commits_ahead(
+                                    &worktree_dir,
+                                    branch,
+                                    self.config.team_config.trunk_branch(),
+                                    "dispatch/reset recovery",
+                                )
+                        {
+                            warn!(
+                                engineer = %entry.engineer,
+                                branch,
+                                error = %archive_err,
+                                "dispatch queue: could not archive branch before reset; skipping reset"
+                            );
+                            entry.last_failure = Some(archive_err.to_string());
+                            if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
+                                self.escalate_dispatch_queue_entry(
+                                    &entry,
+                                    entry
+                                        .last_failure
+                                        .as_deref()
+                                        .unwrap_or("worktree branch archive failed"),
+                                )?;
+                            } else {
+                                retained.push(entry);
+                            }
+                            continue;
                         }
 
                         info!(
@@ -1786,8 +1840,51 @@ mod tests {
 
     use super::{
         OverlapConflict, find_overlapping_tasks, parse_body_owner_role, predicted_files,
-        role_name_seed_tags, split_acyclic_blocking_ids,
+        role_name_seed_tags, split_acyclic_blocking_ids, worktree_on_clean_own_task_branch,
     };
+
+    #[test]
+    fn worktree_on_clean_own_task_branch_accepts_only_clean_matching_task_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "own-task-branch");
+        let team_config_dir = repo.join(".batty").join("team_config");
+        let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+        let base_branch = engineer_base_branch_name("eng-1");
+        setup_engineer_worktree(&repo, &worktree_dir, &base_branch, &team_config_dir).unwrap();
+        assert!(!worktree_on_clean_own_task_branch(
+            &worktree_dir,
+            "eng-1",
+            37
+        ));
+
+        git_ok(&worktree_dir, &["checkout", "-b", "eng-1/37"]);
+        std::fs::write(worktree_dir.join("work.txt"), "work\n").unwrap();
+        git_ok(&worktree_dir, &["add", "work.txt"]);
+        git_ok(&worktree_dir, &["commit", "-m", "task work"]);
+        // Ahead of trunk on its own task branch: still fit to dispatch task 37.
+        assert!(worktree_on_clean_own_task_branch(
+            &worktree_dir,
+            "eng-1",
+            37
+        ));
+        assert!(!worktree_on_clean_own_task_branch(
+            &worktree_dir,
+            "eng-1",
+            38
+        ));
+        assert!(!worktree_on_clean_own_task_branch(
+            &worktree_dir,
+            "eng-2",
+            37
+        ));
+
+        std::fs::write(worktree_dir.join("dirty.txt"), "dirty\n").unwrap();
+        assert!(!worktree_on_clean_own_task_branch(
+            &worktree_dir,
+            "eng-1",
+            37
+        ));
+    }
     use crate::team::config::RoleType;
     use crate::team::hierarchy::MemberInstance;
     use crate::team::standup::MemberState;

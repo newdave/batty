@@ -330,9 +330,17 @@ fn verification_retry_required_task(task: &crate::task::Task) -> bool {
     })
 }
 
-fn authoritative_task_branch(engineer: &str, task: &crate::task::Task) -> String {
+/// Branch the engineer's worktree should be on for `task`. A recorded
+/// `branch` that belongs to another member (left behind when the task was
+/// reassigned or its stale claim reclaimed) is ignored: a member's worktree
+/// must only ever check out its own `<member>/<task>` branch.
+pub(in crate::team) fn authoritative_task_branch(
+    engineer: &str,
+    task: &crate::task::Task,
+) -> String {
     task.branch
         .clone()
+        .filter(|branch| is_managed_task_branch(engineer, branch))
         .unwrap_or_else(|| format!("{engineer}/{}", task.id))
 }
 
@@ -3397,7 +3405,7 @@ pub(super) fn stale_preserve_blocker(task: &crate::task::Task) -> bool {
 mod tests {
     use super::super::*;
     use super::{
-        ClaimedTaskBranchMismatch, active_stale_review_entries,
+        ClaimedTaskBranchMismatch, active_stale_review_entries, authoritative_task_branch,
         select_authoritative_multi_claim_task, task_claim_progress_type,
     };
     use crate::team::config::RoleType;
@@ -5483,6 +5491,56 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
                 current_branch: "HEAD".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn authoritative_task_branch_ignores_previous_assignees_branch() {
+        let mut task = test_task(28, "in-progress", Some("eng-2"), None);
+        task.branch = Some("eng-1/28".to_string());
+        assert_eq!(authoritative_task_branch("eng-2", &task), "eng-2/28");
+        task.branch = Some("eng-2/task-28-fix".to_string());
+        assert_eq!(
+            authoritative_task_branch("eng-2", &task),
+            "eng-2/task-28-fix"
+        );
+        task.branch = None;
+        assert_eq!(authoritative_task_branch("eng-2", &task), "eng-2/28");
+    }
+
+    #[test]
+    fn claimed_task_branch_mismatch_expects_own_branch_after_reassignment() {
+        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "claimed-branch-reassigned");
+        let daemon = TestDaemonBuilder::new(repo.as_path())
+            .members(vec![
+                manager_member("manager", None),
+                engineer_member("eng-2", Some("manager"), true),
+            ])
+            .states(HashMap::from([("eng-2".to_string(), MemberState::Idle)]))
+            .build();
+
+        let team_config_dir = repo.join(".batty").join("team_config");
+        let worktree_dir = repo.join(".batty").join("worktrees").join("eng-2");
+        let base_branch = engineer_base_branch_name("eng-2");
+        setup_engineer_worktree(&repo, &worktree_dir, &base_branch, &team_config_dir).unwrap();
+        // Task was previously worked by eng-1; frontmatter still names its branch.
+        write_owned_task_file_with_context(
+            &repo,
+            28,
+            "reassigned-task",
+            "in-progress",
+            "eng-2",
+            "eng-1/28",
+            ".batty/worktrees/eng-1",
+        );
+
+        let mismatch = daemon
+            .claimed_task_branch_mismatch("eng-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mismatch.expected_branch, "eng-2/28");
+        assert_eq!(mismatch.current_branch, base_branch);
     }
 
     #[test]
