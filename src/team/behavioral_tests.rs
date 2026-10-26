@@ -12,7 +12,7 @@ mod tests {
     };
     use crate::team::completion::{CompletionPacket, parse_completion, validate_completion};
     use crate::team::config::{AutoMergePolicy, RoleType, WorkflowPolicy};
-    use crate::team::merge::handle_engineer_completion;
+    use crate::team::merge::handle_engineer_completion_and_wait;
     use crate::team::messaging::send_message_as;
     use crate::team::policy::{
         check_wip_limit, is_review_nudge_due, is_review_stale, should_escalate,
@@ -295,7 +295,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let task_path = repo
             .join(".batty")

@@ -54,6 +54,10 @@ impl TeamDaemon {
             );
             self.active_tasks.clear();
         }
+        // Re-own tasks whose completion verification was interrupted by the
+        // restart (before the orphan sweep below can reclaim them); the
+        // verification re-runs on the first tick.
+        self.restore_pending_verification_tasks();
 
         // Reclaim orphaned in-progress tasks right away, instead of waiting
         // for the next auto-doctor sweep (which only runs every 10 poll
@@ -158,6 +162,10 @@ impl TeamDaemon {
 
             std::thread::sleep(self.poll_interval);
         }
+
+        // Kill background test commands; interrupted verifications are
+        // persisted below and re-run on resume.
+        self.stop_background_tests();
 
         // Graceful shutdown of all shim subprocesses
         self.shutdown_all_shims();
@@ -308,6 +316,9 @@ impl TeamDaemon {
         });
         self.run_recoverable_step("maybe_clear_stale_preserve_blockers", |daemon| {
             daemon.maybe_clear_stale_preserve_blockers()
+        });
+        self.run_recoverable_step("poll_background_tests", |daemon| {
+            daemon.poll_background_tests()
         });
         self.run_recoverable_step("process_merge_queue", |daemon| daemon.process_merge_queue());
         self.run_recoverable_step("maybe_refresh_stale_daemon_binary", |daemon| {

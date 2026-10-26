@@ -297,6 +297,7 @@ mod tests {
             pending_delivery_queue: HashMap::new(),
             pending_shim_acks: HashMap::new(),
             verification_states: HashMap::new(),
+            background_tests: Default::default(),
             narration_rejection_counts: HashMap::new(),
             zero_diff_completion_counts: HashMap::new(),
             shim_handles: HashMap::new(),

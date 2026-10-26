@@ -128,6 +128,9 @@ impl TeamDaemon {
         }
 
         monitor.mark_reload_attempt();
+        // exec would orphan running test commands; kill them and persist the
+        // interrupted verifications so the new binary re-runs them.
+        self.stop_background_tests();
         self.persist_runtime_state(false)?;
         self.record_daemon_reloading();
         self.record_orchestrator_action(format!(

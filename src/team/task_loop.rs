@@ -157,9 +157,21 @@ pub fn resolve_main_smoke_command(
     resolve_test_command(root, verification).ok()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn run_tests_in_worktree(
     worktree_dir: &Path,
     test_command: Option<&str>,
+) -> Result<TestRunOutput> {
+    run_tests_in_worktree_tracked(worktree_dir, test_command, None)
+}
+
+/// Like [`run_tests_in_worktree`], but when `child_pgid` is given the command
+/// runs in its own process group whose id is published there while it runs,
+/// so a background job can kill the whole test tree.
+pub(crate) fn run_tests_in_worktree_tracked(
+    worktree_dir: &Path,
+    test_command: Option<&str>,
+    child_pgid: Option<&std::sync::atomic::AtomicU32>,
 ) -> Result<TestRunOutput> {
     if !worktree_dir.is_dir() {
         let output = format!(
@@ -210,7 +222,33 @@ pub(crate) fn run_tests_in_worktree(
             shared_cargo_target_dir(&project_root).join(&wt_name),
         );
     }
-    let output = command.output().with_context(|| {
+    let output = match child_pgid {
+        None => command.output(),
+        Some(child_pgid) => {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            if crate::team::test_job::is_cancelled(child_pgid) {
+                anyhow::bail!("test command `{command_text}` cancelled before it started");
+            }
+            command.spawn().and_then(|child| {
+                let pid = child.id();
+                // If the job was killed while we were spawning, this kills
+                // the new group and the wait below returns promptly.
+                crate::team::test_job::register_child(child_pgid, pid);
+                let output = child.wait_with_output();
+                crate::team::test_job::clear_child(child_pgid, pid);
+                output
+            })
+        }
+    }
+    .with_context(|| {
         format!(
             "failed while running `{command_text}` in engineer worktree {}",
             worktree_dir.display(),

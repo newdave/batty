@@ -4,7 +4,7 @@
 //! Validates commits, runs tests, evaluates auto-merge policy, performs the
 //! merge, and handles retries and escalation.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -18,13 +18,14 @@ use crate::team::auto_merge::{self, AutoMergeDecisionKind};
 #[cfg(test)]
 use crate::team::board::WorkflowMetadata;
 use crate::team::board::{read_workflow_metadata, write_workflow_metadata};
-use crate::team::daemon::verification::{inspect_scope_fence, run_automatic_verification};
+use crate::team::daemon::verification::{inspect_scope_fence, run_automatic_verification_tracked};
 use crate::team::daemon::{MergeRequest, TeamDaemon};
 use crate::team::task_loop::{
     checkout_worktree_branch_from_trunk, current_worktree_branch, engineer_base_branch_name,
     read_task_title,
 };
 use crate::team::telemetry_db;
+use crate::team::test_job::TestJob;
 use crate::team::test_results::{TestResults, TestRunOutput};
 use crate::team::verification::{EvidenceKind, VerificationPhase, VerificationState};
 
@@ -599,6 +600,24 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         return Ok(());
     };
 
+    if let Some(running) = daemon.background_tests.verification.get(engineer) {
+        if running.task_id() == task_id {
+            info!(
+                engineer,
+                task_id, "completion verification already running; ignoring repeated completion"
+            );
+            return Ok(());
+        }
+        info!(
+            engineer,
+            stale_task_id = running.task_id(),
+            task_id,
+            "cancelling verification for a task the engineer no longer owns"
+        );
+        running.kill();
+        daemon.background_tests.verification.remove(engineer);
+    }
+
     if !daemon.member_uses_worktrees(engineer) {
         return Ok(());
     }
@@ -623,7 +642,6 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
 
     let worktree_dir = daemon.worktree_dir(engineer);
     let trunk_branch = daemon.config.team_config.trunk_branch().to_string();
-    let board_dir_str = board_dir.to_string_lossy().to_string();
     let manager_name = daemon.manager_name(engineer);
 
     let total_commits = if daemon.is_multi_repo {
@@ -740,99 +758,232 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         );
     }
 
-    let (verification_run, test_duration_ms) = if let Some(scope_fence) = scope_fence.as_ref() {
-        if !scope_fence.ack_present || !scope_fence.out_of_scope_files.is_empty() {
-            (
-                run_automatic_verification(&worktree_dir, test_command.as_deref())?,
-                0,
-            )
-        } else if verification_policy.auto_run_tests {
-            verification_state.begin_iteration();
-            let test_started = Instant::now();
-            let verification_run =
-                run_automatic_verification(&worktree_dir, test_command.as_deref()).with_context(
-                    || {
-                        format!(
-                            "automatic verification failed while running tests in {}",
-                            worktree_dir.display()
-                        )
-                    },
-                )?;
-            let test_duration_ms = test_started.elapsed().as_millis() as u64;
-            verification_state.last_test_passed = verification_run.passed;
-            verification_state.last_test_output = Some(verification_run.output.clone());
-            if verification_run.passed {
-                record_verification_evidence(
-                    daemon,
-                    engineer,
-                    task_id,
-                    &mut verification_state,
-                    EvidenceKind::TestsPassed,
-                    "tests_passed".to_string(),
-                );
-            } else {
-                record_verification_evidence(
-                    daemon,
-                    engineer,
-                    task_id,
-                    &mut verification_state,
-                    EvidenceKind::TestsFailed,
-                    verification_run
-                        .failures
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "tests_failed".to_string()),
-                );
-            }
-            (verification_run, test_duration_ms)
-        } else {
-            let output =
-                "automatic verification skipped because workflow_policy.verification.auto_run_tests=false"
-                    .to_string();
-            verification_state.last_test_passed = true;
-            verification_state.last_test_output = Some(output.clone());
-            record_verification_evidence(
-                daemon,
-                engineer,
-                task_id,
-                &mut verification_state,
-                EvidenceKind::TestsPassed,
-                "automatic verification skipped by policy".to_string(),
-            );
-            (
-                crate::team::daemon::verification::VerificationRunResult {
-                    passed: true,
-                    output,
-                    results: empty_test_results(
-                        "cargo",
-                        Some("automatic verification skipped by policy".to_string()),
-                    ),
-                    failures: Vec::new(),
-                    file_paths: Vec::new(),
-                    recovery: None,
-                },
-                0,
-            )
+    // Decide whether this completion needs the (possibly slow) verification
+    // command. `Some(true)` = a real test run that records test evidence;
+    // `Some(false)` = scope-fence checks that may still reach the test
+    // command; `None` = tests skipped by policy.
+    let run_kind = match scope_fence.as_ref() {
+        Some(fence) if !fence.ack_present || !fence.out_of_scope_files.is_empty() => Some(false),
+        _ if verification_policy.auto_run_tests => Some(true),
+        _ => None,
+    };
+    let worktree_head = if daemon.is_multi_repo {
+        None
+    } else {
+        worktree_head(&worktree_dir)
+    };
+    let mut ctx = CompletionContext {
+        task_id,
+        worktree_dir,
+        worktree_head,
+        trunk_branch,
+        board_dir,
+        manager_name,
+        total_commits,
+        diff_stat,
+        files_changed,
+        code_files_changed,
+        verification_policy,
+        verification_state,
+        records_test_evidence: run_kind == Some(true),
+    };
+
+    if run_kind.is_some() {
+        if ctx.records_test_evidence {
+            ctx.verification_state.begin_iteration();
         }
-    } else if verification_policy.auto_run_tests {
-        verification_state.begin_iteration();
-        let test_started = Instant::now();
-        let verification_run = run_automatic_verification(&worktree_dir, test_command.as_deref())
-            .with_context(|| {
-            format!(
-                "automatic verification failed while running tests in {}",
-                worktree_dir.display()
-            )
-        })?;
-        let test_duration_ms = test_started.elapsed().as_millis() as u64;
-        verification_state.last_test_passed = verification_run.passed;
-        verification_state.last_test_output = Some(verification_run.output.clone());
+        start_verification_job(daemon, engineer, ctx, test_command);
+        return Ok(());
+    }
+
+    let output =
+        "automatic verification skipped because workflow_policy.verification.auto_run_tests=false"
+            .to_string();
+    ctx.verification_state.last_test_passed = true;
+    ctx.verification_state.last_test_output = Some(output.clone());
+    record_verification_evidence(
+        daemon,
+        engineer,
+        task_id,
+        &mut ctx.verification_state,
+        EvidenceKind::TestsPassed,
+        "automatic verification skipped by policy".to_string(),
+    );
+    let verification_run = crate::team::daemon::verification::VerificationRunResult {
+        passed: true,
+        output,
+        results: empty_test_results(
+            "cargo",
+            Some("automatic verification skipped by policy".to_string()),
+        ),
+        failures: Vec::new(),
+        file_paths: Vec::new(),
+        recovery: None,
+    };
+    finish_engineer_completion(daemon, engineer, ctx, verification_run, 0)
+}
+
+/// Everything about a completion that the verification continuation needs,
+/// captured before the verification command is started.
+pub(crate) struct CompletionContext {
+    task_id: u32,
+    worktree_dir: PathBuf,
+    /// Worktree HEAD when verification started; `None` for multi-repo.
+    worktree_head: Option<String>,
+    trunk_branch: String,
+    board_dir: PathBuf,
+    manager_name: Option<String>,
+    total_commits: u32,
+    diff_stat: String,
+    files_changed: u32,
+    code_files_changed: u32,
+    verification_policy: crate::team::config::VerificationPolicy,
+    verification_state: VerificationState,
+    /// True for a real test run whose result is recorded as test evidence.
+    records_test_evidence: bool,
+}
+
+/// A completion verification running on a background thread, keyed by
+/// engineer in `TeamDaemon::background_tests`.
+pub(crate) struct VerificationJob {
+    ctx: CompletionContext,
+    job: TestJob<crate::team::daemon::verification::VerificationRunResult>,
+}
+
+impl VerificationJob {
+    pub(crate) fn task_id(&self) -> u32 {
+        self.ctx.task_id
+    }
+
+    pub(crate) fn kill(&self) {
+        self.job.kill();
+    }
+}
+
+fn worktree_head(worktree_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(worktree_dir)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn start_verification_job(
+    daemon: &mut TeamDaemon,
+    engineer: &str,
+    ctx: CompletionContext,
+    test_command: Option<String>,
+) {
+    let worktree_dir = ctx.worktree_dir.clone();
+    info!(
+        engineer,
+        task_id = ctx.task_id,
+        worktree = %worktree_dir.display(),
+        "starting background completion verification"
+    );
+    let job = TestJob::spawn(format!("verify-{engineer}"), move |child_pgid| {
+        run_automatic_verification_tracked(
+            &worktree_dir,
+            test_command.as_deref(),
+            Some(child_pgid.as_ref()),
+        )
+    });
+    daemon
+        .background_tests
+        .verification
+        .insert(engineer.to_string(), VerificationJob { ctx, job });
+}
+
+/// Apply every finished background completion verification. Called from the
+/// daemon poll loop; returns the first continuation error after applying all
+/// finished jobs.
+pub(crate) fn poll_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> {
+    let finished: Vec<(
+        String,
+        Result<crate::team::daemon::verification::VerificationRunResult>,
+    )> = daemon
+        .background_tests
+        .verification
+        .iter()
+        .filter_map(|(engineer, job)| job.job.try_take().map(|r| (engineer.clone(), r)))
+        .collect();
+    let mut first_error = None;
+    for (engineer, result) in finished {
+        let Some(job) = daemon.background_tests.verification.remove(&engineer) else {
+            continue;
+        };
+        if let Err(error) = apply_verification_result(daemon, &engineer, job, result) {
+            warn!(engineer = %engineer, error = %error, "completion verification handling failed");
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn apply_verification_result(
+    daemon: &mut TeamDaemon,
+    engineer: &str,
+    job: VerificationJob,
+    result: Result<crate::team::daemon::verification::VerificationRunResult>,
+) -> Result<()> {
+    let VerificationJob { mut ctx, job } = job;
+    let task_id = ctx.task_id;
+    let duration_ms = job.elapsed().as_millis() as u64;
+
+    let current_task = daemon.active_task_id(engineer);
+    if current_task != Some(task_id) {
+        info!(
+            engineer,
+            task_id,
+            current_task = ?current_task,
+            duration_ms,
+            "discarding stale verification result: task is no longer active for this engineer"
+        );
+        return Ok(());
+    }
+    if ctx.worktree_head.is_some() && worktree_head(&ctx.worktree_dir) != ctx.worktree_head {
+        info!(
+            engineer,
+            task_id,
+            duration_ms,
+            "discarding stale verification result: worktree HEAD moved while tests ran; re-verifying"
+        );
+        if ctx.records_test_evidence {
+            ctx.verification_state.iteration = ctx.verification_state.iteration.saturating_sub(1);
+        }
+        daemon
+            .verification_states
+            .insert(engineer.to_string(), ctx.verification_state);
+        return handle_engineer_completion(daemon, engineer);
+    }
+
+    let verification_run = result.with_context(|| {
+        format!(
+            "automatic verification failed while running tests in {}",
+            ctx.worktree_dir.display()
+        )
+    })?;
+    info!(
+        engineer,
+        task_id,
+        passed = verification_run.passed,
+        duration_ms,
+        "completion verification finished"
+    );
+
+    let test_duration_ms = if ctx.records_test_evidence {
+        ctx.verification_state.last_test_passed = verification_run.passed;
+        ctx.verification_state.last_test_output = Some(verification_run.output.clone());
         if verification_run.passed {
             record_verification_evidence(
                 daemon,
                 engineer,
                 task_id,
-                &mut verification_state,
+                &mut ctx.verification_state,
                 EvidenceKind::TestsPassed,
                 "tests_passed".to_string(),
             );
@@ -841,7 +992,7 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
                 daemon,
                 engineer,
                 task_id,
-                &mut verification_state,
+                &mut ctx.verification_state,
                 EvidenceKind::TestsFailed,
                 verification_run
                     .failures
@@ -850,36 +1001,38 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
                     .unwrap_or_else(|| "tests_failed".to_string()),
             );
         }
-        (verification_run, test_duration_ms)
+        duration_ms
     } else {
-        let output =
-            "automatic verification skipped because workflow_policy.verification.auto_run_tests=false"
-                .to_string();
-        verification_state.last_test_passed = true;
-        verification_state.last_test_output = Some(output.clone());
-        record_verification_evidence(
-            daemon,
-            engineer,
-            task_id,
-            &mut verification_state,
-            EvidenceKind::TestsPassed,
-            "automatic verification skipped by policy".to_string(),
-        );
-        (
-            crate::team::daemon::verification::VerificationRunResult {
-                passed: true,
-                output,
-                results: empty_test_results(
-                    "cargo",
-                    Some("automatic verification skipped by policy".to_string()),
-                ),
-                failures: Vec::new(),
-                file_paths: Vec::new(),
-                recovery: None,
-            },
-            0,
-        )
+        0
     };
+    finish_engineer_completion(daemon, engineer, ctx, verification_run, test_duration_ms)
+}
+
+/// Second half of completion handling: runs once the verification result is
+/// known (immediately when tests are skipped, otherwise from the poll loop).
+fn finish_engineer_completion(
+    daemon: &mut TeamDaemon,
+    engineer: &str,
+    ctx: CompletionContext,
+    verification_run: crate::team::daemon::verification::VerificationRunResult,
+    test_duration_ms: u64,
+) -> Result<()> {
+    let CompletionContext {
+        task_id,
+        worktree_dir,
+        worktree_head: _,
+        trunk_branch,
+        board_dir,
+        manager_name,
+        total_commits,
+        diff_stat,
+        files_changed,
+        code_files_changed,
+        verification_policy,
+        mut verification_state,
+        records_test_evidence: _,
+    } = ctx;
+    let board_dir_str = board_dir.to_string_lossy().to_string();
 
     if let Some(recovery) = verification_run.recovery.as_ref() {
         verification_state.iteration = verification_state.iteration.saturating_sub(1);
@@ -2040,6 +2193,35 @@ fn multi_repo_diff_stat_from_trunk(
     Ok(stats.join("\n"))
 }
 
+/// Test helper: poll until every background completion verification has
+/// been applied (or panic after a generous timeout).
+#[cfg(test)]
+pub(crate) fn wait_for_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        poll_verification_jobs(daemon)?;
+        if daemon.background_tests.verification.is_empty() {
+            return Ok(());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background verification did not finish in time"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Test helper: completion handling as it behaved when verification was
+/// synchronous — start it, then pump the poll until the result is applied.
+#[cfg(test)]
+pub(crate) fn handle_engineer_completion_and_wait(
+    daemon: &mut TeamDaemon,
+    engineer: &str,
+) -> Result<()> {
+    handle_engineer_completion(daemon, engineer)?;
+    wait_for_verification_jobs(daemon)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2335,7 +2517,7 @@ mod tests {
         daemon: &mut crate::team::daemon::TeamDaemon,
         engineer: &str,
     ) {
-        handle_engineer_completion(daemon, engineer).unwrap();
+        handle_engineer_completion_and_wait(daemon, engineer).unwrap();
         daemon.process_merge_queue_for_test().unwrap();
     }
 
@@ -2585,7 +2767,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(daemon.active_task_id("eng-1"), Some(42));
         assert_eq!(
@@ -2719,7 +2901,7 @@ mod tests {
         daemon.set_active_task_for_test(engineer, task_id);
         daemon.set_member_state_for_test(engineer, MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, engineer).unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, engineer).unwrap();
 
         assert_eq!(daemon.active_task_id(engineer), Some(task_id));
         assert!(!daemon.verification_states.contains_key(engineer));
@@ -2835,7 +3017,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let command = child_channel.recv().unwrap().unwrap();
         match command {
@@ -2880,7 +3062,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(daemon.active_task_id("eng-1"), None);
         assert_eq!(
@@ -2972,7 +3154,7 @@ mod tests {
         for _ in 0..2 {
             daemon.set_active_task_for_test("eng-1", 42);
             daemon.set_member_state_for_test("eng-1", MemberState::Working);
-            handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+            handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
         }
 
         let task_path = repo
@@ -3052,7 +3234,7 @@ mod tests {
         for attempt in 0..4 {
             daemon.set_active_task_for_test("eng-1", 42);
             daemon.set_member_state_for_test("eng-1", MemberState::Working);
-            handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+            handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
             if first_escalation_at.is_none() && escalations(&team_config_dir) > 0 {
                 first_escalation_at = Some(attempt);
                 break;
@@ -3106,7 +3288,7 @@ mod tests {
         let mut daemon = make_test_daemon(&repo, vec![manager, engineer]);
 
         daemon.set_active_task_for_test("eng-1", 42);
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
@@ -3168,7 +3350,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(
             std::fs::read_to_string(worktree_dir.join("docs").join("notes.md")).unwrap(),
@@ -3233,7 +3415,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert!(!worktree_dir.join("stray.txt").exists());
         let revert_subject = String::from_utf8(
@@ -3270,7 +3452,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
@@ -3289,7 +3471,7 @@ mod tests {
         assert!(manager_messages.is_empty());
         assert_eq!(daemon.active_task_id("eng-1"), Some(42));
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
@@ -3354,7 +3536,7 @@ mod tests {
         // gate rejects it but does NOT increment the narration-only
         // counter (this is an "insufficient evidence" failure, not
         // narration).
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
         assert_eq!(
             daemon.narration_rejection_counts.get(&77),
             None,
@@ -3368,7 +3550,7 @@ mod tests {
             &worktree_dir,
             &["commit", "--allow-empty", "-m", "commentary only"],
         );
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
         assert_eq!(
             daemon.narration_rejection_counts.get(&77),
             Some(&1),
@@ -3381,7 +3563,7 @@ mod tests {
             &worktree_dir,
             &["commit", "--allow-empty", "-m", "more commentary"],
         );
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         // After escalation, the counter must be cleared so a future
         // reassignment starts fresh.
@@ -3423,14 +3605,14 @@ mod tests {
 
         let mut daemon = setup_completion_daemon(&repo, "eng-1");
         daemon.set_active_task_for_test("eng-1", 42);
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
         assert_eq!(daemon.narration_rejection_counts.get(&42), Some(&1));
 
         daemon.clear_active_task("eng-1");
         assert!(!daemon.narration_rejection_counts.contains_key(&42));
 
         daemon.set_active_task_for_test("eng-1", 43);
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
         assert_eq!(daemon.narration_rejection_counts.get(&43), Some(&1));
     }
 
@@ -3457,7 +3639,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
@@ -3508,7 +3690,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
@@ -3543,7 +3725,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         // Assignment kept — engineer still owns the task (false-done prevention)
         assert_eq!(daemon.active_task_id("eng-1"), Some(42));
@@ -3565,7 +3747,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         // Retry count should not be incremented
         assert_eq!(daemon.retry_count_for_test("eng-1"), None);
@@ -3583,7 +3765,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
@@ -3606,7 +3788,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(daemon.active_task_id("eng-1"), Some(42));
         assert_eq!(daemon.retry_count_for_test("eng-1"), Some(1));
@@ -3628,7 +3810,7 @@ mod tests {
         daemon.increment_retry("eng-1");
         daemon.increment_retry("eng-1");
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let manager_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "manager").unwrap();
@@ -3652,7 +3834,7 @@ mod tests {
         daemon.increment_retry("eng-1");
         daemon.increment_retry("eng-1");
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(daemon.active_task_id("eng-1"), None);
         assert_eq!(daemon.retry_count_for_test("eng-1"), None);
@@ -3673,7 +3855,7 @@ mod tests {
         daemon.increment_retry("eng-1");
         daemon.increment_retry("eng-1");
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let events = crate::team::events::read_events(
             &repo.join(".batty").join("team_config").join("events.jsonl"),
@@ -3844,7 +4026,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
@@ -3894,7 +4076,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let manager_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "manager").unwrap();
@@ -3920,7 +4102,7 @@ mod tests {
             .recent_escalations
             .insert("tests_failed_42_eng-1".to_string(), Instant::now());
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let manager_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "manager").unwrap();
@@ -3942,7 +4124,7 @@ mod tests {
         };
         let mut daemon = auto_merge_daemon(&repo, policy);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(daemon.queued_merge_count_for_test(), 1);
         assert_eq!(daemon.active_task_id("eng-1"), Some(42));
@@ -4031,7 +4213,7 @@ mod tests {
         };
         let mut daemon = auto_merge_daemon(&repo, policy);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(daemon.queued_merge_count_for_test(), 1);
         assert_eq!(daemon.active_task_id("eng-1"), Some(42));
@@ -4074,7 +4256,7 @@ mod tests {
         };
         let mut daemon = auto_merge_daemon(&repo, policy);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(daemon.queued_merge_count_for_test(), 1);
         assert_eq!(daemon.active_task_id("eng-1"), Some(42));
@@ -4121,7 +4303,7 @@ mod tests {
         };
         let mut daemon = auto_merge_daemon(&repo, policy);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         assert_eq!(daemon.queued_merge_count_for_test(), 1);
         assert_eq!(daemon.active_task_id("eng-1"), Some(42));
@@ -4194,7 +4376,7 @@ mod tests {
         };
         let mut daemon = auto_merge_daemon(&repo, policy);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         let task_path = repo
             .join(".batty")
@@ -4416,7 +4598,7 @@ mod tests {
 
         let mut daemon = auto_merge_daemon(&repo, policy);
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         // With auto-merge disabled, should fall through to normal merge (no review gate)
         assert_eq!(daemon.active_task_id("eng-1"), None);
@@ -4450,7 +4632,7 @@ mod tests {
         let mut daemon = auto_merge_daemon(&repo, policy);
         daemon.set_auto_merge_override(42, false); // Force manual review
 
-        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
         // Manager should have received a message about override
         let manager_messages =
@@ -4527,5 +4709,148 @@ mod tests {
             0,
             "production completion.rs should avoid unwrap/expect"
         );
+    }
+
+    /// Repo + daemon whose completion verification runs `test_command`
+    /// (typically a slow `sleep`) for task #42 owned by eng-1.
+    fn setup_background_verification(
+        test_command: &str,
+    ) -> (tempfile::TempDir, PathBuf, crate::team::daemon::TeamDaemon) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-bg-verify");
+        write_task_file(&repo, 42, "background-verification");
+        let (worktree_dir, team_config_dir) = engineer_worktree_paths(&repo, "eng-1");
+        setup_engineer_worktree(&repo, &worktree_dir, "eng-1", &team_config_dir).unwrap();
+        std::fs::write(worktree_dir.join("note.txt"), "done\n").unwrap();
+        git_ok(&worktree_dir, &["add", "note.txt"]);
+        git_ok(&worktree_dir, &["commit", "-m", "add note"]);
+        seed_completion_packet_metadata(&repo, 42, "background-verification", &worktree_dir);
+
+        let mut daemon = setup_completion_daemon(&repo, "eng-1");
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .verification
+            .test_command = Some(test_command.to_string());
+        daemon.set_active_task_for_test("eng-1", 42);
+        daemon.set_member_state_for_test("eng-1", MemberState::Working);
+        (tmp, repo, daemon)
+    }
+
+    #[test]
+    fn slow_verification_does_not_block_and_is_applied_on_a_later_poll() {
+        // The command waits for a gate file, so returning at all while the gate
+        // is closed proves completion handling did not wait for it (no timing
+        // threshold to trip under load).
+        let gate_dir = tempfile::tempdir().unwrap();
+        let gate = gate_dir.path().join("open");
+        let (_tmp, repo, mut daemon) = setup_background_verification(&format!(
+            "while [ ! -f '{}' ]; do sleep 0.05; done; exit 0",
+            gate.display()
+        ));
+
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        assert!(daemon.background_tests.verification.contains_key("eng-1"));
+
+        // A poll while the command is blocked finds the job still running and
+        // changes nothing.
+        poll_verification_jobs(&mut daemon).unwrap();
+        assert_eq!(daemon.active_task_id("eng-1"), Some(42));
+        assert!(!verification_snapshot_path(&repo, 42, "eng-1", 1).exists());
+
+        std::fs::write(&gate, "").unwrap();
+        wait_for_verification_jobs(&mut daemon).unwrap();
+        let snapshot =
+            std::fs::read_to_string(verification_snapshot_path(&repo, 42, "eng-1", 1)).unwrap();
+        assert!(snapshot.contains("\"phase\": \"complete\""));
+        assert!(snapshot.contains("\"passed\": true"));
+    }
+
+    #[test]
+    fn repeated_completion_while_verifying_does_not_start_a_second_job() {
+        let counter_dir = tempfile::tempdir().unwrap();
+        let counter = counter_dir.path().join("runs");
+        let (_tmp, _repo, mut daemon) = setup_background_verification(&format!(
+            "echo run >> '{}'; sleep 1; exit 0",
+            counter.display()
+        ));
+
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        assert_eq!(daemon.background_tests.verification.len(), 1);
+
+        wait_for_verification_jobs(&mut daemon).unwrap();
+        let runs = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(runs.lines().count(), 1, "verification ran {runs:?}");
+    }
+
+    #[test]
+    fn stale_verification_result_after_reassignment_is_discarded() {
+        let (_tmp, repo, mut daemon) = setup_background_verification("sleep 1; exit 0");
+
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        // The engineer moves on to another task while the tests still run.
+        daemon.set_active_task_for_test("eng-1", 99);
+
+        wait_for_verification_jobs(&mut daemon).unwrap();
+        assert_eq!(daemon.active_task_id("eng-1"), Some(99));
+        assert!(!verification_snapshot_path(&repo, 42, "eng-1", 1).exists());
+        let task = crate::task::Task::from_file(
+            &crate::team::task_cmd::find_task_path(&daemon.board_dir(), 42).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(task.status, "review");
+        assert_ne!(task.status, "done");
+    }
+
+    #[test]
+    fn clearing_the_active_task_cancels_a_running_verification() {
+        let (_tmp, _repo, mut daemon) = setup_background_verification("sleep 30; exit 0");
+
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        assert!(daemon.background_tests.verification.contains_key("eng-1"));
+        daemon.clear_active_task("eng-1");
+        assert!(daemon.background_tests.verification.is_empty());
+    }
+
+    #[test]
+    fn stopping_background_tests_kills_the_command_and_re_runs_it_after_restart() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("finished");
+        let (_tmp, repo, mut daemon) = setup_background_verification(&format!(
+            "sleep 1; touch '{}'; exit 0",
+            marker.display()
+        ));
+
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        // Give the worker time to spawn the command before killing it.
+        std::thread::sleep(Duration::from_millis(300));
+        daemon.stop_background_tests();
+        assert!(daemon.background_tests.verification.is_empty());
+        assert_eq!(
+            daemon.background_tests.retriggers.get("eng-1"),
+            Some(&42),
+            "interrupted verification must be remembered"
+        );
+        assert_eq!(
+            daemon.background_tests.pending_verifications().get("eng-1"),
+            Some(&42),
+            "interrupted verification must be persisted"
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "test command should have been killed with its process group"
+        );
+
+        // The next poll re-runs the interrupted verification.
+        daemon.poll_background_tests().unwrap();
+        assert!(daemon.background_tests.retriggers.is_empty());
+        assert!(daemon.background_tests.verification.contains_key("eng-1"));
+        wait_for_verification_jobs(&mut daemon).unwrap();
+        assert!(marker.exists());
+        assert!(verification_snapshot_path(&repo, 42, "eng-1", 1).exists());
     }
 }

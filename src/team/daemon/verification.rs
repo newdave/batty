@@ -9,7 +9,7 @@ use crate::team::config::TeamConfig;
 use crate::team::hierarchy::resolve_hierarchy;
 use crate::team::inbox;
 use crate::team::review::task_reference_mismatch_blockers;
-use crate::team::task_loop::run_tests_in_worktree;
+use crate::team::task_loop::run_tests_in_worktree_tracked;
 use crate::team::test_results::TestResults;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,16 @@ pub(crate) fn run_automatic_verification(
     worktree_dir: &Path,
     test_command: Option<&str>,
 ) -> Result<VerificationRunResult> {
+    run_automatic_verification_tracked(worktree_dir, test_command, None)
+}
+
+/// [`run_automatic_verification`] for background jobs: the test command's
+/// process group id is published in `child_pgid` while it runs.
+pub(crate) fn run_automatic_verification_tracked(
+    worktree_dir: &Path,
+    test_command: Option<&str>,
+    child_pgid: Option<&std::sync::atomic::AtomicU32>,
+) -> Result<VerificationRunResult> {
     if let Some(conflict_failure) = active_claim_conflict_failure(worktree_dir)? {
         return Ok(conflict_failure);
     }
@@ -67,7 +77,7 @@ pub(crate) fn run_automatic_verification(
         return Ok(scope_failure);
     }
 
-    let test_run = run_tests_in_worktree(worktree_dir, test_command)?;
+    let test_run = run_tests_in_worktree_tracked(worktree_dir, test_command, child_pgid)?;
     let (failures, _failure_paths) =
         parse_test_output(&test_run.output, &test_run.results, test_run.passed);
     let file_paths =

@@ -133,10 +133,12 @@ impl TeamDaemon {
             Err(error) => return Some(error.to_string()),
         };
 
-        Some(match self.execute_telegram_command(command) {
-            Ok(reply) => reply,
-            Err(error) => format!("Command failed: {error}"),
-        })
+        Some(
+            match self.execute_chat_command(command, background_tests::ChatReplyTarget::Discord) {
+                Ok(reply) => reply,
+                Err(error) => format!("Command failed: {error}"),
+            },
+        )
     }
 
     fn sync_discord_events(&mut self) -> Result<()> {

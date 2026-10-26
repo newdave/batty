@@ -390,6 +390,7 @@ fn daemon_state_round_trip_preserves_runtime_fields() {
                 count: 2,
             },
         )]),
+        pending_verifications: HashMap::from([("eng-1".to_string(), 42)]),
     };
 
     save_daemon_state(tmp.path(), &state).unwrap();
@@ -822,6 +823,18 @@ fn test_maybe_auto_dispatch_skips_when_main_smoke_blocks_dispatch() {
     assert_eq!(daemon.last_auto_dispatch, before);
 }
 
+/// Start a main smoke run and pump the poll step until its background
+/// result has been applied.
+fn run_main_smoke_and_wait(daemon: &mut TeamDaemon) {
+    daemon.maybe_run_main_smoke().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while daemon.background_tests.main_smoke.is_some() {
+        assert!(Instant::now() < deadline, "main smoke did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+        daemon.maybe_run_main_smoke().unwrap();
+    }
+}
+
 #[test]
 fn main_smoke_detects_broken_main_and_recovers() {
     let tmp = tempfile::tempdir().unwrap();
@@ -849,7 +862,7 @@ fn main_smoke_detects_broken_main_and_recovers() {
     git_ok(&repo, &["commit", "-m", "break main"]);
 
     daemon.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
-    daemon.maybe_run_main_smoke().unwrap();
+    run_main_smoke_and_wait(&mut daemon);
 
     let broken_commit =
         crate::team::test_support::git_stdout(&repo, &["rev-parse", "--short", "HEAD"]);
@@ -892,7 +905,7 @@ fn main_smoke_detects_broken_main_and_recovers() {
     git_ok(&repo, &["commit", "-m", "repair main"]);
 
     daemon.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
-    daemon.maybe_run_main_smoke().unwrap();
+    run_main_smoke_and_wait(&mut daemon);
 
     let recovered = daemon.main_smoke_state.as_ref().expect("main smoke state");
     assert!(
@@ -5919,6 +5932,7 @@ fn save_daemon_state_returns_error_on_readonly_dir() {
             planning_cycle_consecutive_empty: 0,
             recently_rescued_tasks: HashMap::new(),
             recently_released_by: HashMap::new(),
+            pending_verifications: HashMap::new(),
         };
 
         let result = save_daemon_state(tmp.path(), &state);
@@ -6048,4 +6062,77 @@ fn load_dispatch_queue_graceful_when_no_state() {
         queue.is_empty(),
         "dispatch queue from missing state should be empty, not panic"
     );
+}
+
+#[test]
+fn restore_pending_verification_tasks_re_owns_only_tasks_still_claimed() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_owned_task_file(tmp.path(), 42, "verifying", "review", "eng-1");
+    write_owned_task_file(tmp.path(), 7, "already-done", "done", "eng-2");
+    let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
+    daemon.background_tests.retriggers =
+        HashMap::from([("eng-1".to_string(), 42), ("eng-2".to_string(), 7)]);
+
+    daemon.restore_pending_verification_tasks();
+
+    assert_eq!(daemon.active_task_id("eng-1"), Some(42));
+    assert_eq!(daemon.active_task_id("eng-2"), None);
+    assert_eq!(
+        daemon.background_tests.retriggers,
+        HashMap::from([("eng-1".to_string(), 42)])
+    );
+}
+
+#[test]
+fn persisted_pending_verifications_are_restored_as_retriggers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
+    daemon
+        .background_tests
+        .retriggers
+        .insert("eng-1".to_string(), 42);
+    daemon.persist_runtime_state(false).unwrap();
+
+    let mut restarted = TestDaemonBuilder::new(tmp.path()).build();
+    restarted.restore_runtime_state();
+    assert_eq!(
+        restarted.background_tests.retriggers.get("eng-1"),
+        Some(&42)
+    );
+}
+
+#[test]
+fn slow_main_smoke_runs_in_background() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(&tmp, "batty-main-smoke-bg");
+    let mut daemon = TestDaemonBuilder::new(&repo)
+        .workflow_policy(WorkflowPolicy {
+            main_smoke: MainSmokePolicy {
+                interval_secs: 1,
+                command: Some("sleep 2; exit 0".to_string()),
+                ..MainSmokePolicy::default()
+            },
+            ..WorkflowPolicy::default()
+        })
+        .build();
+    daemon.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
+
+    let started = Instant::now();
+    daemon.maybe_run_main_smoke().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "main smoke blocked the poll for {:?}",
+        started.elapsed()
+    );
+    assert!(daemon.background_tests.main_smoke.is_some());
+    assert!(daemon.main_smoke_state.is_none());
+
+    // Polling while it runs neither blocks nor starts a second run.
+    daemon.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
+    daemon.maybe_run_main_smoke().unwrap();
+    assert!(daemon.main_smoke_state.is_none());
+
+    run_main_smoke_and_wait(&mut daemon);
+    let state = daemon.main_smoke_state.as_ref().expect("main smoke state");
+    assert!(!state.broken);
 }

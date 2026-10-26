@@ -72,6 +72,8 @@ const STALLED_MID_TURN_MAX_ATTEMPTS: u32 = 5;
 pub(super) mod agent_handle;
 #[path = "daemon/automation.rs"]
 mod automation;
+#[path = "daemon/background_tests.rs"]
+mod background_tests;
 #[path = "daemon/config_reload.rs"]
 mod config_reload;
 #[path = "discord_bridge.rs"]
@@ -399,6 +401,9 @@ pub struct TeamDaemon {
     pub(super) last_disk_hygiene_check: Instant,
     /// Per-engineer completion verification loop state.
     pub(super) verification_states: HashMap<String, VerificationState>,
+    /// Test commands running off the poll loop (verification, main smoke,
+    /// chat merges).
+    pub(super) background_tests: background_tests::BackgroundTests,
     /// Tracks consecutive narration-only rejections per task (commits exist
     /// but the branch still has no file diff). After threshold, escalates.
     pub(super) narration_rejection_counts: HashMap<u32, u32>,
@@ -773,6 +778,7 @@ impl TeamDaemon {
             last_shared_target_cleanup: Instant::now() - Duration::from_secs(3600),
             last_disk_hygiene_check: Instant::now() - Duration::from_secs(3600),
             verification_states: HashMap::new(),
+            background_tests: Default::default(),
             narration_rejection_counts: HashMap::new(),
             zero_diff_completion_counts: HashMap::new(),
             pending_delivery_queue: HashMap::new(),
@@ -980,7 +986,20 @@ impl TeamDaemon {
     }
 
     pub(super) fn maybe_run_main_smoke(&mut self) -> Result<()> {
-        const DEFAULT_MAIN_SMOKE_SUSPECT_COMMITS: usize = 5;
+        // A smoke command may still be running on its background thread;
+        // apply its result once it finishes instead of starting another.
+        let finished = match self.background_tests.main_smoke.as_ref() {
+            Some(smoke) => match smoke.job.try_take() {
+                Some(result) => Some(result),
+                None => return Ok(()),
+            },
+            None => None,
+        };
+        if let Some(result) = finished {
+            if let Some(smoke) = self.background_tests.main_smoke.take() {
+                return self.apply_main_smoke_result(smoke, result);
+            }
+        }
 
         let policy = self.config.team_config.workflow_policy.main_smoke.clone();
         if !policy.enabled {
@@ -1011,19 +1030,60 @@ impl TeamDaemon {
             warn!("no main smoke command for this project; set workflow_policy.main_smoke.command");
             return Ok(());
         };
-        let command = command.as_str();
-
         let head = Self::short_head_commit(self.project_root())?;
         self.record_orchestrator_action(format!("main smoke: running `{command}` at {head}"));
 
-        let test_run =
-            crate::team::task_loop::run_tests_in_worktree(self.project_root(), Some(command))
-                .with_context(|| {
-                    format!(
-                        "failed while running main smoke command `{command}` in {}",
-                        self.project_root().display()
-                    )
-                })?;
+        let project_root = self.project_root().to_path_buf();
+        let job_command = command.clone();
+        let job = crate::team::test_job::TestJob::spawn("main-smoke", move |child_pgid| {
+            crate::team::task_loop::run_tests_in_worktree_tracked(
+                &project_root,
+                Some(&job_command),
+                Some(child_pgid.as_ref()),
+            )
+            .with_context(|| {
+                format!(
+                    "failed while running main smoke command `{job_command}` in {}",
+                    project_root.display()
+                )
+            })
+        });
+        self.background_tests.main_smoke =
+            Some(background_tests::MainSmokeJob { command, head, job });
+        Ok(())
+    }
+
+    fn apply_main_smoke_result(
+        &mut self,
+        smoke: background_tests::MainSmokeJob,
+        result: Result<super::test_results::TestRunOutput>,
+    ) -> Result<()> {
+        const DEFAULT_MAIN_SMOKE_SUSPECT_COMMITS: usize = 5;
+
+        let policy = self.config.team_config.workflow_policy.main_smoke.clone();
+        let background_tests::MainSmokeJob { command, head, job } = smoke;
+        let duration_ms = job.elapsed().as_millis() as u64;
+        let command = command.as_str();
+        let test_run = result?;
+
+        let current_head = Self::short_head_commit(self.project_root())?;
+        if current_head != head {
+            info!(
+                command,
+                head = %head,
+                current_head = %current_head,
+                duration_ms,
+                "discarding stale main smoke result: main moved while it ran"
+            );
+            return Ok(());
+        }
+        info!(
+            command,
+            head = %head,
+            passed = test_run.passed,
+            duration_ms,
+            "main smoke finished"
+        );
 
         if test_run.passed {
             let was_broken = self
@@ -1721,6 +1781,14 @@ impl TeamDaemon {
         }
         self.retry_counts.remove(engineer);
         self.verification_states.remove(engineer);
+        if let Some(job) = self.background_tests.verification.remove(engineer) {
+            info!(
+                engineer,
+                task_id = job.task_id(),
+                "cancelling completion verification: active task cleared"
+            );
+            job.kill();
+        }
         // Clean up any progress checkpoint left from a prior restart.
         super::checkpoint::remove_checkpoint(&self.config.project_root, engineer);
         let work_dir = self

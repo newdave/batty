@@ -15,8 +15,10 @@ mod git_ops;
 mod lock;
 mod operations;
 
-pub(crate) use completion::handle_engineer_completion;
+#[cfg(test)]
+pub(crate) use completion::handle_engineer_completion_and_wait;
 pub(crate) use completion::record_merge_test_timing;
+pub(crate) use completion::{VerificationJob, handle_engineer_completion, poll_verification_jobs};
 pub(crate) use lock::{
     MergeLock, MergeMode, MergeOutcome, infer_merge_mode_from_failure, merge_lock_is_held,
 };

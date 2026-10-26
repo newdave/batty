@@ -101,13 +101,31 @@ impl TeamDaemon {
             Err(error) => return Some(error.to_string()),
         };
 
-        Some(match self.execute_telegram_command(command) {
-            Ok(reply) => reply,
-            Err(error) => format!("Command failed: {error}"),
-        })
+        Some(
+            match self.execute_chat_command(
+                command,
+                background_tests::ChatReplyTarget::Telegram {
+                    chat_id: msg.chat_id,
+                },
+            ) {
+                Ok(reply) => reply,
+                Err(error) => format!("Command failed: {error}"),
+            },
+        )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn execute_telegram_command(&mut self, command: TelegramCommand) -> Result<String> {
+        self.execute_chat_command(command, background_tests::ChatReplyTarget::None)
+    }
+
+    /// Execute a chat command. Commands that finish in the background (merge)
+    /// send their final reply to `reply_to` when done.
+    pub(super) fn execute_chat_command(
+        &mut self,
+        command: TelegramCommand,
+        reply_to: background_tests::ChatReplyTarget,
+    ) -> Result<String> {
         match command {
             TelegramCommand::Status => Ok(self.render_telegram_status_summary()),
             TelegramCommand::Board { filter } => {
@@ -122,7 +140,9 @@ impl TeamDaemon {
             TelegramCommand::Assign { engineer, task } => {
                 self.execute_telegram_assign_command(&engineer, &task)
             }
-            TelegramCommand::Merge { task_id } => self.execute_telegram_merge_command(task_id),
+            TelegramCommand::Merge { task_id } => {
+                self.execute_telegram_merge_command(task_id, reply_to)
+            }
             TelegramCommand::Kick { member } => self.execute_telegram_kick_command(&member),
             TelegramCommand::Pause => {
                 crate::team::pause_team(&self.config.project_root)?;
@@ -308,24 +328,93 @@ impl TeamDaemon {
         }
     }
 
-    pub(super) fn execute_telegram_merge_command(&mut self, task_id: u32) -> Result<String> {
+    /// Start a chat `merge`: validate now, run the verification command on a
+    /// background thread, and merge + reply from the poll loop once it passes.
+    pub(super) fn execute_telegram_merge_command(
+        &mut self,
+        task_id: u32,
+        reply_to: background_tests::ChatReplyTarget,
+    ) -> Result<String> {
         let board_dir = self.board_dir();
         let task_path = crate::team::task_cmd::find_task_path(&board_dir, task_id)?;
         let task = crate::task::Task::from_file(&task_path)?;
         if task.status != "review" {
             bail!("Task #{task_id} is not in review.");
         }
+        if self
+            .background_tests
+            .chat_merges
+            .iter()
+            .any(|job| job.task_id == task_id)
+        {
+            return Ok(format!(
+                "Task #{task_id} is already being verified for merge."
+            ));
+        }
 
         let engineer = engineer_for_merge_task(&self.config.project_root, task_id)?;
         let worktree_dir = self.worktree_dir(&engineer);
         let verification_policy = &self.config.team_config.workflow_policy.verification;
-        let test_command = verification_policy.test_command.as_deref().or(self
+        let test_command = verification_policy.test_command.clone().or(self
             .config
             .team_config
             .workflow_policy
             .test_command
-            .as_deref());
-        let test_run = crate::team::task_loop::run_tests_in_worktree(&worktree_dir, test_command)?;
+            .clone());
+        let job = crate::team::test_job::TestJob::spawn(
+            format!("chat-merge-{task_id}"),
+            move |child_pgid| {
+                crate::team::task_loop::run_tests_in_worktree_tracked(
+                    &worktree_dir,
+                    test_command.as_deref(),
+                    Some(child_pgid.as_ref()),
+                )
+            },
+        );
+        self.background_tests
+            .chat_merges
+            .push(background_tests::ChatMergeJob {
+                task_id,
+                engineer: engineer.clone(),
+                reply_to,
+                job,
+            });
+        Ok(format!(
+            "Running verification for Task #{task_id} from {engineer}; will merge and reply when it passes."
+        ))
+    }
+
+    /// Finish chat merges whose verification command has completed.
+    pub(super) fn poll_chat_merge_jobs(&mut self) {
+        let mut index = 0;
+        while index < self.background_tests.chat_merges.len() {
+            let Some(result) = self.background_tests.chat_merges[index].job.try_take() else {
+                index += 1;
+                continue;
+            };
+            let job = self.background_tests.chat_merges.remove(index);
+            let duration_ms = job.job.elapsed().as_millis() as u64;
+            info!(
+                task_id = job.task_id,
+                engineer = %job.engineer,
+                duration_ms,
+                "chat merge verification finished"
+            );
+            let reply = match self.finish_chat_merge(job.task_id, &job.engineer, result) {
+                Ok(reply) => reply,
+                Err(error) => format!("Command failed: {error}"),
+            };
+            self.send_chat_reply(&job.reply_to, &reply);
+        }
+    }
+
+    fn finish_chat_merge(
+        &mut self,
+        task_id: u32,
+        engineer: &str,
+        result: Result<crate::team::test_results::TestRunOutput>,
+    ) -> Result<String> {
+        let test_run = result?;
         if !test_run.passed {
             bail!(
                 "Task #{task_id} verification failed before merge.\n{}",
@@ -333,7 +422,24 @@ impl TeamDaemon {
             );
         }
 
-        crate::team::messaging::merge_worktree(&self.config.project_root, &engineer)?;
+        // The board may have changed while the tests ran; re-check before
+        // merging so a stale pass is never merged.
+        let board_dir = self.board_dir();
+        let task_path = crate::team::task_cmd::find_task_path(&board_dir, task_id)?;
+        let task = crate::task::Task::from_file(&task_path)?;
+        if task.status != "review"
+            || engineer_for_merge_task(&self.config.project_root, task_id)? != engineer
+        {
+            info!(
+                task_id,
+                engineer,
+                status = %task.status,
+                "discarding stale chat merge verification: task changed while tests ran"
+            );
+            bail!("Task #{task_id} changed while its tests ran; merge skipped.");
+        }
+
+        crate::team::messaging::merge_worktree(&self.config.project_root, engineer)?;
         crate::team::task_cmd::cmd_review_structured_with_attribution(
             &board_dir,
             task_id,
@@ -351,6 +457,28 @@ impl TeamDaemon {
         Ok(format!(
             "Merged Task #{task_id} from {engineer}. Tests: {test_summary}"
         ))
+    }
+
+    pub(super) fn send_chat_reply(&self, target: &background_tests::ChatReplyTarget, reply: &str) {
+        match target {
+            background_tests::ChatReplyTarget::None => {
+                info!(reply = %reply, "background chat command finished");
+            }
+            background_tests::ChatReplyTarget::Telegram { chat_id } => {
+                if let Some(bot) = self.telegram_bot.as_ref()
+                    && let Err(error) = bot.send_message(&chat_id.to_string(), reply)
+                {
+                    warn!(chat_id, error = %error, "failed to send telegram reply");
+                }
+            }
+            background_tests::ChatReplyTarget::Discord => {
+                if let Some(bot) = self.discord_bot.as_ref()
+                    && let Err(error) = bot.send_command_reply(reply)
+                {
+                    warn!(error = %error, "failed to send discord command reply");
+                }
+            }
+        }
     }
 
     pub(super) fn execute_telegram_kick_command(&mut self, member: &str) -> Result<String> {
@@ -1153,6 +1281,7 @@ mod tests {
             pending_delivery_queue: HashMap::new(),
             pending_shim_acks: HashMap::new(),
             verification_states: HashMap::new(),
+            background_tests: Default::default(),
             narration_rejection_counts: HashMap::new(),
             zero_diff_completion_counts: HashMap::new(),
             shim_handles,
@@ -1311,6 +1440,7 @@ mod tests {
             pending_delivery_queue: HashMap::new(),
             pending_shim_acks: HashMap::new(),
             verification_states: HashMap::new(),
+            background_tests: Default::default(),
             narration_rejection_counts: HashMap::new(),
             zero_diff_completion_counts: HashMap::new(),
             shim_handles: HashMap::new(),
@@ -1488,6 +1618,7 @@ mod tests {
             pending_delivery_queue: HashMap::new(),
             pending_shim_acks: HashMap::new(),
             verification_states: HashMap::new(),
+            background_tests: Default::default(),
             narration_rejection_counts: HashMap::new(),
             zero_diff_completion_counts: HashMap::new(),
             shim_handles: HashMap::new(),
@@ -2606,6 +2737,46 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("not in review"));
+    }
+
+    #[test]
+    fn telegram_merge_command_verifies_in_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_board_task(
+            tmp.path(),
+            "task-41.md",
+            "---\nid: 41\ntitle: Merge me\nstatus: review\npriority: high\nclaimed_by: eng-1\nclass: standard\n---\n",
+        );
+        let mut daemon = TeamDaemon::new(daemon_config_with_roles(tmp.path(), Vec::new())).unwrap();
+
+        let reply = daemon
+            .execute_telegram_command(TelegramCommand::Merge { task_id: 41 })
+            .unwrap();
+        assert!(reply.contains("Running verification"), "{reply}");
+        assert_eq!(daemon.background_tests.chat_merges.len(), 1);
+
+        let again = daemon
+            .execute_telegram_command(TelegramCommand::Merge { task_id: 41 })
+            .unwrap();
+        assert!(again.contains("already being verified"), "{again}");
+        assert_eq!(daemon.background_tests.chat_merges.len(), 1);
+
+        // The engineer worktree does not exist, so verification fails and the
+        // job is drained without merging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !daemon.background_tests.chat_merges.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "chat merge never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            daemon.poll_chat_merge_jobs();
+        }
+        let task = crate::task::Task::from_file(
+            &crate::team::task_cmd::find_task_path(&daemon.board_dir(), 41).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task.status, "review");
     }
 
     #[test]

@@ -119,6 +119,10 @@ pub(super) struct PersistedDaemonState {
     /// u64-only form (pre-v0.11.60) and the full struct form.
     #[serde(default)]
     pub recently_released_by: HashMap<String, PersistedReleaseRecord>,
+    /// Completion verifications (engineer -> task id) that were running or
+    /// queued to re-run when the daemon stopped; re-run after restart.
+    #[serde(default)]
+    pub pending_verifications: HashMap<String, u32>,
 }
 
 impl TeamDaemon {
@@ -165,6 +169,7 @@ impl TeamDaemon {
             schedule.paused = persisted.paused;
         }
         self.pipeline_starvation_fired = state.pipeline_starvation_fired;
+        self.background_tests.retriggers = state.pending_verifications;
         self.restore_optional_subsystem_budget_state(
             &state.optional_subsystem_backoff,
             &state.optional_subsystem_disabled_remaining_secs,
@@ -289,6 +294,7 @@ impl TeamDaemon {
                     )
                 })
                 .collect(),
+            pending_verifications: self.background_tests.pending_verifications(),
         };
         save_daemon_state(&self.config.project_root, &state)
     }

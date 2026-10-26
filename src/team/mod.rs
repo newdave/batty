@@ -93,6 +93,7 @@ pub mod telegram;
 pub mod telemetry_db;
 #[cfg(test)]
 pub mod test_helpers;
+pub(crate) mod test_job;
 pub mod test_results;
 #[cfg(test)]
 pub mod test_support;
