@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,6 +23,7 @@ use chrono::TimeZone;
 use regex::Regex;
 
 use super::codex_types::{self, CodexEvent};
+use super::common::shim_eprintln;
 use super::common::{
     self, MAX_QUEUE_DEPTH, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors,
     format_injected_message,
@@ -36,6 +38,9 @@ use super::runtime::ShimArgs;
 
 const PROCESS_EXIT_POLL_MS: u64 = 100;
 const GROUP_TERM_GRACE_SECS: u64 = 2;
+/// Retries after a thread-store "active writer" conflict before failing the turn.
+const THREAD_CONFLICT_MAX_RETRIES: u32 = 3;
+const THREAD_CONFLICT_RETRY_DELAY_MS: u64 = 2000;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -80,7 +85,7 @@ struct CodexState {
 /// subprocess. The shim manages the lifecycle per-message and emits the same
 /// `Command`/`Event` protocol to the orchestrator.
 pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
-    eprintln!("[shim-codex {}] started (spawn-per-message mode)", args.id);
+    shim_eprintln!("[shim-codex {}] started (spawn-per-message mode)", args.id);
 
     let launch_context = super::codex_session::LaunchContext::load(&args.cwd, &args.id)?;
 
@@ -159,11 +164,11 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
         let cmd = match cmd_channel.recv::<ShimCommand>() {
             Ok(Some(c)) => c,
             Ok(None) => {
-                eprintln!("[shim-codex {shim_id}] orchestrator disconnected");
+                shim_eprintln!("[shim-codex {shim_id}] orchestrator disconnected");
                 break;
             }
             Err(e) => {
-                eprintln!("[shim-codex {shim_id}] channel error: {e}");
+                shim_eprintln!("[shim-codex {shim_id}] channel error: {e}");
                 break;
             }
         };
@@ -337,13 +342,13 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
             }
 
             ShimCommand::Shutdown { reason, .. } => {
-                eprintln!(
+                shim_eprintln!(
                     "[shim-codex {shim_id}] shutdown requested ({})",
                     reason.label()
                 );
                 stop_codex_exec(&state_cmd);
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
-                    eprintln!(
+                    shim_eprintln!(
                         "[shim-codex {shim_id}] failed to preserve work before shutdown: {error:#}"
                     );
                 }
@@ -357,7 +362,7 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
             ShimCommand::Kill => {
                 stop_codex_exec(&state_cmd);
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
-                    eprintln!(
+                    shim_eprintln!(
                         "[shim-codex {shim_id}] failed to preserve work before kill: {error:#}"
                     );
                 }
@@ -391,6 +396,93 @@ fn run_codex_exec(
     evt_channel: &mut Channel,
     pty_log: Option<&Arc<Mutex<PtyLogWriter>>>,
 ) {
+    run_codex_exec_attempt(
+        shim_id,
+        program,
+        args,
+        prompt,
+        cwd,
+        state,
+        evt_channel,
+        pty_log,
+        0,
+    );
+}
+
+/// True when codex reports another writer already owns the thread.
+fn is_thread_store_conflict(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("already has an active writer") || lower.contains("thread-store conflict")
+}
+
+/// Thread id of a `codex exec ... resume <id> -` argument list.
+fn resume_thread_id(args: &[String]) -> Option<&str> {
+    let pos = args.iter().position(|a| a == "resume")?;
+    args.get(pos + 1).map(String::as_str)
+}
+
+/// Terminate any other process still running `codex exec ... resume <thread>`
+/// (left behind by a killed shim, hot reload or timed-out turn) so two codex
+/// processes never write the same thread. Returns the pids signalled.
+fn kill_stale_codex_for_thread(thread_id: &str) -> Vec<u32> {
+    #[cfg(unix)]
+    {
+        let Ok(output) = Command::new("pgrep")
+            .args(["-f", &format!("exec .*resume {thread_id}")])
+            .output()
+        else {
+            return Vec::new();
+        };
+        let me = std::process::id();
+        let pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .filter(|pid| *pid != me)
+            .collect();
+        for pid in &pids {
+            unsafe {
+                libc::kill(-(*pid as i32), libc::SIGTERM);
+                libc::kill(*pid as i32, libc::SIGTERM);
+            }
+        }
+        if !pids.is_empty() {
+            thread::sleep(Duration::from_millis(PROCESS_EXIT_POLL_MS * 5));
+            for pid in &pids {
+                unsafe {
+                    libc::kill(-(*pid as i32), libc::SIGKILL);
+                    libc::kill(*pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        pids
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = thread_id;
+        Vec::new()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_codex_exec_attempt(
+    shim_id: &str,
+    program: &str,
+    args: &[String],
+    prompt: &str,
+    cwd: &std::path::Path,
+    state: &Arc<Mutex<CodexState>>,
+    evt_channel: &mut Channel,
+    pty_log: Option<&Arc<Mutex<PtyLogWriter>>>,
+    conflict_retries: u32,
+) {
+    if let Some(tid) = resume_thread_id(args) {
+        let killed = kill_stale_codex_for_thread(tid);
+        if !killed.is_empty() {
+            shim_eprintln!(
+                "[shim-codex {shim_id}] terminated stale codex process(es) {killed:?} for thread {tid}"
+            );
+        }
+    }
     // Spawn the subprocess
     let mut command = Command::new(program);
     command
@@ -413,7 +505,7 @@ fn run_codex_exec(
         Ok(c) => c,
         Err(e) => {
             drop(start_guard);
-            eprintln!("[shim-codex {shim_id}] failed to spawn codex exec: {e}");
+            shim_eprintln!("[shim-codex {shim_id}] failed to spawn codex exec: {e}");
             let mut st = state.lock().unwrap();
             let msg_id = st.pending_message_id.take();
             let drained = fail_queued_messages(&mut st.message_queue);
@@ -450,12 +542,12 @@ fn run_codex_exec(
         state: Arc::clone(state),
     };
     let child_pid = child.lock().unwrap().id();
-    eprintln!("[shim-codex {shim_id}] codex exec spawned (pid {child_pid})");
+    shim_eprintln!("[shim-codex {shim_id}] codex exec spawned (pid {child_pid})");
 
     let stdin = child.lock().unwrap().stdin.take();
     if let Some(mut stdin) = stdin {
         if let Err(e) = stdin.write_all(prompt.as_bytes()) {
-            eprintln!("[shim-codex {shim_id}] failed to write prompt to stdin: {e}");
+            shim_eprintln!("[shim-codex {shim_id}] failed to write prompt to stdin: {e}");
         }
     }
 
@@ -468,12 +560,17 @@ fn run_codex_exec(
     // stderr thread against the stdout JSONL path.
     let shim_id_err = shim_id.to_string();
     let pty_log_err = pty_log.map(Arc::clone);
+    let thread_conflict = Arc::new(AtomicBool::new(false));
+    let thread_conflict_err = Arc::clone(&thread_conflict);
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line_result in reader.lines() {
             match line_result {
                 Ok(line) => {
-                    eprintln!("[shim-codex {shim_id_err}] stderr: {line}");
+                    shim_eprintln!("[shim-codex {shim_id_err}] stderr: {line}");
+                    if is_thread_store_conflict(&line) {
+                        thread_conflict_err.store(true, Ordering::SeqCst);
+                    }
                     if let Some(ref log) = pty_log_err {
                         let _ = log
                             .lock()
@@ -495,7 +592,7 @@ fn run_codex_exec(
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[shim-codex {shim_id}] stdout read error: {e}");
+                shim_eprintln!("[shim-codex {shim_id}] stdout read error: {e}");
                 break;
             }
         };
@@ -540,7 +637,7 @@ fn run_codex_exec(
         let evt: CodexEvent = match serde_json::from_str(&line) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[shim-codex {shim_id}] ignoring unparseable JSONL: {e}");
+                shim_eprintln!("[shim-codex {shim_id}] ignoring unparseable JSONL: {e}");
                 continue;
             }
         };
@@ -619,7 +716,7 @@ fn run_codex_exec(
 
             "turn.failed" => {
                 let error_msg = evt.error_message().unwrap_or("unknown error").to_string();
-                eprintln!("[shim-codex {shim_id}] turn failed: {error_msg}");
+                shim_eprintln!("[shim-codex {shim_id}] turn failed: {error_msg}");
 
                 // Non-recoverable auth failure: the codex refresh token has
                 // been consumed. No amount of respawning fixes this — a
@@ -688,7 +785,7 @@ fn run_codex_exec(
 
             "error" => {
                 let error_msg = evt.error_message().unwrap_or("stream error").to_string();
-                eprintln!("[shim-codex {shim_id}] error event: {error_msg}");
+                shim_eprintln!("[shim-codex {shim_id}] error event: {error_msg}");
 
                 // Non-recoverable auth failure short-circuits before quota
                 // detection so we never treat a dead refresh token as a
@@ -716,7 +813,7 @@ fn run_codex_exec(
                     || lower.contains("billing")
                     || lower.contains("purchase more credits")
                 {
-                    eprintln!("[shim-codex {shim_id}] QUOTA EXHAUSTED: {error_msg}");
+                    shim_eprintln!("[shim-codex {shim_id}] QUOTA EXHAUSTED: {error_msg}");
                     if let Some(quota_block) = detect_quota_block(&error_msg) {
                         let mut st = state.lock().unwrap();
                         st.pending_message_id = None;
@@ -775,6 +872,38 @@ fn run_codex_exec(
             return;
         }
         if !exit_status.is_some_and(|status| status.success()) || !turn_completed {
+            // Give the stderr reader a moment to see the conflict line.
+            if !turn_completed && conflict_retries < THREAD_CONFLICT_MAX_RETRIES {
+                drop(st);
+                thread::sleep(Duration::from_millis(PROCESS_EXIT_POLL_MS));
+                if thread_conflict.load(Ordering::SeqCst) {
+                    shim_eprintln!(
+                        "[shim-codex {shim_id}] thread has another active writer; retrying ({}/{})",
+                        conflict_retries + 1,
+                        THREAD_CONFLICT_MAX_RETRIES
+                    );
+                    thread::sleep(Duration::from_millis(THREAD_CONFLICT_RETRY_DELAY_MS));
+                    if state.lock().unwrap().state == ShimState::Dead {
+                        return;
+                    }
+                    terminate_child(&mut child.lock().unwrap());
+                    return run_codex_exec_attempt(
+                        shim_id,
+                        program,
+                        args,
+                        prompt,
+                        cwd,
+                        state,
+                        evt_channel,
+                        pty_log,
+                        conflict_retries + 1,
+                    );
+                }
+                st = state.lock().unwrap();
+                if st.state == ShimState::Dead {
+                    return;
+                }
+            }
             let message_id = st.pending_message_id.take();
             let drained = fail_queued_messages(&mut st.message_queue);
             st.state = ShimState::Idle;
@@ -937,6 +1066,44 @@ fn detect_auth_required(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("refresh token was already used")
         || (lower.contains("failed to refresh token") && lower.contains("log out and sign in"))
+}
+
+#[cfg(test)]
+mod thread_conflict_tests {
+    use super::*;
+
+    #[test]
+    fn detects_thread_store_conflict() {
+        assert!(is_thread_store_conflict(
+            "ERROR codex_core::session: Failed to create session: thread-store conflict: thread x already has an active writer"
+        ));
+        assert!(!is_thread_store_conflict("stream error"));
+    }
+
+    #[test]
+    fn extracts_resume_thread_id() {
+        let (_, args) = codex_types::codex_sdk_args_with_options("codex", Some("abc"), None, None);
+        assert_eq!(resume_thread_id(&args), Some("abc"));
+        let (_, fresh) = codex_types::codex_sdk_args_with_options("codex", None, None, None);
+        assert_eq!(resume_thread_id(&fresh), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_codex_for_same_thread_is_killed_before_resume() {
+        let tid = uuid::Uuid::new_v4().to_string();
+        let mut stale = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30; : codex exec --json resume {tid} -"))
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let killed = kill_stale_codex_for_thread(&tid);
+        assert!(killed.contains(&stale.id()));
+        let status = stale.wait().unwrap();
+        assert!(!status.success());
+        assert!(kill_stale_codex_for_thread(&tid).is_empty());
+    }
 }
 
 #[cfg(test)]

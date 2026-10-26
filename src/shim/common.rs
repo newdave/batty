@@ -18,6 +18,44 @@ pub const SESSION_STATS_INTERVAL_SECS: u64 = 10;
 pub const TEST_FAILURE_MAX_ITERATIONS: u8 = 5;
 
 // ---------------------------------------------------------------------------
+// Log lines
+// ---------------------------------------------------------------------------
+
+/// Write one complete log line (newline included) to stderr with a single
+/// `write_all`. `eprintln!` issues a separate write per format piece, so lines
+/// from several shim processes sharing the daemon log fd interleave mid-line.
+pub fn write_log_line(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let line = format_log_line(args);
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+}
+
+fn format_log_line(args: std::fmt::Arguments<'_>) -> String {
+    let mut line = std::fmt::format(args);
+    line.push('\n');
+    line
+}
+
+#[cfg(test)]
+mod log_line_tests {
+    use super::format_log_line;
+
+    #[test]
+    fn log_line_is_single_buffer_with_trailing_newline() {
+        let line = format_log_line(format_args!("[shim-codex {}] stderr: {}", "e1", "boom"));
+        assert_eq!(line, "[shim-codex e1] stderr: boom\n");
+    }
+}
+
+/// Drop-in replacement for `eprintln!` that emits each line atomically.
+macro_rules! shim_eprintln {
+    ($($arg:tt)*) => {
+        $crate::shim::common::write_log_line(format_args!($($arg)*))
+    };
+}
+pub(crate) use shim_eprintln;
+
+// ---------------------------------------------------------------------------
 // Message formatting
 // ---------------------------------------------------------------------------
 

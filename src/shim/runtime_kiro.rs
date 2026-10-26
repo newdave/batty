@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use super::common::shim_eprintln;
 use super::common::{
     self, MAX_QUEUE_DEPTH, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors,
     format_injected_message,
@@ -97,9 +98,10 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
         .with_context(|| format!("[shim-kiro {}] failed to spawn kiro-cli acp", args.id))?;
 
     let child_pid = child.id();
-    eprintln!(
+    shim_eprintln!(
         "[shim-kiro {}] spawned kiro-cli acp (pid {})",
-        args.id, child_pid
+        args.id,
+        child_pid
     );
 
     let child_stdin = child.stdin.take().context("failed to take child stdin")?;
@@ -144,7 +146,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
         let init_req = kiro_types::initialize_request(next_request_id());
         let ndjson = init_req.to_ndjson();
         write_stdin(&stdin_writer, &ndjson);
-        eprintln!("[shim-kiro {}] sent initialize request", args.id);
+        shim_eprintln!("[shim-kiro {}] sent initialize request", args.id);
     }
 
     // -- stdout reader thread --
@@ -159,7 +161,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
             let line = match line_result {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[shim-kiro {shim_id}] stdout read error: {e}");
+                    shim_eprintln!("[shim-kiro {shim_id}] stdout read error: {e}");
                     break;
                 }
             };
@@ -171,7 +173,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
             let msg: AcpMessage = match serde_json::from_str(&line) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("[shim-kiro {shim_id}] ignoring unparseable NDJSON: {e}");
+                    shim_eprintln!("[shim-kiro {shim_id}] ignoring unparseable NDJSON: {e}");
                     continue;
                 }
             };
@@ -181,7 +183,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                 let msg_id = msg.id.unwrap();
 
                 if let Some(ref error) = msg.error {
-                    eprintln!("[shim-kiro {shim_id}] JSON-RPC error (id={msg_id}): {error}");
+                    shim_eprintln!("[shim-kiro {shim_id}] JSON-RPC error (id={msg_id}): {error}");
                     // Check if this was a prompt request that failed
                     let mut st = state_stdout.lock().unwrap();
                     if st.pending_prompt_request_id == Some(msg_id) {
@@ -248,7 +250,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                             kiro_types::session_new_request(next_request_id(), &cwd_for_init);
                         let ndjson = session_req.to_ndjson();
                         write_stdin(&stdin_for_approve, &ndjson);
-                        eprintln!("[shim-kiro {shim_id}] sent session/new request");
+                        shim_eprintln!("[shim-kiro {shim_id}] sent session/new request");
                         continue;
                     }
 
@@ -259,7 +261,10 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                             st.initialized = true;
                             st.state = ShimState::Idle;
                             st.state_changed_at = Instant::now();
-                            eprintln!("[shim-kiro {shim_id}] session created: {}", st.session_id);
+                            shim_eprintln!(
+                                "[shim-kiro {shim_id}] session created: {}",
+                                st.session_id
+                            );
                             drop(st);
 
                             // Now emit Ready — agent is ready for messages
@@ -462,7 +467,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
 
                     "_kiro.dev/compaction/status" | "_kiro.dev/clear/status" => {
                         // Informational — log only
-                        eprintln!("[shim-kiro {shim_id}] {method}: {params:?}");
+                        shim_eprintln!("[shim-kiro {shim_id}] {method}: {params:?}");
                     }
 
                     _ => {
@@ -483,7 +488,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                         let resp = kiro_types::permission_approve_response(request_id);
                         let ndjson = resp.to_ndjson();
                         write_stdin(&stdin_for_approve, &ndjson);
-                        eprintln!(
+                        shim_eprintln!(
                             "[shim-kiro {shim_id}] auto-approved permission request {request_id}"
                         );
                     }
@@ -553,7 +558,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
         for line_result in reader.lines() {
             match line_result {
                 Ok(line) => {
-                    eprintln!("[shim-kiro {shim_id_err}] stderr: {line}");
+                    shim_eprintln!("[shim-kiro {shim_id_err}] stderr: {line}");
                     if let Some(ref log) = pty_log_stderr {
                         let _ = log
                             .lock()
@@ -606,15 +611,16 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                 break;
             }
             if st.state == ShimState::Dead {
-                eprintln!("[shim-kiro {}] agent died during initialization", args.id);
+                shim_eprintln!("[shim-kiro {}] agent died during initialization", args.id);
                 return Ok(());
             }
             drop(st);
 
             if Instant::now() > deadline {
-                eprintln!(
+                shim_eprintln!(
                     "[shim-kiro {}] initialization timed out after {}s",
-                    args.id, INIT_TIMEOUT_SECS
+                    args.id,
+                    INIT_TIMEOUT_SECS
                 );
                 terminate_child(&mut child);
                 return Ok(());
@@ -629,7 +635,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
         let cmd = match cmd_channel.recv::<ShimCommand>() {
             Ok(Some(c)) => c,
             Ok(None) => {
-                eprintln!(
+                shim_eprintln!(
                     "[shim-kiro {}] orchestrator disconnected, shutting down",
                     args.id
                 );
@@ -637,7 +643,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                 break;
             }
             Err(e) => {
-                eprintln!("[shim-kiro {}] channel error: {e}", args.id);
+                shim_eprintln!("[shim-kiro {}] channel error: {e}", args.id);
                 terminate_child(&mut child);
                 break;
             }
@@ -783,14 +789,14 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                 timeout_secs,
                 reason,
             } => {
-                eprintln!(
+                shim_eprintln!(
                     "[shim-kiro {}] shutdown requested ({}, timeout: {}s)",
                     args.id,
                     reason.label(),
                     timeout_secs
                 );
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
-                    eprintln!("[shim-kiro {}] work preservation failed: {error}", args.id);
+                    shim_eprintln!("[shim-kiro {}] work preservation failed: {error}", args.id);
                 }
                 // Take stdin out of the shared Option to truly close it.
                 // The stdout reader thread also holds an Arc clone, but taking
@@ -816,7 +822,7 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
 
             ShimCommand::Kill => {
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
-                    eprintln!("[shim-kiro {}] work preservation failed: {error}", args.id);
+                    shim_eprintln!("[shim-kiro {}] work preservation failed: {error}", args.id);
                 }
                 terminate_child(&mut child);
                 break;

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use super::common::shim_eprintln;
 use super::common::{
     self, MAX_QUEUE_DEPTH, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors,
     format_injected_message,
@@ -106,9 +107,10 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
         .with_context(|| format!("[shim-sdk {}] failed to spawn agent", args.id))?;
 
     let child_pid = child.id();
-    eprintln!(
+    shim_eprintln!(
         "[shim-sdk {}] spawned agent subprocess (pid {})",
-        args.id, child_pid
+        args.id,
+        child_pid
     );
 
     let child_stdin = child.stdin.take().context("failed to take child stdin")?;
@@ -195,7 +197,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
             let line = match line_result {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[shim-sdk {shim_id}] stdout read error: {e}");
+                    shim_eprintln!("[shim-sdk {shim_id}] stdout read error: {e}");
                     break;
                 }
             };
@@ -207,7 +209,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
             let msg: SdkOutput = match serde_json::from_str(&line) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("[shim-sdk {shim_id}] ignoring unparseable NDJSON line: {e}");
+                    shim_eprintln!("[shim-sdk {shim_id}] ignoring unparseable NDJSON line: {e}");
                     continue;
                 }
             };
@@ -513,7 +515,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
         for line_result in reader.lines() {
             match line_result {
                 Ok(line) => {
-                    eprintln!("[shim-sdk {shim_id_err}] stderr: {line}");
+                    shim_eprintln!("[shim-sdk {shim_id_err}] stderr: {line}");
                     if let Some(ref log) = pty_log_stderr {
                         let _ = log
                             .lock()
@@ -572,7 +574,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
         let cmd = match cmd_channel.recv::<ShimCommand>() {
             Ok(Some(c)) => c,
             Ok(None) => {
-                eprintln!(
+                shim_eprintln!(
                     "[shim-sdk {}] orchestrator disconnected, shutting down",
                     args.id
                 );
@@ -595,7 +597,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                 continue;
             }
             Err(e) => {
-                eprintln!("[shim-sdk {}] channel error: {e}", args.id);
+                shim_eprintln!("[shim-sdk {}] channel error: {e}", args.id);
                 terminate_child(&mut child);
                 break;
             }
@@ -745,14 +747,14 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                 timeout_secs,
                 reason,
             } => {
-                eprintln!(
+                shim_eprintln!(
                     "[shim-sdk {}] shutdown requested ({}, timeout: {}s)",
                     args.id,
                     reason.label(),
                     timeout_secs
                 );
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
-                    eprintln!("[shim-sdk {}] work preservation failed: {error}", args.id);
+                    shim_eprintln!("[shim-sdk {}] work preservation failed: {error}", args.id);
                 }
                 // Close stdin to signal EOF to the subprocess
                 drop(stdin_writer);
@@ -773,7 +775,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
 
             ShimCommand::Kill => {
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
-                    eprintln!("[shim-sdk {}] work preservation failed: {error}", args.id);
+                    shim_eprintln!("[shim-sdk {}] work preservation failed: {error}", args.id);
                 }
                 terminate_child(&mut child);
                 break;
@@ -1044,7 +1046,7 @@ fn force_stalled_completion(
     let previous_state = st.state;
     let queued_message = st.message_queue.pop_front();
 
-    eprintln!(
+    shim_eprintln!(
         "[shim-sdk {shim_id}] STALL DETECTED after {}s while working",
         WORKING_READ_TIMEOUT.as_secs()
     );

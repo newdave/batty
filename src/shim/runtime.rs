@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, PtySize};
 
 use super::classifier::{self, AgentType, ScreenVerdict};
+use super::common::shim_eprintln;
 use super::common::{self, QueuedMessage};
 use super::protocol::{Channel, Command, Event, ShimState};
 use super::pty_log::PtyLogWriter;
@@ -1180,7 +1181,7 @@ pub fn run(args: ShimArgs, channel: Channel) -> Result<()> {
                         let enter = enter_seq(inner.agent_type);
                         inner.dialogs_dismissed = attempt;
                         drop(inner);
-                        eprintln!(
+                        shim_eprintln!(
                             "[shim {}] auto-dismissing startup dialog (attempt {attempt})",
                             args.id
                         );
@@ -1244,7 +1245,7 @@ pub fn run(args: ShimArgs, channel: Channel) -> Result<()> {
         let cmd = match cmd_channel.recv::<Command>() {
             Ok(Some(c)) => c,
             Ok(None) => {
-                eprintln!(
+                shim_eprintln!(
                     "[shim {}] orchestrator disconnected, shutting down",
                     args.id
                 );
@@ -1252,7 +1253,7 @@ pub fn run(args: ShimArgs, channel: Channel) -> Result<()> {
                 break;
             }
             Err(e) => {
-                eprintln!("[shim {}] channel error: {e}", args.id);
+                shim_eprintln!("[shim {}] channel error: {e}", args.id);
                 terminate_agent_group(&mut child, Duration::from_secs(GROUP_TERM_GRACE_SECS)).ok();
                 break;
             }
@@ -1417,16 +1418,17 @@ pub fn run(args: ShimArgs, channel: Channel) -> Result<()> {
                 timeout_secs,
                 reason,
             } => {
-                eprintln!(
+                shim_eprintln!(
                     "[shim {}] shutdown requested ({}, timeout: {}s)",
                     args.id,
                     reason.label(),
                     timeout_secs
                 );
                 if let Err(error) = args.preserve_work_before_kill(&args.cwd) {
-                    eprintln!(
+                    shim_eprintln!(
                         "[shim {}] auto-save before shutdown failed: {}",
-                        args.id, error
+                        args.id,
+                        error
                     );
                 }
                 {
@@ -1454,7 +1456,7 @@ pub fn run(args: ShimArgs, channel: Channel) -> Result<()> {
 
             Command::Kill => {
                 if let Err(error) = args.preserve_work_before_kill(&args.cwd) {
-                    eprintln!("[shim {}] auto-save before kill failed: {}", args.id, error);
+                    shim_eprintln!("[shim {}] auto-save before kill failed: {}", args.id, error);
                 }
                 terminate_agent_group(&mut child, Duration::from_secs(GROUP_TERM_GRACE_SECS)).ok();
                 break;
