@@ -1054,7 +1054,7 @@ fn ensure_shared_cargo_target_config(project_root: &Path, worktree_dir: &Path) -
         Ok(_) | Err(_) => {}
     }
 
-    std::fs::write(&config_path, managed)
+    crate::atomic_file::write(&config_path, managed)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
     Ok(())
 }
@@ -1115,7 +1115,7 @@ fn ensure_engineer_worktree_excludes(worktree_dir: &Path) -> Result<()> {
         }
     }
 
-    std::fs::write(&exclude_path, content)
+    crate::atomic_file::write(&exclude_path, content)
         .with_context(|| format!("failed to write {}", exclude_path.display()))?;
     Ok(())
 }
@@ -1571,6 +1571,29 @@ pub(crate) fn preserve_worktree_with_commit(
     preserve_worktree_with_commit_for(worktree_dir, commit_message, timeout, "task-loop/preserve")
 }
 
+/// `-c` overrides that give git a placeholder identity when the repo has none
+/// configured, so preservation commits cannot fail with "Please tell me who
+/// you are". Returns an empty slice when git can already resolve an identity.
+pub(crate) fn fallback_identity_args(dir: &Path) -> &'static [&'static str] {
+    let has_identity = ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"]
+        .iter()
+        .all(|var| {
+            Command::new("git")
+                .args(["var", var])
+                .current_dir(dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+    if has_identity {
+        &[]
+    } else {
+        &["-c", "user.name=batty", "-c", "user.email=batty@localhost"]
+    }
+}
+
 pub(crate) fn preserve_worktree_with_commit_for(
     worktree_dir: &Path,
     commit_message: &str,
@@ -1599,19 +1622,17 @@ pub(crate) fn preserve_worktree_with_commit_for(
         }
 
         log_worktree_mutation_audit(worktree_dir, subsystem, "git commit", &staged_paths);
-        run_git_with_timeout(
-            worktree_dir,
-            &[
-                "-c",
-                "commit.gpgSign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "commit",
-                "-m",
-                commit_message,
-            ],
-            timeout,
-        )?;
+        let mut commit_args: Vec<&str> = fallback_identity_args(worktree_dir).to_vec();
+        commit_args.extend([
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-m",
+            commit_message,
+        ]);
+        run_git_with_timeout(worktree_dir, &commit_args, timeout)?;
         Ok(true)
     })();
 
@@ -4314,5 +4335,36 @@ mod tests {
             resolve_main_smoke_command(root, Some("make smoke"), None).as_deref(),
             Some("make smoke")
         );
+    }
+
+    #[test]
+    fn preserve_commit_uses_fallback_identity_when_none_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::team::test_support::init_git_repo(&tmp, "preserve-no-identity");
+        // Blank local identity overrides any global one and makes git refuse.
+        git_ok(&repo, &["config", "user.name", ""]);
+        git_ok(&repo, &["config", "user.email", ""]);
+        git_ok(&repo, &["config", "user.useConfigOnly", "true"]);
+        assert!(!fallback_identity_args(&repo).is_empty());
+        std::fs::write(repo.join("wip.txt"), "wip\n").unwrap();
+
+        let preserved = preserve_worktree_with_commit_for(
+            &repo,
+            "wip: no identity",
+            Duration::from_secs(10),
+            "test",
+        )
+        .unwrap();
+
+        assert!(preserved);
+        let author = git_stdout(&repo, &["log", "-1", "--format=%an <%ae>"]);
+        assert_eq!(author, "batty <batty@localhost>");
+    }
+
+    #[test]
+    fn fallback_identity_args_empty_when_identity_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::team::test_support::init_git_repo(&tmp, "preserve-identity");
+        assert!(fallback_identity_args(&repo).is_empty());
     }
 }

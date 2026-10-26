@@ -10,7 +10,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
+/// Run git and return its output only if it exited successfully.
+///
+/// A nonzero exit becomes an error carrying the command, directory, intent,
+/// and stderr. Use [`run_git_with_context_allow_fail`] when the caller
+/// inspects the exit status itself (probes, conflict detection, best-effort
+/// cleanup).
 pub(crate) fn run_git_with_context(
+    repo_dir: &Path,
+    args: &[&str],
+    intent: &str,
+) -> Result<std::process::Output> {
+    let output = run_git_with_context_allow_fail(repo_dir, args, intent)?;
+    if !output.status.success() {
+        bail!(
+            "{} ({})",
+            describe_git_failure(
+                repo_dir,
+                args,
+                intent,
+                &String::from_utf8_lossy(&output.stderr)
+            ),
+            output.status
+        );
+    }
+    Ok(output)
+}
+
+/// Run git and return its output whatever the exit status. Only spawn
+/// failures are errors; the caller must check `output.status`.
+pub(crate) fn run_git_with_context_allow_fail(
     repo_dir: &Path,
     args: &[&str],
     intent: &str,
@@ -32,7 +61,7 @@ pub(crate) fn run_git_with_context(
 /// Abort an in-progress merge left behind by a failed `git merge`, so the
 /// checkout does not stay in a MERGING state with conflict markers.
 pub(crate) fn abort_failed_merge(repo_dir: &Path) {
-    let merging = run_git_with_context(
+    let merging = run_git_with_context_allow_fail(
         repo_dir,
         &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
         "check for in-progress merge",
@@ -41,7 +70,7 @@ pub(crate) fn abort_failed_merge(repo_dir: &Path) {
     if !merging {
         return;
     }
-    match run_git_with_context(repo_dir, &["merge", "--abort"], "abort failed merge") {
+    match run_git_with_context_allow_fail(repo_dir, &["merge", "--abort"], "abort failed merge") {
         Ok(output) if output.status.success() => {
             info!(repo = %repo_dir.display(), "aborted failed merge");
         }
@@ -75,7 +104,7 @@ pub(crate) fn commits_ahead_of_main(worktree_dir: &Path) -> Result<u32> {
 
 pub(crate) fn commits_ahead_of_trunk(worktree_dir: &Path, trunk_branch: &str) -> Result<u32> {
     let range = format!("{trunk_branch}..HEAD");
-    let output = run_git_with_context(
+    let output = run_git_with_context_allow_fail(
         worktree_dir,
         &["rev-list", "--count", &range],
         &format!("count commits ahead of {trunk_branch} before accepting engineer completion"),
@@ -114,7 +143,7 @@ pub(crate) fn diff_stat_from_main(worktree_dir: &Path) -> Result<String> {
 
 pub(crate) fn diff_stat_from_trunk(worktree_dir: &Path, trunk_branch: &str) -> Result<String> {
     let range = format!("{trunk_branch}...HEAD");
-    let output = run_git_with_context(
+    let output = run_git_with_context_allow_fail(
         worktree_dir,
         &["diff", "--stat", &range],
         &format!("check diff stat between {trunk_branch} and HEAD for narration-only detection"),
@@ -143,7 +172,7 @@ pub(crate) fn changed_paths_from_trunk(
     trunk_branch: &str,
 ) -> Result<Vec<PathBuf>> {
     let range = format!("{trunk_branch}...HEAD");
-    let output = run_git_with_context(
+    let output = run_git_with_context_allow_fail(
         worktree_dir,
         &["diff", "--name-only", &range],
         &format!("list changed paths between {trunk_branch} and HEAD for narration-only detection"),
@@ -276,7 +305,7 @@ pub(crate) fn now_unix() -> u64 {
 /// so `checkout -B` can succeed.
 /// Best-effort: failures are logged but do not block the reset attempt.
 pub(crate) fn force_clean_worktree(worktree_dir: &Path, engineer_name: &str) {
-    let branch = run_git_with_context(
+    let branch = run_git_with_context_allow_fail(
         worktree_dir,
         &["rev-parse", "--abbrev-ref", "HEAD"],
         "capture current branch before worktree cleanup",
@@ -700,5 +729,23 @@ mod tests {
         assert!(is_completion_noise_path(Path::new("CLAUDE.md")));
         assert!(!is_completion_noise_path(Path::new("docs/guide.md")));
         assert!(!is_completion_noise_path(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn run_git_with_context_bails_on_nonzero_exit() {
+        use crate::team::test_support::init_git_repo;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "strict-runner");
+        let err = run_git_with_context(&repo, &["rev-parse", "--verify", "nope"], "resolve nope")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("resolve nope"), "{err}");
+        assert!(err.contains("rev-parse"), "{err}");
+
+        let output =
+            run_git_with_context_allow_fail(&repo, &["rev-parse", "--verify", "nope"], "probe")
+                .unwrap();
+        assert!(!output.status.success());
+        assert!(run_git_with_context(&repo, &["rev-parse", "HEAD"], "head").is_ok());
     }
 }

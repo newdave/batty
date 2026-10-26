@@ -565,11 +565,14 @@ fn worktree_registered(repo_root: &Path, path: &Path) -> Result<bool> {
         );
     }
 
-    let target = path.to_string_lossy().to_string();
+    // git prints canonical paths (e.g. /private/var/... on macOS) while the
+    // caller may hold a symlinked spelling (/var/...); compare canonical forms.
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = canonical(path);
     let listed = String::from_utf8_lossy(&output.stdout);
     for line in listed.lines() {
         if let Some(candidate) = line.strip_prefix("worktree ")
-            && candidate.trim() == target
+            && canonical(Path::new(candidate.trim())) == target
         {
             return Ok(true);
         }
@@ -980,12 +983,21 @@ pub fn ensure_worktree_branch_for_dispatch_from_trunk(
 
     // #659: archive commits ahead of the start ref on `expected_branch` before
     // the destructive `checkout -B expected_branch <start_ref>` below.
-    let _ = archive_branch_if_commits_ahead(
+    // A failed archive must abort the reset: rewriting the branch without a
+    // saved copy would drop its unmerged commits.
+    archive_branch_if_commits_ahead(
         worktree_path,
         expected_branch,
         selection.ref_name.as_str(),
         "dispatch/branch-reset",
-    );
+    )
+    .with_context(|| {
+        format!(
+            "aborting branch reset of '{}' in {}: could not archive its commits",
+            expected_branch,
+            worktree_path.display()
+        )
+    })?;
     crate::team::task_loop::log_worktree_mutation_audit(
         worktree_path,
         "dispatch/branch-reset",
@@ -1117,7 +1129,7 @@ pub fn reset_worktree_to_base_with_options_for_trunk(
             base_branch,
             trunk_branch,
             subsystem,
-        );
+        )?;
     }
 
     checkout_base_branch_across_repos(worktree_path, base_branch, trunk_branch, subsystem)?;
@@ -1164,6 +1176,22 @@ pub(crate) fn prepare_worktree_for_reset(
         return Ok(WorktreeResetReason::PreserveFailedResetSkipped);
     }
 
+    // Never discard work without a saved copy: snapshot the dirty tree
+    // (tracked + untracked) to a ref first, and refuse to reset if that fails.
+    let snapshot_ref = snapshot_dirty_worktree_to_ref(worktree_path, subsystem)
+        .with_context(|| {
+            format!(
+                "refusing to force-reset {}: preserve failed and the dirty-tree snapshot also failed",
+                worktree_path.display()
+            )
+        })?;
+    warn!(
+        subsystem,
+        worktree = %worktree_path.display(),
+        snapshot_ref = %snapshot_ref,
+        "preserve commit failed; saved dirty worktree snapshot before force-reset"
+    );
+
     let _ = run_git(worktree_path, ["merge", "--abort"]);
     crate::team::task_loop::log_worktree_mutation_audit(
         worktree_path,
@@ -1190,6 +1218,100 @@ pub(crate) fn prepare_worktree_for_reset(
     }
 
     Ok(WorktreeResetReason::PreserveFailedForceReset)
+}
+
+/// Save every uncommitted change in `worktree_path` (staged, unstaged and
+/// untracked, minus ignored files and Batty runtime dirs) as a commit on a
+/// new `refs/heads/preserved/<branch>-snapshot-<stamp>` ref, without touching
+/// the real index, worktree or HEAD. Returns the created ref name.
+///
+/// Used before a forced reset when the normal preserve commit failed, so the
+/// reset can never be the only copy of the work.
+pub(crate) fn snapshot_dirty_worktree_to_ref(
+    worktree_path: &Path,
+    subsystem: &str,
+) -> Result<String> {
+    fn git_checked(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
+        let mut command = Command::new("git");
+        command.current_dir(dir).args(args);
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let output = command
+            .output()
+            .with_context(|| format!("failed to execute `git {}`", args.join(" ")))?;
+        if !output.status.success() {
+            bail!(
+                "`git {}` failed in {}: {}",
+                args.join(" "),
+                dir.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    let real_index = PathBuf::from(git_checked(
+        worktree_path,
+        None,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_index = real_index.with_file_name(format!(
+        "index.batty-snapshot-{}-{stamp}",
+        std::process::id()
+    ));
+    // Remove the temp index on every exit path.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = RemoveOnDrop(temp_index.clone());
+    if real_index.exists() {
+        std::fs::copy(&real_index, &temp_index).with_context(|| {
+            format!("failed to copy index {} for snapshot", real_index.display())
+        })?;
+    }
+
+    let index = Some(temp_index.as_path());
+    git_checked(worktree_path, index, &["add", "-A"])?;
+    git_checked(
+        worktree_path,
+        index,
+        &["reset", "-q", "--", ".batty", ".cargo", ".batty-target"],
+    )?;
+    let tree = git_checked(worktree_path, index, &["write-tree"])?;
+    let head = git_checked(
+        worktree_path,
+        None,
+        &["rev-parse", "--verify", "-q", "HEAD"],
+    )
+    .ok();
+    let branch = git_current_branch(worktree_path).unwrap_or_else(|_| "detached".to_string());
+    let message = format!("wip: batty snapshot before forced reset ({subsystem}) [{branch}]");
+
+    let mut commit_args: Vec<&str> =
+        crate::team::task_loop::fallback_identity_args(worktree_path).to_vec();
+    commit_args.extend(["commit-tree", tree.as_str(), "-m", message.as_str()]);
+    if let Some(head) = head.as_deref() {
+        commit_args.extend(["-p", head]);
+    }
+    let commit = git_checked(worktree_path, None, &commit_args)?;
+
+    let slug = branch.replace('/', "-");
+    let ref_name = format!("refs/heads/preserved/{slug}-snapshot-{stamp}");
+    // Empty old-value: create only, never overwrite an existing ref.
+    git_checked(
+        worktree_path,
+        None,
+        &["update-ref", "-m", "batty snapshot", &ref_name, &commit, ""],
+    )?;
+    Ok(ref_name)
 }
 
 #[cfg(test)]
@@ -1228,7 +1350,7 @@ pub fn reset_worktree_to_base_if_clean_from_trunk(
         base_branch,
         trunk_branch,
         subsystem,
-    );
+    )?;
     checkout_base_branch_across_repos(worktree_path, base_branch, trunk_branch, subsystem)?;
 
     Ok(WorktreeResetReason::CleanReset)
@@ -1280,7 +1402,7 @@ pub(crate) fn recover_worktree_to_base_preserving(
         }
         Some(_) => {}
         None => {
-            if rev_list_count(worktree_path, &format!("{trunk_branch}..HEAD")).unwrap_or(0) > 0 {
+            if rev_list_count(worktree_path, &format!("{trunk_branch}..HEAD"))? > 0 {
                 archive_preserved_base_branch_head(worktree_path, "detached")?;
             }
         }
@@ -1290,7 +1412,7 @@ pub(crate) fn recover_worktree_to_base_preserving(
         base_branch,
         trunk_branch,
         subsystem,
-    );
+    )?;
     checkout_base_branch_across_repos(worktree_path, base_branch, trunk_branch, subsystem)?;
     Ok(reason)
 }
@@ -1412,9 +1534,8 @@ fn archive_preserved_base_branch_head(worktree_path: &Path, base_branch: &str) -
 
 /// Iterate sub-repos (or the single repo at `worktree_path`) and archive any
 /// commits on `base_branch` that are ahead of each repo's default branch
-/// before a destructive `checkout -B`. Errors are logged but non-fatal: this
-/// mirrors the single-repo caller's `let _ = archive_branch_if_commits_ahead`
-/// best-effort behavior.
+/// before a destructive `checkout -B`. Any archive failure is returned so the
+/// caller aborts the reset instead of rewriting a branch it could not save.
 ///
 /// In multi-repo mode (worktree root is not a git repo), each sub-repo is
 /// processed independently. The default branch is resolved per-repo so
@@ -1424,11 +1545,20 @@ fn archive_branch_if_commits_ahead_across_repos(
     base_branch: &str,
     trunk_branch: &str,
     subsystem: &str,
-) {
+) -> Result<()> {
     for repo in iter_repos_for_mutation(worktree_path) {
         let base_ref = effective_trunk_branch_for_repo(&repo, trunk_branch);
-        let _ = archive_branch_if_commits_ahead(&repo, base_branch, &base_ref, subsystem);
+        archive_branch_if_commits_ahead(&repo, base_branch, &base_ref, subsystem).with_context(
+            || {
+                format!(
+                    "aborting reset of '{}' in {}: could not archive its commits",
+                    base_branch,
+                    repo.display()
+                )
+            },
+        )?;
     }
+    Ok(())
 }
 
 /// Run `git checkout -B <base_branch> <default>` in each sub-repo (or the
@@ -1522,20 +1652,16 @@ pub(crate) fn archive_branch_if_commits_ahead(
         return Ok(None);
     }
     let range = format!("{base_ref}..{branch_name}");
-    let ahead = match rev_list_count(worktree_path, range.as_str()) {
-        Ok(n) => n,
-        Err(e) => {
-            warn!(
-                subsystem,
-                worktree = %worktree_path.display(),
-                branch = branch_name,
-                base_ref,
-                error = %e,
-                "failed to count commits ahead; skipping archive"
-            );
-            return Ok(None);
-        }
-    };
+    // Fail closed: if we cannot tell whether the branch carries unmerged
+    // commits, the caller must not rewrite it.
+    let ahead = rev_list_count(worktree_path, range.as_str()).with_context(|| {
+        format!(
+            "failed to count commits on '{}' ahead of '{}' in {} before archiving",
+            branch_name,
+            base_ref,
+            worktree_path.display()
+        )
+    })?;
     if ahead == 0 {
         return Ok(None);
     }
@@ -3107,5 +3233,169 @@ mod tests {
         // Dirty notes were auto-saved on the task branch and archived.
         assert!(git_succeeds(tmp.path(), &["show", "eng-1/7:notes.txt"]));
         assert!(!list_branches(tmp.path(), "preserved/eng-1-7-*").is_empty());
+    }
+
+    // --- archive failures abort destructive resets --------------------------------
+
+    #[test]
+    fn archive_branch_if_commits_ahead_fails_closed_on_bad_base_ref() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        git(tmp.path(), &["branch", "eng-1"]);
+        assert!(
+            archive_branch_if_commits_ahead(tmp.path(), "eng-1", "no-such-base", "test").is_err()
+        );
+    }
+
+    #[test]
+    fn reset_aborts_without_rewriting_branch_when_archive_fails() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        git(tmp.path(), &["checkout", "-q", "-b", "eng-main/eng-1"]);
+        fs::write(tmp.path().join("work.txt"), "unmerged\n").unwrap();
+        git(tmp.path(), &["add", "work.txt"]);
+        git(tmp.path(), &["commit", "-q", "-m", "unmerged work"]);
+        let tip_before = rev_parse(tmp.path(), "eng-main/eng-1");
+
+        // The trunk ref cannot be resolved, so commits ahead cannot be counted.
+        let result = reset_worktree_to_base_if_clean_from_trunk(
+            tmp.path(),
+            "eng-main/eng-1",
+            "test",
+            "no-such-trunk",
+        );
+
+        assert!(result.is_err(), "reset must abort: {result:?}");
+        assert_eq!(rev_parse(tmp.path(), "eng-main/eng-1"), tip_before);
+    }
+
+    fn rev_parse(repo: &Path, rev: &str) -> String {
+        let output = run_git(repo, ["rev-parse", rev]).unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    // --- force-reset fallback snapshots first -------------------------------------
+
+    #[test]
+    fn snapshot_dirty_worktree_captures_tracked_and_untracked_without_touching_index() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        fs::write(tmp.path().join("README.md"), "edited\n").unwrap();
+        fs::write(tmp.path().join("staged.txt"), "staged\n").unwrap();
+        git(tmp.path(), &["add", "staged.txt"]);
+        fs::write(tmp.path().join("untracked.txt"), "untracked\n").unwrap();
+        let head_before = rev_parse(tmp.path(), "HEAD");
+
+        let snapshot = snapshot_dirty_worktree_to_ref(tmp.path(), "test").unwrap();
+
+        assert!(snapshot.starts_with("refs/heads/preserved/main-snapshot-"));
+        let show = |path: &str| {
+            let output =
+                run_git(tmp.path(), ["show", format!("{snapshot}:{path}").as_str()]).unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        assert_eq!(show("README.md"), "edited\n");
+        assert_eq!(show("staged.txt"), "staged\n");
+        assert_eq!(show("untracked.txt"), "untracked\n");
+        assert_eq!(rev_parse(tmp.path(), &format!("{snapshot}^")), head_before);
+        // Real HEAD and index are unchanged.
+        assert_eq!(rev_parse(tmp.path(), "HEAD"), head_before);
+        let cached = run_git(tmp.path(), ["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&cached.stdout).trim(), "staged.txt");
+    }
+
+    #[test]
+    fn force_reset_after_failed_preserve_keeps_a_snapshot() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        fs::write(tmp.path().join("README.md"), "precious\n").unwrap();
+        fs::write(tmp.path().join("new.txt"), "precious new\n").unwrap();
+
+        // A zero timeout makes the preserve commit fail.
+        let reason = prepare_worktree_for_reset(
+            tmp.path(),
+            "wip: test",
+            Duration::ZERO,
+            PreserveFailureMode::ForceReset,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(reason, WorktreeResetReason::PreserveFailedForceReset);
+        assert!(
+            !tmp.path().join("new.txt").exists(),
+            "worktree was force-reset"
+        );
+        let refs = run_git(
+            tmp.path(),
+            [
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/preserved/",
+            ],
+        )
+        .unwrap();
+        let refs = String::from_utf8_lossy(&refs.stdout).into_owned();
+        let snapshot = refs.lines().next().expect("snapshot ref created");
+        let output = run_git(tmp.path(), ["show", format!("{snapshot}:new.txt").as_str()]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "precious new\n");
+    }
+
+    #[test]
+    fn force_reset_is_refused_when_snapshot_fails() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        // A branch literally named `preserved` blocks creating any
+        // `refs/heads/preserved/...` snapshot ref (directory/file conflict).
+        git(tmp.path(), &["branch", "preserved"]);
+        fs::write(tmp.path().join("new.txt"), "precious\n").unwrap();
+
+        let result = prepare_worktree_for_reset(
+            tmp.path(),
+            "wip: test",
+            Duration::ZERO,
+            PreserveFailureMode::ForceReset,
+            "test",
+        );
+
+        assert!(result.is_err(), "reset must be refused: {result:?}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
+            "precious\n"
+        );
+    }
+
+    // --- worktree registration with symlinked paths ----------------------------------
+
+    #[test]
+    fn worktree_registered_matches_symlinked_path_spelling() {
+        let Some(tmp) = init_repo() else {
+            return;
+        };
+        let wt = tmp.path().join("wt");
+        git(
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt-branch",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("repo-link");
+        std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+
+        assert!(worktree_registered(tmp.path(), &wt).unwrap());
+        assert!(worktree_registered(tmp.path(), &link.join("wt")).unwrap());
+        assert!(!worktree_registered(tmp.path(), &tmp.path().join("other")).unwrap());
     }
 }

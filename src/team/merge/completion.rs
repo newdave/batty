@@ -32,6 +32,7 @@ use crate::team::verification::{EvidenceKind, VerificationPhase, VerificationSta
 use super::git_ops::{
     abort_failed_merge, code_files_changed_from_trunk, commits_ahead_of_trunk,
     diff_stat_from_trunk, files_changed_from_trunk, now_unix, run_git_with_context,
+    run_git_with_context_allow_fail,
 };
 use super::lock::{
     MergeLock, MergeMode, MergeOutcome, MergeSuccess, infer_merge_mode_from_failure,
@@ -1382,8 +1383,14 @@ fn finish_engineer_completion(
         let auto_merge_override = daemon.auto_merge_override(task_id);
 
         // Analyze diff and emit confidence score for every completed task
-        let diff_analysis =
-            auto_merge::analyze_diff(daemon.project_root(), &trunk_branch, &task_branch);
+        let diff_analysis = analyze_completion_diff(
+            daemon.project_root(),
+            daemon.is_multi_repo,
+            &daemon.sub_repo_names,
+            &worktree_dir,
+            &trunk_branch,
+            &task_branch,
+        );
         if let Ok(ref summary) = diff_analysis {
             let confidence = auto_merge::score_auto_merge_candidate(summary, &policy);
             let task_str = task_id.to_string();
@@ -1437,120 +1444,121 @@ fn finish_engineer_completion(
         // Evaluate auto-merge if policy is enabled or override forces it
         let should_try_auto_merge = auto_merge_override == Some(true) || policy.enabled;
         if should_try_auto_merge {
-            match diff_analysis {
+            // Fail closed: a diff we could not analyze is never auto-merged.
+            let decision = match diff_analysis {
+                Ok(ref summary) if auto_merge_override == Some(true) => {
+                    auto_merge::forced_auto_merge_decision(Some(summary), &policy, true)
+                }
                 Ok(ref summary) => {
-                    let decision = if auto_merge_override == Some(true) {
-                        auto_merge::forced_auto_merge_decision(Some(summary), &policy, true)
-                    } else {
-                        auto_merge::evaluate_auto_merge_candidate(summary, &policy, true)
-                    };
-                    daemon.record_auto_merge_decision(engineer, task_id, &decision);
-
-                    match decision.decision {
-                        AutoMergeDecisionKind::Accepted => {
-                            if !move_task_to_review(
-                                daemon,
-                                &board_dir,
-                                task_id,
-                                manager_name.as_deref(),
-                                engineer,
-                            )? {
-                                return Ok(());
-                            }
-                            if let Err(error) = record_completion_packet_metadata(
-                                daemon.project_root(),
-                                &board_dir,
-                                task_id,
-                                &task_branch,
-                                &worktree_dir,
-                                true,
-                                Some(verification_run.results.clone()),
-                            ) {
-                                escalate_completion_metadata_rejection(
-                                    daemon,
-                                    engineer,
-                                    task_id,
-                                    manager_name.as_deref(),
-                                    &error,
-                                )?;
-                                return Ok(());
-                            }
-                            info!(
-                                engineer,
-                                task_id,
-                                confidence = decision.confidence,
-                                files = summary.files_changed,
-                                lines = summary.total_lines(),
-                                "auto-merging task"
-                            );
-                            daemon.enqueue_merge_request(MergeRequest {
-                                task_id,
-                                engineer: engineer.to_string(),
-                                branch: task_branch.clone(),
-                                worktree_dir: worktree_dir.clone(),
-                                queued_at: Instant::now(),
-                                test_passed: true,
-                                should_post_merge_verify: verification_policy.auto_run_tests,
-                                test_duration_ms,
-                                confidence: decision.confidence,
-                                files_changed: summary.files_changed,
-                                lines_changed: summary.total_lines(),
-                            });
-                            return Ok(());
-                        }
-                        AutoMergeDecisionKind::ManualReview => {
-                            info!(
-                                engineer,
-                                task_id,
-                                confidence = decision.confidence,
-                                reasons = ?decision.reasons,
-                                "routing to manual review"
-                            );
-                            if !move_task_to_review(
-                                daemon,
-                                &board_dir,
-                                task_id,
-                                manager_name.as_deref(),
-                                engineer,
-                            )? {
-                                return Ok(());
-                            }
-                            if let Err(error) = record_completion_packet_metadata(
-                                daemon.project_root(),
-                                &board_dir,
-                                task_id,
-                                &task_branch,
-                                &worktree_dir,
-                                true,
-                                Some(verification_run.results.clone()),
-                            ) {
-                                escalate_completion_metadata_rejection(
-                                    daemon,
-                                    engineer,
-                                    task_id,
-                                    manager_name.as_deref(),
-                                    &error,
-                                )?;
-                                return Ok(());
-                            }
-                            if let Some(ref manager_name) = manager_name {
-                                let reason_text = decision.reasons.join("; ");
-                                let msg = format!(
-                                    "[{engineer}] Task #{task_id} passed tests but requires manual review.\nTitle: {task_title}\nConfidence: {confidence:.2}\nReasons: {reason_text}",
-                                    confidence = decision.confidence
-                                );
-                                daemon.queue_message(engineer, manager_name, &msg)?;
-                                daemon.mark_member_working(manager_name);
-                            }
-                            daemon.clear_active_task(engineer);
-                            daemon.record_task_completed(engineer, Some(task_id));
-                            daemon.set_member_idle(engineer);
-                            return Ok(());
-                        }
-                    }
+                    auto_merge::evaluate_auto_merge_candidate(summary, &policy, true)
                 }
                 Err(ref error) => {
-                    warn!(engineer, task_id, error = %error, "auto-merge diff analysis failed, falling through to normal merge");
+                    warn!(engineer, task_id, error = %format!("{error:#}"), "auto-merge diff analysis failed, routing to manual review");
+                    auto_merge::analysis_failed_decision(&format!("{error:#}"), true)
+                }
+            };
+            daemon.record_auto_merge_decision(engineer, task_id, &decision);
+
+            match decision.decision {
+                AutoMergeDecisionKind::Accepted => {
+                    if !move_task_to_review(
+                        daemon,
+                        &board_dir,
+                        task_id,
+                        manager_name.as_deref(),
+                        engineer,
+                    )? {
+                        return Ok(());
+                    }
+                    if let Err(error) = record_completion_packet_metadata(
+                        daemon.project_root(),
+                        &board_dir,
+                        task_id,
+                        &task_branch,
+                        &worktree_dir,
+                        true,
+                        Some(verification_run.results.clone()),
+                    ) {
+                        escalate_completion_metadata_rejection(
+                            daemon,
+                            engineer,
+                            task_id,
+                            manager_name.as_deref(),
+                            &error,
+                        )?;
+                        return Ok(());
+                    }
+                    info!(
+                        engineer,
+                        task_id,
+                        confidence = decision.confidence,
+                        files = decision.files_changed,
+                        lines = decision.lines_changed,
+                        "auto-merging task"
+                    );
+                    daemon.enqueue_merge_request(MergeRequest {
+                        task_id,
+                        engineer: engineer.to_string(),
+                        branch: task_branch.clone(),
+                        worktree_dir: worktree_dir.clone(),
+                        queued_at: Instant::now(),
+                        test_passed: true,
+                        should_post_merge_verify: verification_policy.auto_run_tests,
+                        test_duration_ms,
+                        confidence: decision.confidence,
+                        files_changed: decision.files_changed,
+                        lines_changed: decision.lines_changed,
+                    });
+                    return Ok(());
+                }
+                AutoMergeDecisionKind::ManualReview => {
+                    info!(
+                        engineer,
+                        task_id,
+                        confidence = decision.confidence,
+                        reasons = ?decision.reasons,
+                        "routing to manual review"
+                    );
+                    if !move_task_to_review(
+                        daemon,
+                        &board_dir,
+                        task_id,
+                        manager_name.as_deref(),
+                        engineer,
+                    )? {
+                        return Ok(());
+                    }
+                    if let Err(error) = record_completion_packet_metadata(
+                        daemon.project_root(),
+                        &board_dir,
+                        task_id,
+                        &task_branch,
+                        &worktree_dir,
+                        true,
+                        Some(verification_run.results.clone()),
+                    ) {
+                        escalate_completion_metadata_rejection(
+                            daemon,
+                            engineer,
+                            task_id,
+                            manager_name.as_deref(),
+                            &error,
+                        )?;
+                        return Ok(());
+                    }
+                    if let Some(ref manager_name) = manager_name {
+                        let reason_text = decision.reasons.join("; ");
+                        let msg = format!(
+                            "[{engineer}] Task #{task_id} passed tests but requires manual review.\nTitle: {task_title}\nConfidence: {confidence:.2}\nReasons: {reason_text}",
+                            confidence = decision.confidence
+                        );
+                        daemon.queue_message(engineer, manager_name, &msg)?;
+                        daemon.mark_member_working(manager_name);
+                    }
+                    daemon.clear_active_task(engineer);
+                    daemon.record_task_completed(engineer, Some(task_id));
+                    daemon.set_member_idle(engineer);
+                    return Ok(());
                 }
             }
         }
@@ -1867,48 +1875,55 @@ fn revert_out_of_scope_files(
         return Ok(false);
     }
 
+    let mut restored = Vec::new();
     for file in out_of_scope {
         if path_exists_on_trunk(worktree_dir, trunk_branch, file)? {
+            // `checkout <rev> -- <path>` updates both the index and the worktree.
             run_git_with_context(
                 worktree_dir,
                 &["checkout", trunk_branch, "--", file],
-                "failed to revert out-of-scope file",
+                "revert out-of-scope file",
             )?;
+            restored.push(file.as_str());
         } else {
             run_git_with_context(
                 worktree_dir,
                 &["rm", "-f", "--ignore-unmatch", "--", file],
-                "failed to remove out-of-scope file added outside the fence",
+                "remove out-of-scope file added outside the fence",
             )?;
         }
     }
 
-    run_git_with_context(worktree_dir, &["add", "-A"], "failed to stage scope revert")?;
-    let staged = std::process::Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(worktree_dir)
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to inspect staged diff in {}",
-                worktree_dir.display()
-            )
-        })?;
-    if staged.success() {
+    // Stage only the fenced paths; never sweep up unrelated worktree changes.
+    if !restored.is_empty() {
+        let mut add_args = vec!["add", "-A", "--"];
+        add_args.extend(restored.iter().copied());
+        run_git_with_context(worktree_dir, &add_args, "stage scope revert")?;
+    }
+
+    let mut staged_args = vec!["diff", "--cached", "--name-only", "--"];
+    staged_args.extend(out_of_scope.iter().map(String::as_str));
+    let staged = run_git_with_context(worktree_dir, &staged_args, "inspect staged scope revert")?;
+    let staged_paths: Vec<String> = String::from_utf8_lossy(&staged.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if staged_paths.is_empty() {
         return Ok(false);
     }
 
-    run_git_with_context(
-        worktree_dir,
-        &[
-            "commit",
-            "-m",
-            "Restore fenced files after automatic scope recovery",
-            "-m",
-            "Constraint: Scope fence violations must be reverted automatically\nConfidence: medium\nScope-risk: narrow\nDirective: This daemon-owned recovery commit keeps the branch clean after out-of-scope writes\nTested: scope fence auto-revert path\nNot-tested: multi-repo scope recovery",
-        ],
-        "failed to commit scope revert",
-    )?;
+    let mut commit_args = vec![
+        "commit",
+        "-m",
+        "Restore fenced files after automatic scope recovery",
+        "-m",
+        "Constraint: Scope fence violations must be reverted automatically\nConfidence: medium\nScope-risk: narrow\nDirective: This daemon-owned recovery commit keeps the branch clean after out-of-scope writes\nTested: scope fence auto-revert path\nNot-tested: multi-repo scope recovery",
+        "--only",
+        "--",
+    ];
+    commit_args.extend(staged_paths.iter().map(String::as_str));
+    run_git_with_context(worktree_dir, &commit_args, "commit scope revert")?;
     Ok(true)
 }
 
@@ -1926,12 +1941,20 @@ fn detect_flaky_failures(
 }
 
 /// Merge engineer branches across all sub-repos in a multi-repo project.
+///
+/// All-or-nothing: every sub-repo with work is preflighted (commit count,
+/// root checkout on trunk and clean, conflict-free merge) before any merge
+/// runs, and repos already merged are rolled back if a later one fails. The
+/// user's sub-repo checkouts are never switched to another branch. Only the
+/// worktrees of repos that were actually merged are reset afterwards.
 pub(crate) fn merge_multi_repo_engineer_branch(
     project_root: &Path,
     engineer_name: &str,
     sub_repo_names: &[String],
     trunk_branch: &str,
 ) -> Result<MergeOutcome> {
+    // Phase 1: preflight every repo before touching any of them.
+    let mut candidates = Vec::new();
     for repo_name in sub_repo_names {
         let repo_root = project_root.join(repo_name);
         let sub_wt = project_root
@@ -1942,21 +1965,43 @@ pub(crate) fn merge_multi_repo_engineer_branch(
         if !sub_wt.exists() {
             continue;
         }
-        // Check if there are commits to merge in this sub-repo
-        if commits_ahead_of_trunk(&sub_wt, trunk_branch).unwrap_or(0) == 0 {
+        let ahead = commits_ahead_of_trunk(&sub_wt, trunk_branch).with_context(|| {
+            format!("count commits to merge in sub-repo {repo_name} before multi-repo merge")
+        })?;
+        if ahead == 0 {
             continue;
         }
-        match merge_engineer_branch_in_repo(&repo_root, &sub_wt, engineer_name, trunk_branch)? {
-            MergeOutcome::Success(_) => {}
-            other => return Ok(other),
+        if let Some(reason) = multi_repo_preflight_failure(&repo_root, &sub_wt, trunk_branch)? {
+            return Ok(reason);
+        }
+        candidates.push((repo_name.as_str(), repo_root, sub_wt));
+    }
+
+    // Phase 2: merge, rolling back earlier repos if a later one fails.
+    let mut merged: Vec<(&str, PathBuf, String)> = Vec::new();
+    for (repo_name, repo_root, sub_wt) in &candidates {
+        let trunk_before = rev_parse(repo_root, &format!("refs/heads/{trunk_branch}"))?;
+        let outcome =
+            match merge_engineer_branch_in_repo(repo_root, sub_wt, engineer_name, trunk_branch) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    rollback_multi_repo_merges(&merged, trunk_branch);
+                    return Err(error);
+                }
+            };
+        match outcome {
+            MergeOutcome::Success(_) => merged.push((repo_name, repo_root.clone(), trunk_before)),
+            other => {
+                rollback_multi_repo_merges(&merged, trunk_branch);
+                return Ok(other);
+            }
         }
     }
 
-    // Reset all sub-repo worktrees after successful merge
-    for repo_name in sub_repo_names {
-        let repo_root = project_root.join(repo_name);
+    // Phase 3: reset only the worktrees whose work landed.
+    for (repo_name, repo_root, _) in &merged {
         if let Err(e) =
-            reset_engineer_worktree_in_repo(&repo_root, engineer_name, repo_name, trunk_branch)
+            reset_engineer_worktree_in_repo(repo_root, engineer_name, repo_name, trunk_branch)
         {
             warn!(
                 engineer = engineer_name,
@@ -1973,6 +2018,73 @@ pub(crate) fn merge_multi_repo_engineer_branch(
     }))
 }
 
+fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
+    let output = run_git_with_context(
+        repo,
+        &["rev-parse", "--verify", rev],
+        &format!("resolve {rev}"),
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Same root-checkout rules as the single-repo path, applied before any
+/// merge so one bad repo cannot leave the others half-merged. Returns the
+/// outcome to report when the repo is not safe to merge into.
+fn multi_repo_preflight_failure(
+    repo_root: &Path,
+    sub_wt: &Path,
+    trunk_branch: &str,
+) -> Result<Option<MergeOutcome>> {
+    let current = current_worktree_branch(repo_root)
+        .with_context(|| format!("inspect sub-repo checkout {}", repo_root.display()))?;
+    if current != trunk_branch {
+        return Ok(Some(MergeOutcome::MergeFailure(format!(
+            "sub-repo {} root checkout is on '{current}', not '{trunk_branch}'; refusing to switch the user's checkout",
+            repo_root.display()
+        ))));
+    }
+    let dirty = super::operations::inspect_root_dirty_state(repo_root)?;
+    if !dirty.is_clean() && !dirty.is_runtime_only() {
+        return Ok(Some(MergeOutcome::MergeFailure(format!(
+            "sub-repo {} root {trunk_branch} checkout has local changes; deferring multi-repo merge",
+            repo_root.display()
+        ))));
+    }
+    let branch = current_worktree_branch(sub_wt)?;
+    if auto_merge::branch_has_conflicts(repo_root, trunk_branch, &branch) {
+        return Ok(Some(MergeOutcome::RebaseConflict(format!(
+            "branch '{branch}' conflicts with {trunk_branch} in {} (preflight); no sub-repo was merged",
+            repo_root.display()
+        ))));
+    }
+    Ok(None)
+}
+
+/// Undo merges already applied in earlier sub-repos. `reset --keep` refuses
+/// rather than discarding local changes; it only runs when trunk is still
+/// checked out, so the user's checkout is never switched.
+fn rollback_multi_repo_merges(merged: &[(&str, PathBuf, String)], trunk_branch: &str) {
+    for (repo_name, repo_root, trunk_before) in merged.iter().rev() {
+        let result = run_git_with_context(
+            repo_root,
+            &["reset", "--keep", trunk_before],
+            &format!("roll back {trunk_branch} in {repo_name} after multi-repo merge failure"),
+        );
+        match result {
+            Ok(_) => warn!(
+                repo = repo_name,
+                trunk_before = %trunk_before,
+                "rolled back sub-repo merge after a later sub-repo failed"
+            ),
+            Err(error) => warn!(
+                repo = repo_name,
+                error = %error,
+                "failed to roll back sub-repo merge; manual cleanup needed"
+            ),
+        }
+    }
+}
+
 /// Merge a single sub-repo's engineer worktree branch into trunk.
 fn merge_engineer_branch_in_repo(
     repo_root: &Path,
@@ -1983,23 +2095,17 @@ fn merge_engineer_branch_in_repo(
     let branch = current_worktree_branch(worktree_dir)?;
     info!(engineer = engineer_name, branch = %branch, repo = %repo_root.display(), "merging sub-repo worktree branch");
 
+    // Never switch the user's checkout: the caller preflights that the
+    // sub-repo root is already on trunk.
     let current_trunk = current_worktree_branch(repo_root)?;
     if current_trunk != trunk_branch {
-        let checkout = run_git_with_context(
-            repo_root,
-            &["checkout", trunk_branch],
-            &format!("checkout {trunk_branch} in sub-repo before merge"),
-        )?;
-        if !checkout.status.success() {
-            let stderr = String::from_utf8_lossy(&checkout.stderr).trim().to_string();
-            return Ok(MergeOutcome::MergeFailure(format!(
-                "sub-repo {} on '{current_trunk}', checkout {trunk_branch} failed: {stderr}",
-                repo_root.display()
-            )));
-        }
+        return Ok(MergeOutcome::MergeFailure(format!(
+            "sub-repo {} root checkout is on '{current_trunk}', not '{trunk_branch}'",
+            repo_root.display()
+        )));
     }
 
-    let rebase = run_git_with_context(
+    let rebase = run_git_with_context_allow_fail(
         worktree_dir,
         &["rebase", trunk_branch],
         &format!(
@@ -2009,14 +2115,15 @@ fn merge_engineer_branch_in_repo(
     )?;
     if !rebase.status.success() {
         let stderr = String::from_utf8_lossy(&rebase.stderr).trim().to_string();
-        let _ = run_git_with_context(worktree_dir, &["rebase", "--abort"], "abort rebase");
+        let _ =
+            run_git_with_context_allow_fail(worktree_dir, &["rebase", "--abort"], "abort rebase");
         return Ok(MergeOutcome::RebaseConflict(format!(
             "rebase conflict in {}: {stderr}",
             repo_root.display()
         )));
     }
 
-    let output = run_git_with_context(
+    let output = run_git_with_context_allow_fail(
         repo_root,
         &["merge", &branch, "--no-edit"],
         &format!(
@@ -2115,10 +2222,38 @@ fn multi_repo_commits_ahead_of_trunk(
     for name in sub_repo_names {
         let sub_wt = worktree_dir.join(name);
         if sub_wt.exists() {
-            total += commits_ahead_of_trunk(&sub_wt, trunk_branch).unwrap_or(0);
+            total += commits_ahead_of_trunk(&sub_wt, trunk_branch)?;
         }
     }
     Ok(total)
+}
+
+/// Analyze a completed task's diff in the repo(s) that actually hold the
+/// branch. In multi-repo mode the project root is not a git repo, so each
+/// sub-repo with commits ahead is analyzed and the results combined.
+fn analyze_completion_diff(
+    project_root: &Path,
+    is_multi_repo: bool,
+    sub_repo_names: &[String],
+    worktree_dir: &Path,
+    trunk_branch: &str,
+    task_branch: &str,
+) -> Result<auto_merge::DiffSummary> {
+    if !is_multi_repo {
+        return auto_merge::analyze_diff(project_root, trunk_branch, task_branch);
+    }
+    let mut repos = Vec::new();
+    for name in sub_repo_names {
+        let sub_wt = worktree_dir.join(name);
+        if !sub_wt.exists() {
+            continue;
+        }
+        if commits_ahead_of_trunk(&sub_wt, trunk_branch)? == 0 {
+            continue;
+        }
+        repos.push((project_root.join(name), current_worktree_branch(&sub_wt)?));
+    }
+    auto_merge::analyze_diff_across_repos(&repos, trunk_branch)
 }
 
 /// For multi-repo: get the task branch from the first sub-repo that has commits.
@@ -2129,7 +2264,7 @@ fn multi_repo_task_branch(
 ) -> Result<String> {
     for name in sub_repo_names {
         let sub_wt = worktree_dir.join(name);
-        if sub_wt.exists() && commits_ahead_of_trunk(&sub_wt, trunk_branch).unwrap_or(0) > 0 {
+        if sub_wt.exists() && commits_ahead_of_trunk(&sub_wt, trunk_branch)? > 0 {
             return current_worktree_branch(&sub_wt);
         }
     }
@@ -4852,5 +4987,204 @@ mod tests {
         wait_for_verification_jobs(&mut daemon).unwrap();
         assert!(marker.exists());
         assert!(verification_snapshot_path(&repo, 42, "eng-1", 1).exists());
+    }
+
+    // --- scope revert -------------------------------------------------------
+
+    #[test]
+    fn revert_out_of_scope_files_commits_only_fenced_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "scope-revert");
+        git_ok(&repo, &["checkout", "-b", "eng-1/9"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn out_of_scope() {}\n").unwrap();
+        std::fs::write(repo.join("added.txt"), "added\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-m", "work"]);
+        // Unrelated staged + unstaged work must not be swept into the revert.
+        std::fs::write(repo.join("keep.txt"), "keep\n").unwrap();
+        git_ok(&repo, &["add", "keep.txt"]);
+        std::fs::write(repo.join("Cargo.toml"), "# edited\n").unwrap();
+
+        let files = vec!["src/lib.rs".to_string(), "added.txt".to_string()];
+        assert!(revert_out_of_scope_files(&repo, &files, "main").unwrap());
+
+        let committed = git_stdout(&repo, &["show", "--name-only", "--format=", "HEAD"]);
+        let mut committed: Vec<&str> = committed.lines().collect();
+        committed.sort();
+        assert_eq!(committed, vec!["added.txt", "src/lib.rs"]);
+        assert_eq!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"]),
+            "keep.txt"
+        );
+        assert_eq!(git_stdout(&repo, &["diff", "--name-only"]), "Cargo.toml");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+            git_stdout(&repo, &["show", "main:src/lib.rs"]) + "\n"
+        );
+
+        // Nothing left to revert: report false rather than a phantom revert.
+        assert!(!revert_out_of_scope_files(&repo, &files, "main").unwrap());
+    }
+
+    #[test]
+    fn revert_out_of_scope_files_propagates_git_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "scope-revert-fail");
+        let err = revert_out_of_scope_files(&repo, &["src/lib.rs".to_string()], "no-such-trunk")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no-such-trunk"), "{err:#}");
+    }
+
+    // --- multi-repo merge -----------------------------------------------------
+
+    fn init_sub_repo(project: &Path, name: &str) -> PathBuf {
+        let repo = project.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["config", "user.email", "batty@example.com"]);
+        git_ok(&repo, &["config", "user.name", "Batty Tests"]);
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        git_ok(&repo, &["add", "shared.txt"]);
+        git_ok(&repo, &["commit", "-q", "-m", "init"]);
+        repo
+    }
+
+    /// Engineer worktree for `name` at `.batty/worktrees/eng-1/<name>` on a
+    /// task branch, optionally with one commit editing `shared.txt`.
+    fn add_sub_worktree(project: &Path, name: &str, edit: Option<&str>) -> PathBuf {
+        let repo = project.join(name);
+        let wt = project
+            .join(".batty")
+            .join("worktrees")
+            .join("eng-1")
+            .join(name);
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "eng-1/5",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        if let Some(content) = edit {
+            std::fs::write(wt.join("shared.txt"), content).unwrap();
+            git_ok(&wt, &["commit", "-q", "-am", "engineer work"]);
+        }
+        wt
+    }
+
+    fn head_of(repo: &Path, rev: &str) -> String {
+        git_stdout(repo, &["rev-parse", rev])
+    }
+
+    #[test]
+    fn multi_repo_merge_is_all_or_nothing_on_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let a = init_sub_repo(project, "A");
+        let b = init_sub_repo(project, "B");
+        add_sub_worktree(project, "A", Some("from engineer A\n"));
+        add_sub_worktree(project, "B", Some("from engineer B\n"));
+        // Trunk in B moves on and conflicts with the engineer's edit.
+        std::fs::write(b.join("shared.txt"), "trunk B\n").unwrap();
+        git_ok(&b, &["commit", "-q", "-am", "trunk change"]);
+        let a_before = head_of(&a, "main");
+        let b_before = head_of(&b, "main");
+
+        let names = vec!["A".to_string(), "B".to_string()];
+        let outcome = merge_multi_repo_engineer_branch(project, "eng-1", &names, "main").unwrap();
+
+        assert!(
+            matches!(outcome, MergeOutcome::RebaseConflict(_)),
+            "expected preflight conflict, got {outcome:?}"
+        );
+        assert_eq!(head_of(&a, "main"), a_before, "A must not be merged alone");
+        assert_eq!(head_of(&b, "main"), b_before);
+    }
+
+    #[test]
+    fn multi_repo_merge_refuses_to_switch_user_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let a = init_sub_repo(project, "A");
+        add_sub_worktree(project, "A", Some("engineer\n"));
+        git_ok(&a, &["checkout", "-q", "-b", "user-feature"]);
+        let main_before = head_of(&a, "main");
+
+        let names = vec!["A".to_string()];
+        let outcome = merge_multi_repo_engineer_branch(project, "eng-1", &names, "main").unwrap();
+
+        assert!(
+            matches!(outcome, MergeOutcome::MergeFailure(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(current_worktree_branch(&a).unwrap(), "user-feature");
+        assert_eq!(head_of(&a, "main"), main_before);
+    }
+
+    #[test]
+    fn multi_repo_merge_does_not_reset_skipped_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let a = init_sub_repo(project, "A");
+        init_sub_repo(project, "C");
+        add_sub_worktree(project, "A", Some("engineer\n"));
+        let c_wt = add_sub_worktree(project, "C", None);
+
+        let names = vec!["A".to_string(), "C".to_string()];
+        let outcome = merge_multi_repo_engineer_branch(project, "eng-1", &names, "main").unwrap();
+
+        assert!(matches!(outcome, MergeOutcome::Success(_)), "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(a.join("shared.txt")).unwrap(),
+            "engineer\n"
+        );
+        assert_eq!(
+            current_worktree_branch(&c_wt).unwrap(),
+            "eng-1/5",
+            "repo with nothing merged must keep its lane untouched"
+        );
+    }
+
+    #[test]
+    fn multi_repo_merge_propagates_commit_count_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        init_sub_repo(project, "A");
+        add_sub_worktree(project, "A", Some("engineer\n"));
+        let names = vec!["A".to_string()];
+        assert!(
+            merge_multi_repo_engineer_branch(project, "eng-1", &names, "no-such-trunk").is_err()
+        );
+    }
+
+    #[test]
+    fn completion_diff_analysis_runs_in_sub_repos_for_multi_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        init_sub_repo(project, "A");
+        init_sub_repo(project, "B");
+        add_sub_worktree(project, "A", Some("engineer A\nmore\n"));
+        add_sub_worktree(project, "B", Some("engineer B\n"));
+        let worktree_dir = project.join(".batty").join("worktrees").join("eng-1");
+        let names = vec!["A".to_string(), "B".to_string()];
+
+        let summary =
+            analyze_completion_diff(project, true, &names, &worktree_dir, "main", "eng-1/5")
+                .unwrap();
+        assert_eq!(summary.files_changed, 2);
+        assert!(!summary.has_conflicts);
+
+        // The project root itself is not a git repo: single-repo analysis there
+        // must fail (and therefore never auto-merge).
+        assert!(
+            analyze_completion_diff(project, false, &names, &worktree_dir, "main", "eng-1/5")
+                .is_err()
+        );
     }
 }

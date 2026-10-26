@@ -69,6 +69,26 @@ pub struct DiffSummary {
 }
 
 impl DiffSummary {
+    /// Fold another repo's summary into this one (multi-repo completions).
+    /// Counts add up and every risk flag is OR-ed, so the combined summary
+    /// is never less risky than any of its parts.
+    pub fn absorb(&mut self, other: DiffSummary) {
+        self.files_changed += other.files_changed;
+        self.lines_added += other.lines_added;
+        self.lines_removed += other.lines_removed;
+        self.generated_lines_added += other.generated_lines_added;
+        self.generated_lines_removed += other.generated_lines_removed;
+        self.modules_touched.extend(other.modules_touched);
+        self.sensitive_files.extend(other.sensitive_files);
+        self.generated_report_artifacts
+            .extend(other.generated_report_artifacts);
+        self.has_unsafe |= other.has_unsafe;
+        self.has_conflicts |= other.has_conflicts;
+        self.rename_count += other.rename_count;
+        self.has_migrations |= other.has_migrations;
+        self.has_config_changes |= other.has_config_changes;
+    }
+
     pub fn total_lines(&self) -> usize {
         self.lines_added + self.lines_removed
     }
@@ -159,14 +179,9 @@ impl AutoMergeDecisionRecord {
 
 /// Analyze the diff between `base` and `branch` in the given repo.
 pub fn analyze_diff(repo: &Path, base: &str, branch: &str) -> Result<DiffSummary> {
+    let range = format!("{}...{}", base, branch);
     // Get --stat for file count and per-file changes
-    let stat_output = Command::new("git")
-        .args(["diff", "--numstat", &format!("{}...{}", base, branch)])
-        .current_dir(repo)
-        .output()
-        .context("failed to run git diff --numstat")?;
-
-    let stat_str = String::from_utf8_lossy(&stat_output.stdout);
+    let stat_str = git_stdout_checked(repo, &["diff", "--numstat", &range])?;
 
     let mut files_changed = 0usize;
     let mut lines_added = 0usize;
@@ -214,32 +229,15 @@ pub fn analyze_diff(repo: &Path, base: &str, branch: &str) -> Result<DiffSummary
     }
 
     // Get full diff to check for unsafe blocks
-    let diff_output = Command::new("git")
-        .args(["diff", &format!("{}...{}", base, branch)])
-        .current_dir(repo)
-        .output()
-        .context("failed to run git diff")?;
-
-    let diff_str = String::from_utf8_lossy(&diff_output.stdout);
+    let diff_str = git_stdout_checked(repo, &["diff", &range])?;
     let has_unsafe = diff_str.lines().any(|line| {
         line.starts_with('+') && (line.contains("unsafe {") || line.contains("unsafe fn"))
     });
 
     // Count renames (pure renames are lower risk than logic changes)
-    let rename_output = Command::new("git")
-        .args([
-            "diff",
-            "--diff-filter=R",
-            "--name-only",
-            &format!("{}...{}", base, branch),
-        ])
-        .current_dir(repo)
-        .output()
-        .context("failed to run git diff --diff-filter=R")?;
-    let rename_count = String::from_utf8_lossy(&rename_output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .count();
+    let rename_output =
+        git_stdout_checked(repo, &["diff", "--diff-filter=R", "--name-only", &range])?;
+    let rename_count = rename_output.lines().filter(|l| !l.is_empty()).count();
 
     // Detect migration and config file changes
     let has_migrations = changed_paths.iter().any(|p| is_migration_file(p));
@@ -265,8 +263,73 @@ pub fn analyze_diff(repo: &Path, base: &str, branch: &str) -> Result<DiffSummary
     })
 }
 
+/// Run a read-only git command and return stdout, failing on a nonzero exit.
+///
+/// A failed `git diff` prints nothing on stdout; treating that as "no
+/// changes" would make a broken repo look like a tiny, safe diff.
+fn git_stdout_checked(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed in {} ({}): {}",
+            args.join(" "),
+            repo.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Analyze a completion across several sub-repos. `repos` pairs each
+/// sub-repo root with the task branch to compare against `base` there.
+/// Any per-repo failure fails the whole analysis (fail closed).
+pub fn analyze_diff_across_repos(
+    repos: &[(std::path::PathBuf, String)],
+    base: &str,
+) -> Result<DiffSummary> {
+    let mut combined: Option<DiffSummary> = None;
+    for (repo, branch) in repos {
+        let summary = analyze_diff(repo, base, branch)
+            .with_context(|| format!("diff analysis failed for {}", repo.display()))?;
+        match combined.as_mut() {
+            Some(total) => total.absorb(summary),
+            None => combined = Some(summary),
+        }
+    }
+    combined.context("no sub-repo has changes to analyze")
+}
+
+/// Public fail-closed conflict probe (true on conflict or any git error).
+pub(crate) fn branch_has_conflicts(repo: &Path, base: &str, branch: &str) -> bool {
+    check_has_conflicts(repo, base, branch)
+}
+
 /// Check whether merging `branch` into `base` would produce conflicts.
+///
+/// Fails closed: any git failure is reported as a conflict so the task is
+/// routed to manual review instead of being auto-merged.
 fn check_has_conflicts(repo: &Path, base: &str, branch: &str) -> bool {
+    // Modern git (>= 2.38): exit 0 = clean, 1 = conflicts, anything else = error.
+    let modern = Command::new("git")
+        .args(["merge-tree", "--write-tree", "--name-only", base, branch])
+        .current_dir(repo)
+        .output();
+    match modern {
+        Ok(output) => match output.status.code() {
+            Some(0) => return false,
+            Some(1) => return true,
+            // 129 = usage error: git too old to know --write-tree. Fall back.
+            Some(129) => {}
+            _ => return true,
+        },
+        Err(_) => return true,
+    }
+
     let merge_base = Command::new("git")
         .args(["merge-base", base, branch])
         .current_dir(repo)
@@ -283,11 +346,11 @@ fn check_has_conflicts(repo: &Path, base: &str, branch: &str) -> bool {
         .current_dir(repo)
         .output();
     match result {
-        Ok(output) => {
+        Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             stdout.contains("<<<<<<") || stdout.contains("changed in both")
         }
-        Err(_) => true, // merge-tree failed — assume conflicts
+        _ => true, // merge-tree failed — assume conflicts
     }
 }
 
@@ -546,6 +609,19 @@ pub fn forced_auto_merge_decision(
         vec!["auto-merge forced by per-task override".to_string()],
         tests_passed,
         Some(true),
+    )
+}
+
+/// Decision used when the diff could not be analyzed: never auto-merge
+/// something we could not inspect.
+pub fn analysis_failed_decision(error: &str, tests_passed: bool) -> AutoMergeDecisionRecord {
+    AutoMergeDecisionRecord::from_summary(
+        None,
+        0.0,
+        AutoMergeDecisionKind::ManualReview,
+        vec![format!("diff analysis failed: {error}")],
+        tests_passed,
+        None,
     )
 }
 
@@ -1154,15 +1230,58 @@ mod tests {
     }
 
     #[test]
-    fn analyze_diff_on_non_git_dir_returns_empty_summary() {
+    fn analyze_diff_on_non_git_dir_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
-        // analyze_diff doesn't fail — git commands produce empty output on non-git dirs
-        // This verifies graceful degradation rather than hard failure
-        let result = analyze_diff(tmp.path(), "main", "feature");
-        if let Ok(summary) = result {
-            assert_eq!(summary.files_changed, 0);
-            assert_eq!(summary.total_lines(), 0);
+        // A non-git dir must not look like an empty (auto-mergeable) diff.
+        let err = analyze_diff(tmp.path(), "main", "feature").unwrap_err();
+        assert!(err.to_string().contains("git diff"), "{err:#}");
+    }
+
+    #[test]
+    fn analyze_diff_with_missing_branch_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::team::test_support::init_git_repo(&tmp, "am_missing");
+        assert!(analyze_diff(&repo, "main", "no-such-branch").is_err());
+    }
+
+    fn repo_with_branches(conflicting: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        use crate::team::test_support::git_ok;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::team::test_support::init_git_repo(&tmp, "am_conflict");
+        git_ok(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn feature() {}\n").unwrap();
+        git_ok(&repo, &["commit", "-am", "feature edit"]);
+        git_ok(&repo, &["checkout", "main"]);
+        if conflicting {
+            std::fs::write(repo.join("src/lib.rs"), "pub fn trunk() {}\n").unwrap();
+        } else {
+            std::fs::write(repo.join("other.txt"), "x\n").unwrap();
+            git_ok(&repo, &["add", "other.txt"]);
         }
-        // If it errors, that's also acceptable graceful behavior
+        git_ok(&repo, &["commit", "-am", "trunk edit"]);
+        (tmp, repo)
+    }
+
+    #[test]
+    fn analyze_diff_reports_clean_merge_without_conflicts() {
+        let (_tmp, repo) = repo_with_branches(false);
+        let summary = analyze_diff(&repo, "main", "feature").unwrap();
+        assert_eq!(summary.files_changed, 1);
+        assert!(!summary.has_conflicts);
+    }
+
+    #[test]
+    fn analyze_diff_detects_real_conflicts() {
+        let (_tmp, repo) = repo_with_branches(true);
+        let summary = analyze_diff(&repo, "main", "feature").unwrap();
+        assert!(summary.has_conflicts);
+    }
+
+    #[test]
+    fn check_has_conflicts_fails_closed_on_git_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(check_has_conflicts(tmp.path(), "main", "feature"));
+        let repo = crate::team::test_support::init_git_repo(&tmp, "am_err");
+        assert!(check_has_conflicts(&repo, "main", "no-such-branch"));
     }
 }

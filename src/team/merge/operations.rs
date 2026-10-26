@@ -20,6 +20,7 @@ use crate::team::verification::{self, VerifyStatus};
 
 use super::git_ops::{
     abort_failed_merge, describe_git_failure, force_clean_worktree, run_git_with_context,
+    run_git_with_context_allow_fail,
 };
 use super::lock::{MergeMode, MergeOutcome, MergeSuccess};
 
@@ -81,7 +82,7 @@ pub(crate) fn inspect_root_dirty_state(project_root: &Path) -> Result<RootDirtyS
 }
 
 fn git_name_only(project_root: &Path, args: &[&str]) -> Result<Vec<String>> {
-    let output = run_git_with_context(
+    let output = run_git_with_context_allow_fail(
         project_root,
         args,
         &format!("inspect root dirty paths with git {}", args.join(" ")),
@@ -152,13 +153,13 @@ pub(crate) fn merge_engineer_branch_into_trunk(
     info!(engineer = engineer_name, branch = %branch, "merging worktree branch");
 
     // Fetch latest trunk into the worktree so rebase sees current state.
-    let _ = run_git_with_context(
+    let _ = run_git_with_context_allow_fail(
         &worktree_dir,
         &["fetch", ".", &format!("{trunk_branch}:{trunk_branch}")],
         &format!("fetch {trunk_branch} into worktree before rebase"),
     );
 
-    let rebase = run_git_with_context(
+    let rebase = run_git_with_context_allow_fail(
         &worktree_dir,
         &["rebase", trunk_branch],
         &format!(
@@ -172,7 +173,7 @@ pub(crate) fn merge_engineer_branch_into_trunk(
         let resolved = try_auto_resolve_rebase(&worktree_dir);
         if !resolved {
             let stderr = String::from_utf8_lossy(&rebase.stderr).trim().to_string();
-            let _ = run_git_with_context(
+            let _ = run_git_with_context_allow_fail(
                 &worktree_dir,
                 &["rebase", "--abort"],
                 &format!("abort rebase for engineer branch '{branch}' after conflict"),
@@ -303,7 +304,7 @@ fn merge_branch_into_root_trunk(
     branch: &str,
     trunk_branch: &str,
 ) -> Result<()> {
-    let output = run_git_with_context(
+    let output = run_git_with_context_allow_fail(
         project_root,
         &["merge", branch, "--no-edit"],
         &format!("merge engineer branch '{branch}' from '{engineer_name}' into {trunk_branch}"),
@@ -332,7 +333,7 @@ fn merge_branch_via_isolated_integration(
     branch: &str,
     trunk_branch: &str,
 ) -> Result<()> {
-    let trunk_before = run_git_with_context(
+    let trunk_before = run_git_with_context_allow_fail(
         project_root,
         &["rev-parse", &format!("refs/heads/{trunk_branch}")],
         &format!("capture {trunk_branch} ref before isolated merge"),
@@ -348,7 +349,7 @@ fn merge_branch_via_isolated_integration(
         .to_string();
     let integration =
         crate::worktree::prepare_integration_worktree(project_root, "merge-main-", trunk_branch)?;
-    let merge = run_git_with_context(
+    let merge = run_git_with_context_allow_fail(
         integration.path(),
         &["merge", branch, "--no-edit"],
         &format!(
@@ -370,7 +371,7 @@ fn merge_branch_via_isolated_integration(
         );
     }
 
-    let integration_head = run_git_with_context(
+    let integration_head = run_git_with_context_allow_fail(
         integration.path(),
         &["rev-parse", "HEAD"],
         "capture isolated integration merge head",
@@ -384,7 +385,38 @@ fn merge_branch_via_isolated_integration(
     let integration_head = String::from_utf8_lossy(&integration_head.stdout)
         .trim()
         .to_string();
-    let advance_trunk = run_git_with_context(
+
+    // If the root checkout has trunk checked out (isolated mode because it is
+    // dirty), moving the ref with update-ref would leave root's index and
+    // worktree at the old tip: the merge would then show up as staged
+    // reversals and a `commit -a` in root would undo it. Fast-forward the
+    // checkout instead, which moves ref, index and worktree together and
+    // refuses (losing nothing) when the merge touches locally modified files.
+    let root_head = run_git_with_context_allow_fail(
+        project_root,
+        &["symbolic-ref", "-q", "HEAD"],
+        "inspect root checkout HEAD before isolated merge",
+    )?;
+    let root_on_trunk = root_head.status.success()
+        && String::from_utf8_lossy(&root_head.stdout).trim()
+            == format!("refs/heads/{trunk_branch}");
+    if root_on_trunk {
+        let ff = run_git_with_context_allow_fail(
+            project_root,
+            &["merge", "--ff-only", "--no-edit", integration_head.as_str()],
+            &format!("fast-forward dirty root {trunk_branch} checkout to isolated merge"),
+        )?;
+        if !ff.status.success() {
+            bail!(
+                "root {trunk_branch} checkout is dirty and its local changes conflict with the merge; \
+                 deferring until the root checkout is clean: {}",
+                String::from_utf8_lossy(&ff.stderr).trim()
+            );
+        }
+        return Ok(());
+    }
+
+    let advance_trunk = run_git_with_context_allow_fail(
         project_root,
         &[
             "update-ref",
@@ -403,65 +435,127 @@ fn merge_branch_via_isolated_integration(
     Ok(())
 }
 
-/// Try to auto-resolve rebase conflicts for files that batty manages.
-/// Returns true if all conflicts were resolved and the rebase completed.
-fn try_auto_resolve_rebase(worktree_dir: &Path) -> bool {
-    // List conflicted files
-    let status = match run_git_with_context(
+/// Conflicted paths batty may resolve by taking trunk's version. Only
+/// daemon-generated files belong here: anything an engineer could
+/// legitimately edit (e.g. `src/team/templates/batty_*`) must go through the
+/// normal conflict path so their changes are not silently dropped.
+fn is_auto_resolvable_managed_file(path: &str) -> bool {
+    path == ".cargo/config.toml" || path.ends_with("/.cargo/config.toml")
+}
+
+fn list_unmerged_paths(worktree_dir: &Path) -> Option<Vec<String>> {
+    let output = run_git_with_context(
         worktree_dir,
         &["diff", "--name-only", "--diff-filter=U"],
         "list rebase conflicts",
-    ) {
-        Ok(out) => out,
-        Err(_) => return false,
-    };
-    let raw = String::from_utf8_lossy(&status.stdout).trim().to_string();
-    let conflicts: Vec<&str> = raw.lines().collect();
+    )
+    .ok()?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
 
-    if conflicts.is_empty() {
+/// True when `path` is fully resolved in the index (no unmerged stages) and
+/// its staged content carries no conflict markers.
+fn staged_resolution_is_clean(worktree_dir: &Path, path: &str) -> bool {
+    let unmerged = run_git_with_context(
+        worktree_dir,
+        &["ls-files", "-u", "--", path],
+        &format!("check {path} is resolved"),
+    );
+    match unmerged {
+        Ok(output) if output.stdout.is_empty() => {}
+        _ => return false,
+    }
+    let stage_spec = format!(":0:{path}");
+    match run_git_with_context(
+        worktree_dir,
+        &["show", stage_spec.as_str()],
+        &format!("read staged {path}"),
+    ) {
+        Ok(output) => !contains_conflict_markers(&output.stdout),
+        Err(_) => false,
+    }
+}
+
+fn contains_conflict_markers(content: &[u8]) -> bool {
+    String::from_utf8_lossy(content).lines().any(|line| {
+        // `=======` alone is too common (markdown underlines) to treat as a marker.
+        line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> ")
+    })
+}
+
+/// Resolve a managed file by taking trunk's version. During a rebase "ours"
+/// is the upstream being rebased onto (trunk). Fails (returning false) when
+/// trunk has no version — e.g. a delete/modify conflict — or any step fails.
+fn resolve_managed_conflict_with_trunk(worktree_dir: &Path, path: &str) -> bool {
+    let checkout = run_git_with_context(
+        worktree_dir,
+        &["checkout", "--ours", "--", path],
+        &format!("auto-resolve conflict in {path} (accept trunk)"),
+    );
+    if let Err(error) = checkout {
+        warn!(file = path, error = %error, "could not take trunk version of conflicted file");
         return false;
     }
+    if let Err(error) = run_git_with_context(
+        worktree_dir,
+        &["add", "--", path],
+        &format!("stage auto-resolved {path}"),
+    ) {
+        warn!(file = path, error = %error, "could not stage auto-resolved file");
+        return false;
+    }
+    true
+}
 
-    // Auto-resolvable patterns: batty-managed configs and generated files
-    let auto_resolvable = |path: &str| -> bool {
-        path == ".cargo/config.toml"
-            || path.ends_with(".cargo/config.toml")
-            || path.starts_with("src/team/templates/batty_")
-    };
-
-    for conflict in &conflicts {
-        if auto_resolvable(conflict) {
-            // Accept trunk's version for managed files. During a rebase,
-            // "ours" is the upstream being rebased onto (trunk) and "theirs"
-            // is the engineer commit being replayed.
-            let _ = run_git_with_context(
-                worktree_dir,
-                &["checkout", "--ours", conflict],
-                &format!("auto-resolve conflict in {conflict} (accept main)"),
-            );
-            let _ = run_git_with_context(
-                worktree_dir,
-                &["add", conflict],
-                &format!("stage auto-resolved {conflict}"),
-            );
+/// Resolve every conflicted path, or return false so the caller takes the
+/// normal rebase-conflict path.
+fn resolve_rebase_conflicts(worktree_dir: &Path, conflicts: &[String]) -> bool {
+    for conflict in conflicts {
+        let resolved = if is_auto_resolvable_managed_file(conflict) {
+            resolve_managed_conflict_with_trunk(worktree_dir, conflict)
         } else if try_auto_resolve_additive_conflict(worktree_dir, conflict) {
             info!(
-                file = conflict,
+                file = %conflict,
                 "auto-resolved additive-only rebase conflict"
             );
+            true
         } else {
-            // Non-auto-resolvable conflict — bail
             info!(
-                file = conflict,
+                file = %conflict,
                 "rebase conflict in non-managed file, cannot auto-resolve"
+            );
+            return false;
+        };
+        if !resolved || !staged_resolution_is_clean(worktree_dir, conflict) {
+            warn!(
+                file = %conflict,
+                "auto-resolution left the file unresolved or with conflict markers"
             );
             return false;
         }
     }
+    true
+}
+
+/// Try to auto-resolve rebase conflicts for files that batty manages.
+/// Returns true if all conflicts were resolved and the rebase completed.
+fn try_auto_resolve_rebase(worktree_dir: &Path) -> bool {
+    let Some(conflicts) = list_unmerged_paths(worktree_dir) else {
+        return false;
+    };
+    if conflicts.is_empty() || !resolve_rebase_conflicts(worktree_dir, &conflicts) {
+        return false;
+    }
 
     // Continue the rebase — may need multiple rounds if there are stacked conflicts
     for _ in 0..20 {
-        let cont = run_git_with_context(
+        let cont = run_git_with_context_allow_fail(
             worktree_dir,
             &["rebase", "--continue"],
             "continue rebase after auto-resolve",
@@ -469,37 +563,14 @@ fn try_auto_resolve_rebase(worktree_dir: &Path) -> bool {
         match cont {
             Ok(output) if output.status.success() => return true,
             Ok(_) => {
-                // Another conflict — try to auto-resolve again
-                let status = run_git_with_context(
-                    worktree_dir,
-                    &["diff", "--name-only", "--diff-filter=U"],
-                    "list remaining rebase conflicts",
-                );
-                let remaining: Vec<String> = match status {
-                    Ok(out) => String::from_utf8_lossy(&out.stdout)
-                        .trim()
-                        .lines()
-                        .map(String::from)
-                        .collect(),
-                    Err(_) => return false,
+                let Some(remaining) = list_unmerged_paths(worktree_dir) else {
+                    return false;
                 };
                 if remaining.is_empty() {
                     continue; // no conflicts, just needs --continue again
                 }
-                for r in &remaining {
-                    if auto_resolvable(r) {
-                        let _ = run_git_with_context(
-                            worktree_dir,
-                            &["checkout", "--ours", r],
-                            &format!("auto-resolve {r}"),
-                        );
-                        let _ =
-                            run_git_with_context(worktree_dir, &["add", r], &format!("stage {r}"));
-                    } else if try_auto_resolve_additive_conflict(worktree_dir, r) {
-                        info!(file = r, "auto-resolved additive-only rebase conflict");
-                    } else {
-                        return false;
-                    }
+                if !resolve_rebase_conflicts(worktree_dir, &remaining) {
+                    return false;
                 }
             }
             Err(_) => return false,
@@ -528,7 +599,7 @@ fn try_auto_resolve_additive_conflict(worktree_dir: &Path, path: &str) -> bool {
     };
 
     std::fs::write(worktree_dir.join(path), merged).is_ok()
-        && run_git_with_context(
+        && run_git_with_context_allow_fail(
             worktree_dir,
             &["add", path],
             &format!("stage additive-only conflict resolution for {path}"),
@@ -538,7 +609,7 @@ fn try_auto_resolve_additive_conflict(worktree_dir: &Path, path: &str) -> bool {
 
 fn read_conflict_stage(worktree_dir: &Path, stage: u8, path: &str) -> Option<String> {
     let stage_spec = format!(":{stage}:{path}");
-    let output = run_git_with_context(
+    let output = run_git_with_context_allow_fail(
         worktree_dir,
         &["show", stage_spec.as_str()],
         &format!("read stage {stage} for conflicted path {path}"),
@@ -1621,5 +1692,137 @@ overall_parity: 100%
         let branch = current_worktree_branch(&worktree_dir).unwrap();
         assert_eq!(branch, "eng-wip/88");
         assert!(worktree_dir.join("wip.txt").exists());
+    }
+
+    // --- isolated merge with trunk checked out in root ---------------------------
+
+    fn status_without_batty(repo: &Path) -> String {
+        git_stdout(
+            repo,
+            &["status", "--porcelain", "--", ".", ":(exclude).batty"],
+        )
+    }
+
+    #[test]
+    fn isolated_merge_moves_dirty_root_checkout_with_trunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "isolated-dirty-root");
+        git_ok(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("feat.txt"), "feature\n").unwrap();
+        git_ok(&repo, &["add", "feat.txt"]);
+        git_ok(&repo, &["commit", "-q", "-m", "feature"]);
+        git_ok(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("Cargo.toml"), "# user edit\n").unwrap();
+        assert_eq!(
+            plan_root_merge(&repo, "main").unwrap().mode,
+            MergeMode::IsolatedIntegration
+        );
+
+        merge_branch_via_isolated_integration(&repo, "eng-1", "feature", "main").unwrap();
+
+        // Ref, index and worktree moved together; the user's edit survives and
+        // is the only local change (no phantom reversal of the merge).
+        assert!(repo.join("feat.txt").exists());
+        assert_eq!(status_without_batty(&repo), "M Cargo.toml");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("Cargo.toml")).unwrap(),
+            "# user edit\n"
+        );
+        git_ok(&repo, &["merge-base", "--is-ancestor", "feature", "main"]);
+    }
+
+    #[test]
+    fn isolated_merge_defers_when_root_changes_overlap_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "isolated-overlap");
+        git_ok(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("Cargo.toml"), "# engineer edit\n").unwrap();
+        git_ok(&repo, &["commit", "-q", "-am", "feature"]);
+        git_ok(&repo, &["checkout", "-q", "main"]);
+        let main_before = git_stdout(&repo, &["rev-parse", "main"]);
+        std::fs::write(repo.join("Cargo.toml"), "# user edit\n").unwrap();
+
+        let err = merge_branch_via_isolated_integration(&repo, "eng-1", "feature", "main")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("deferring"), "{err}");
+        assert_eq!(git_stdout(&repo, &["rev-parse", "main"]), main_before);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("Cargo.toml")).unwrap(),
+            "# user edit\n"
+        );
+    }
+
+    // --- rebase auto-resolve -------------------------------------------------------
+
+    /// Commit `path` on main, edit it on `feature` and (unless `delete_on_main`)
+    /// edit it differently on main, then start a conflicting rebase.
+    fn start_conflicting_rebase(repo: &Path, path: &str, delete_on_main: bool) {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "base\n").unwrap();
+        git_ok(repo, &["add", path]);
+        git_ok(repo, &["commit", "-q", "-m", "add file"]);
+        git_ok(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(&file, "engineer\n").unwrap();
+        git_ok(repo, &["commit", "-q", "-am", "engineer edit"]);
+        git_ok(repo, &["checkout", "-q", "main"]);
+        if delete_on_main {
+            git_ok(repo, &["rm", "-q", path]);
+        } else {
+            std::fs::write(&file, "trunk\n").unwrap();
+            git_ok(repo, &["add", path]);
+        }
+        git_ok(repo, &["commit", "-q", "-m", "trunk edit"]);
+        git_ok(repo, &["checkout", "-q", "feature"]);
+        assert!(!git(repo, &["rebase", "main"]).status.success());
+    }
+
+    #[test]
+    fn auto_resolve_takes_trunk_for_managed_cargo_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "auto-resolve-cargo");
+        start_conflicting_rebase(&repo, ".cargo/config.toml", false);
+        assert!(try_auto_resolve_rebase(&repo));
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".cargo/config.toml")).unwrap(),
+            "trunk\n"
+        );
+    }
+
+    #[test]
+    fn auto_resolve_refuses_delete_modify_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "auto-resolve-delete");
+        start_conflicting_rebase(&repo, ".cargo/config.toml", true);
+        assert!(!try_auto_resolve_rebase(&repo));
+        let staged = git(&repo, &["show", ":0:.cargo/config.toml"]);
+        assert!(
+            !staged.status.success() || !contains_conflict_markers(&staged.stdout),
+            "conflict markers must never be staged"
+        );
+        git_ok(&repo, &["rebase", "--abort"]);
+    }
+
+    #[test]
+    fn auto_resolve_no_longer_drops_template_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "auto-resolve-template");
+        start_conflicting_rebase(&repo, "src/team/templates/batty_engineer.md", false);
+        assert!(!try_auto_resolve_rebase(&repo));
+        git_ok(&repo, &["rebase", "--abort"]);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/team/templates/batty_engineer.md")).unwrap(),
+            "engineer\n"
+        );
+    }
+
+    #[test]
+    fn conflict_marker_detection() {
+        assert!(contains_conflict_markers(
+            b"a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> x\n"
+        ));
+        assert!(!contains_conflict_markers(b"Title\n=======\nbody\n"));
     }
 }
