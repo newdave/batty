@@ -415,7 +415,7 @@ impl TeamDaemon {
             }
 
             for msg in &messages {
-                info!(from = %msg.from, to = %user_name, id = %msg.id, "delivering to user channel");
+                debug!(from = %msg.from, to = %user_name, id = %msg.id, "delivering to user channel");
 
                 let formatted = format!("--- Message from {} ---\n{}", msg.from, msg.body);
                 let send_result = match self.channels.get(user_name) {
@@ -432,6 +432,7 @@ impl TeamDaemon {
                     break;
                 }
 
+                info!(from = %msg.from, to = %user_name, id = %msg.id, "delivered to user channel");
                 if let Err(error) = inbox::mark_delivered(&root, user_name, &msg.id) {
                     warn!(user = %user_name, id = %msg.id, error = %error, "failed to mark delivered");
                 }
