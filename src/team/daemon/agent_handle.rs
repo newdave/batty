@@ -49,6 +49,29 @@ pub(in crate::team) struct AgentHandle {
     pub last_activity_at: Option<Instant>,
     /// Most recent message delivered into the shim and still awaiting completion.
     pub in_flight_message: Option<InFlightMessage>,
+    /// Set when a write hit EPIPE/ECONNRESET: the shim end of the socketpair
+    /// is gone. The poll loop turns this into the normal died/respawn path.
+    pub channel_broken: bool,
+}
+
+/// Whether an `anyhow` error wraps a transient non-blocking/timed-out write.
+pub(in crate::team) fn is_transient_send_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    })
+}
+
+/// Whether an `anyhow` error wraps a write to a closed peer.
+pub(in crate::team) fn is_broken_pipe_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        )
+    })
 }
 
 impl AgentHandle {
@@ -77,6 +100,7 @@ impl AgentHandle {
             input_bytes: 0,
             last_activity_at: None,
             in_flight_message: None,
+            channel_broken: false,
         }
     }
 
@@ -124,11 +148,28 @@ impl AgentHandle {
             body: body.to_string(),
             message_id: message_id.clone(),
         });
-        self.channel.send(&Command::SendMessage {
+        let result = self.channel.send(&Command::SendMessage {
             from: from.to_string(),
             body: body.to_string(),
             message_id,
-        })
+        });
+        if let Err(error) = &result {
+            // Nothing was sent, so there is nothing in flight to replay.
+            self.in_flight_message = None;
+            if is_broken_pipe_error(error) {
+                self.mark_channel_broken();
+            }
+        }
+        result
+    }
+
+    /// Record that the shim end of the channel is gone: stop treating the
+    /// handle as deliverable and let the poll loop run the respawn path.
+    pub fn mark_channel_broken(&mut self) {
+        self.channel_broken = true;
+        if self.state != ShimState::Dead {
+            self.apply_state_change(ShimState::Dead);
+        }
     }
 
     /// Send a shutdown command to the shim.
@@ -306,6 +347,27 @@ mod tests {
             }
             _ => panic!("expected SendMessage, got {:?}", cmd),
         }
+    }
+
+    #[test]
+    fn send_to_closed_peer_marks_channel_broken_and_dead() {
+        let (mut handle, child) = make_test_handle();
+        drop(child);
+        let error = handle.send_message("manager", "hi").unwrap_err();
+        assert!(is_broken_pipe_error(&error), "{error:?}");
+        assert!(handle.channel_broken);
+        assert!(handle.is_terminal());
+        assert!(handle.in_flight_message.is_none());
+    }
+
+    #[test]
+    fn classifies_transient_and_broken_pipe_errors() {
+        let busy: anyhow::Error = std::io::Error::from_raw_os_error(libc::EAGAIN).into();
+        assert!(is_transient_send_error(&busy));
+        assert!(!is_broken_pipe_error(&busy));
+        let pipe: anyhow::Error = std::io::Error::from_raw_os_error(libc::EPIPE).into();
+        assert!(is_broken_pipe_error(&pipe));
+        assert!(!is_transient_send_error(&pipe));
     }
 
     #[test]

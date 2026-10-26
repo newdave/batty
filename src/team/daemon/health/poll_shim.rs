@@ -187,6 +187,22 @@ impl TeamDaemon {
         let member_names: Vec<String> = self.shim_handles.keys().cloned().collect();
 
         for name in &member_names {
+            // A write hit EPIPE: the shim is gone. Route through the normal
+            // died/respawn handling exactly once.
+            if self
+                .shim_handles
+                .get_mut(name)
+                .is_some_and(|handle| std::mem::take(&mut handle.channel_broken))
+            {
+                self.handle_shim_event(
+                    name,
+                    Event::Died {
+                        exit_code: None,
+                        last_lines: "shim channel broken (broken pipe on write)".into(),
+                    },
+                )?;
+                continue;
+            }
             loop {
                 // Drain all currently queued events for this shim before
                 // moving on. A busy shim can emit SessionStats, state

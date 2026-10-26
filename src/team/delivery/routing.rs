@@ -1260,6 +1260,11 @@ impl TeamDaemon {
             if is_ready {
                 match self.send_live_shim_message(recipient, from, body, message_id, Vec::new()) {
                     Ok(delivery) => return Ok(delivery),
+                    Err(error)
+                        if super::super::daemon::agent_handle::is_transient_send_error(&error) =>
+                    {
+                        debug!(from, to = recipient, error = %error, "shim channel busy; falling through to inbox for retry");
+                    }
                     Err(error) => {
                         warn!(from, to = recipient, error = %error, "shim channel delivery failed; falling through to inbox");
                     }
@@ -1720,13 +1725,22 @@ impl TeamDaemon {
                         }
                     }
                     Err(error) => {
-                        warn!(
-                            from = %msg.from,
-                            to = %name,
-                            id = %msg.id,
-                            error = %error,
-                            "failed to deliver inbox message"
-                        );
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                            matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            )
+                        }) {
+                            debug!(from = %msg.from, to = %name, id = %msg.id, error = %error, "shim channel busy; inbox message stays pending");
+                        } else {
+                            warn!(
+                                from = %msg.from,
+                                to = %name,
+                                id = %msg.id,
+                                error = %error,
+                                "failed to deliver inbox message"
+                            );
+                        }
                         if matches!(msg.msg_type, inbox::MessageType::Assign) {
                             mark_delivered = true;
                             self.record_assignment_failure(name, &msg.id, &msg.body, &error);
@@ -1814,12 +1828,22 @@ impl TeamDaemon {
             message_id,
             ack_messages,
         ) {
-            warn!(
-                to = %member_name,
-                count = messages.len(),
-                error = %error,
-                "failed to deliver batched inbox messages"
-            );
+            if super::super::daemon::agent_handle::is_transient_send_error(&error) {
+                // Socket buffer full; messages stay in the inbox and retry next tick.
+                debug!(
+                    to = %member_name,
+                    count = messages.len(),
+                    error = %error,
+                    "shim channel busy; batched inbox messages stay pending"
+                );
+            } else {
+                warn!(
+                    to = %member_name,
+                    count = messages.len(),
+                    error = %error,
+                    "failed to deliver batched inbox messages"
+                );
+            }
             return Ok(false);
         }
 

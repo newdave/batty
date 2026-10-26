@@ -253,9 +253,21 @@ pub fn pending_message_count(inboxes_root: &Path, member: &str) -> Result<usize>
 /// Mark a message as delivered (move from `new/` to `cur/`).
 pub fn mark_delivered(inboxes_root: &Path, member: &str, id: &str) -> Result<()> {
     let md = member_maildir(inboxes_root, member);
-    md.move_new_to_cur(id)
-        .with_context(|| format!("failed to mark message '{id}' as delivered for '{member}'"))?;
-    Ok(())
+    match md.move_new_to_cur(id) {
+        Ok(()) => Ok(()),
+        // Already moved to cur/ by another path (duplicate shim ack, batched
+        // delivery re-ack): the message is delivered, so this is a no-op.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && md
+                    .find(id)
+                    .is_some_and(|entry| !entry.path().starts_with(md.path().join("new"))) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to mark message '{id}' as delivered for '{member}'")),
+    }
 }
 
 /// List all messages (both pending and delivered) for a member.
@@ -916,6 +928,26 @@ mod tests {
         let all = all_messages(root, "eng-1").unwrap();
         assert_eq!(all.len(), 1);
         assert!(all[0].1); // delivered = true
+    }
+
+    #[test]
+    fn mark_delivered_is_idempotent_for_already_delivered_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_inbox(root, "eng-1").unwrap();
+        let id = deliver_to_inbox(root, &InboxMessage::new_send("manager", "eng-1", "x")).unwrap();
+
+        mark_delivered(root, "eng-1", &id).unwrap();
+        mark_delivered(root, "eng-1", &id).unwrap();
+        assert!(pending_messages(root, "eng-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_delivered_still_errors_for_unknown_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_inbox(root, "eng-1").unwrap();
+        assert!(mark_delivered(root, "eng-1", "does-not-exist").is_err());
     }
 
     #[test]

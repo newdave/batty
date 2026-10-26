@@ -203,6 +203,10 @@ impl std::fmt::Display for ShimState {
 pub struct Channel {
     stream: UnixStream,
     read_buf: Vec<u8>,
+    /// Unsent tail of a frame whose write timed out mid-frame. It must be
+    /// flushed before any new frame, otherwise the length-prefixed stream
+    /// would be corrupted by interleaving.
+    pending_out: Vec<u8>,
 }
 
 const MAX_MSG: usize = 1_048_576; // 1 MB
@@ -212,19 +216,64 @@ impl Channel {
         Self {
             stream,
             read_buf: vec![0u8; 4096],
+            pending_out: Vec::new(),
         }
     }
 
+    /// Write `buf`, returning how many bytes were written. On a write
+    /// timeout / EAGAIN the bytes already written are reported as success so
+    /// the caller can keep the remainder instead of re-sending the frame.
+    fn write_partial(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut written = 0;
+        while written < buf.len() {
+            match self.stream.write(&buf[written..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if written > 0
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(written)
+    }
+
     /// Send a serializable message.
+    ///
+    /// A write timeout before any byte of the frame is written returns an
+    /// error with nothing sent (safe to retry). A timeout after a partial
+    /// write returns `Ok`: the frame is committed and its remainder is
+    /// flushed before the next frame, so the stream is never corrupted and
+    /// the message is never duplicated.
     pub fn send<T: Serialize>(&mut self, msg: &T) -> anyhow::Result<()> {
         let json = serde_json::to_vec(msg)?;
         if json.len() > MAX_MSG {
             anyhow::bail!("message too large: {} bytes", json.len());
         }
-        let len = (json.len() as u32).to_be_bytes();
-        self.stream.write_all(&len)?;
-        self.stream.write_all(&json)?;
-        self.stream.flush()?;
+        if !self.pending_out.is_empty() {
+            let pending = std::mem::take(&mut self.pending_out);
+            let n = self.write_partial(&pending).inspect_err(|_| {
+                self.pending_out = pending.clone();
+            })?;
+            if n < pending.len() {
+                self.pending_out = pending[n..].to_vec();
+                return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
+            }
+        }
+        let mut frame = Vec::with_capacity(4 + json.len());
+        frame.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&json);
+        let n = self.write_partial(&frame)?;
+        if n < frame.len() {
+            self.pending_out = frame[n..].to_vec();
+        }
         Ok(())
     }
 
@@ -281,6 +330,7 @@ impl Channel {
         Ok(Self {
             stream: self.stream.try_clone()?,
             read_buf: vec![0u8; 4096],
+            pending_out: Vec::new(),
         })
     }
 }
@@ -839,6 +889,66 @@ mod tests {
         ch_a.send(&Command::Ping).unwrap();
         let msg: Command = ch_b.recv().unwrap().unwrap();
         assert!(matches!(msg, Command::Ping));
+    }
+
+    #[test]
+    fn partial_write_timeout_does_not_corrupt_frame_stream() {
+        let (a, b) = socketpair().unwrap();
+        let mut sender = Channel::new(a);
+        sender
+            .set_write_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let mut receiver = Channel::new(b);
+
+        let make = |tag: &str| Command::SendMessage {
+            from: "daemon".into(),
+            body: format!("{tag}{}", "x".repeat(512 * 1024)),
+            message_id: None,
+        };
+        // Nobody is reading, so this frame is written only partially; the
+        // send is committed (Ok) and its tail is held for the next send.
+        sender.send(&make("A")).unwrap();
+        assert!(!sender.pending_out.is_empty());
+
+        let reader = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                match receiver.recv::<Command>().unwrap().unwrap() {
+                    Command::SendMessage { body, .. } => bodies.push(body),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            bodies
+        });
+        let start = std::time::Instant::now();
+        while sender.send(&make("B")).is_err() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let bodies = reader.join().unwrap();
+        assert!(bodies[0].starts_with('A') && bodies[0].len() == 512 * 1024 + 1);
+        assert!(bodies[1].starts_with('B') && bodies[1].len() == 512 * 1024 + 1);
+    }
+
+    #[test]
+    fn send_with_nothing_written_on_timeout_is_retryable_error() {
+        let (a, _b) = socketpair().unwrap();
+        let mut sender = Channel::new(a);
+        sender
+            .set_write_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let cmd = Command::SendMessage {
+            from: "d".into(),
+            body: "x".repeat(512 * 1024),
+            message_id: None,
+        };
+        sender.send(&cmd).unwrap(); // partial, committed
+        let err = sender.send(&cmd).unwrap_err();
+        assert!(!sender.pending_out.is_empty());
+        assert!(err.downcast_ref::<io::Error>().is_some_and(|e| matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        )));
     }
 
     #[test]
