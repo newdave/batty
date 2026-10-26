@@ -293,6 +293,11 @@ impl TeamDaemon {
         if !self.member_uses_worktrees(name) && !worktree_dir.exists() {
             return Ok(());
         }
+        // Members removed while the daemon was down never went through
+        // remove_member; release their active claims so cleanup can proceed.
+        if let Err(error) = self.requeue_removed_member_tasks(name) {
+            warn!(member = name, error = %error, "failed to requeue board tasks for removed member");
+        }
         if self.removed_member_still_owns_board_work(name)? {
             self.warn_removed_member_cleanup_refusal(
                 "board-claims-work",
@@ -358,9 +363,9 @@ impl TeamDaemon {
         if !tasks_dir.exists() {
             return Ok(false);
         }
-        Ok(load_tasks_from_dir(&tasks_dir)?
-            .into_iter()
-            .any(|task| task.claimed_by.as_deref() == Some(name)))
+        Ok(load_tasks_from_dir(&tasks_dir)?.into_iter().any(|task| {
+            task.claimed_by.as_deref() == Some(name) && !task_is_finished(&task.status)
+        }))
     }
 
     fn cleanup_removed_member_git_worktree(
@@ -432,18 +437,8 @@ impl TeamDaemon {
         message: &str,
     ) {
         let key = removed_member_cleanup_refusal_key(reason, name, worktree_dir, branch);
-        let cooldown = Duration::from_secs(
-            self.config
-                .team_config
-                .automation
-                .intervention_cooldown_secs,
-        );
-        if cooldown > Duration::ZERO
-            && self
-                .intervention_cooldowns
-                .get(&key)
-                .is_some_and(|last| last.elapsed() < cooldown)
-        {
+        // Log each distinct refusal once; repeating it every cycle is noise.
+        if self.intervention_cooldowns.contains_key(&key) {
             return;
         }
 
@@ -460,9 +455,7 @@ impl TeamDaemon {
                 "{message}"
             ),
         }
-        if cooldown > Duration::ZERO {
-            self.intervention_cooldowns.insert(key, Instant::now());
-        }
+        self.intervention_cooldowns.insert(key, Instant::now());
     }
 
     fn requeue_removed_member_tasks(&mut self, name: &str) -> Result<()> {
@@ -473,7 +466,7 @@ impl TeamDaemon {
         }
 
         for task in load_tasks_from_dir(&tasks_dir)? {
-            if task.claimed_by.as_deref() != Some(name) {
+            if task.claimed_by.as_deref() != Some(name) || task_is_finished(&task.status) {
                 continue;
             }
 
@@ -663,6 +656,11 @@ fn archived_removed_member_branch_name(repo_root: &Path, branch: &str) -> Result
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Finished tasks keep their historical claim and must not block worktree cleanup.
+fn task_is_finished(status: &str) -> bool {
+    matches!(status, "done" | "archived")
+}
 
 #[cfg(test)]
 mod tests {
@@ -873,6 +871,54 @@ mod tests {
         .unwrap();
         assert_eq!(task.status, "todo");
         assert_eq!(task.claimed_by, None);
+    }
+
+    #[test]
+    fn removed_member_finished_claims_do_not_block_cleanup_or_get_requeued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = make_test_daemon(
+            tmp.path(),
+            vec![engineer_member("eng-1", Some("manager"), false)],
+        );
+        write_board_task_file(tmp.path(), 50, "old", "done", Some("eng-1"), &[], None);
+        assert!(
+            !daemon
+                .removed_member_still_owns_board_work("eng-1")
+                .unwrap()
+        );
+        daemon.requeue_removed_member_tasks("eng-1").unwrap();
+        assert!(
+            !daemon
+                .removed_member_still_owns_board_work("eng-1")
+                .unwrap()
+        );
+        write_board_task_file(
+            tmp.path(),
+            51,
+            "live",
+            "in-progress",
+            Some("eng-1"),
+            &[],
+            None,
+        );
+        assert!(
+            daemon
+                .removed_member_still_owns_board_work("eng-1")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn removed_member_cleanup_refusal_is_logged_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = make_test_daemon(tmp.path(), vec![]);
+        let dir = tmp.path().join("wt");
+        daemon.warn_removed_member_cleanup_refusal("r", "eng-1", &dir, None, "m");
+        let key = super::removed_member_cleanup_refusal_key("r", "eng-1", &dir, None);
+        let first = daemon.intervention_cooldowns[&key];
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        daemon.warn_removed_member_cleanup_refusal("r", "eng-1", &dir, None, "m");
+        assert_eq!(daemon.intervention_cooldowns[&key], first);
     }
 
     #[test]

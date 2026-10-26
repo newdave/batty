@@ -988,8 +988,11 @@ pub(crate) fn repair_board_frontmatter_compat(
         if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
-        if let Some(repair) = normalize_blocked_frontmatter(&path)? {
-            repairs.push(repair);
+        // One malformed task file must not fail the whole scan.
+        match normalize_blocked_frontmatter(&path) {
+            Ok(Some(repair)) => repairs.push(repair),
+            Ok(None) => {}
+            Err(error) => crate::task::warn_unparseable_task_once(&path, &error),
         }
     }
 
@@ -1463,6 +1466,23 @@ Body.\n",
             )
         );
         assert!(content.ends_with("\n\nTask body.\n"));
+    }
+
+    #[test]
+    fn repair_board_frontmatter_compat_skips_malformed_task_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board_dir = tmp.path();
+        let tasks_dir = board_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join("009-bad.md"),
+            "---\nid: 9\ntitle: PROXY-10 e2e: a new area\nstatus: todo\n---\n\nBody\n",
+        )
+        .unwrap();
+        write_task_file(board_dir, 10, "todo");
+
+        let repairs = repair_board_frontmatter_compat(board_dir).unwrap();
+        assert!(repairs.is_empty());
     }
 
     #[test]

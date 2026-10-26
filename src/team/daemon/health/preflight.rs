@@ -173,15 +173,13 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn ensure_git_ready_rejects_dirty_repo_outside_batty() {
+    fn ensure_git_ready_warns_but_allows_dirty_repo_outside_batty() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "preflight-dirty-source");
         let source_file = repo.join("src").join("main.rs");
         std::fs::write(&source_file, "fn main() { println!(\"dirty\"); }\n").unwrap();
 
-        let err = ensure_git_ready(&repo).unwrap_err().to_string();
-        assert!(err.contains("git worktree is dirty"));
-        assert!(err.contains("src/main.rs"));
+        ensure_git_ready(&repo).unwrap();
     }
 
     #[test]

@@ -174,9 +174,11 @@ pub(super) fn ensure_git_ready(project_root: &Path) -> Result<()> {
         .map(str::to_string)
         .collect();
     if !dirty_lines.is_empty() {
-        bail!(
-            "daemon startup pre-flight failed: git worktree is dirty:\n{}",
-            dirty_lines.join("\n")
+        // Consistent with the running daemon: warn (auto-merges are blocked)
+        // rather than refusing to start while a human edits files in the root.
+        tracing::warn!(
+            dirty = %dirty_lines.join("\n"),
+            "project root has dirty source changes that will block review auto-merges"
         );
     }
 

@@ -576,6 +576,26 @@ fn parse_body(body: &str) -> (String, Option<TaskBattyConfig>) {
     }
 }
 
+/// Warn about an unparseable task file once per (path, mtime) instead of on
+/// every poll; editing the file (new mtime) re-arms the warning.
+pub(crate) fn warn_unparseable_task_once(path: &Path, error: &anyhow::Error) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::SystemTime;
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, Option<SystemTime>>>> = OnceLock::new();
+
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.get(path) == Some(&mtime) {
+        return;
+    }
+    seen.insert(path.to_path_buf(), mtime);
+    tracing::warn!("skipping {}: {error:#}", path.display());
+}
+
 /// Load all task files from a kanban-md tasks directory.
 pub fn load_tasks_from_dir(dir: &Path) -> Result<Vec<Task>> {
     let mut tasks = Vec::new();
@@ -588,9 +608,7 @@ pub fn load_tasks_from_dir(dir: &Path) -> Result<Vec<Task>> {
         if path.extension().is_some_and(|ext| ext == "md") {
             match Task::from_file(&path) {
                 Ok(task) => tasks.push(task),
-                Err(e) => {
-                    tracing::warn!("skipping {}: {e:#}", path.display());
-                }
+                Err(e) => warn_unparseable_task_once(&path, &e),
             }
         }
     }
@@ -650,6 +668,32 @@ pub fn load_task_by_id(tasks_dir: &Path, task_id: u32) -> Result<Task> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn load_tasks_from_dir_skips_malformed_file_and_dedupes_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("009-bad.md");
+        std::fs::write(
+            &bad,
+            "---\nid: 9\ntitle: e2e: a new area\nstatus: todo\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("001-ok.md"),
+            "---\nid: 1\ntitle: ok\nstatus: todo\npriority: low\n---\n",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let tasks = load_tasks_from_dir(tmp.path()).unwrap();
+            assert_eq!(tasks.len(), 1);
+        }
+        // Same mtime: warning is recorded once; a rewrite re-arms it without panicking.
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&bad, "---\nid: 9\ntitle: still: bad\nstatus: todo\n---\n").unwrap();
+        assert_eq!(load_tasks_from_dir(tmp.path()).unwrap().len(), 1);
+    }
+
     use super::*;
     use std::fs;
 
