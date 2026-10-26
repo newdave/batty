@@ -330,6 +330,6 @@ pub(super) fn save_daemon_state(
     }
     let content =
         serde_json::to_string_pretty(state).context("failed to serialize daemon state")?;
-    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    crate::atomic_file::write(&path, content)?;
     Ok(())
 }

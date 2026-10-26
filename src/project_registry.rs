@@ -766,7 +766,7 @@ fn save_registry(path: &Path, registry: &ProjectRegistry) -> Result<()> {
     }
 
     let content = serde_json::to_string_pretty(registry)?;
-    std::fs::write(path, format!("{content}\n"))
+    crate::atomic_file::write(path, format!("{content}\n"))
         .with_context(|| format!("failed to write registry {}", path.display()))?;
     Ok(())
 }
@@ -780,7 +780,7 @@ fn save_routing_state(path: &Path, state: &ProjectRoutingState) -> Result<()> {
     }
 
     let content = serde_json::to_string_pretty(state)?;
-    std::fs::write(path, format!("{content}\n"))
+    crate::atomic_file::write(path, format!("{content}\n"))
         .with_context(|| format!("failed to write routing state {}", path.display()))?;
     Ok(())
 }

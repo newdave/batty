@@ -474,7 +474,7 @@ fn save_watchdog_state(project_root: &Path, state: &PersistedWatchdogState) -> R
     }
     let content =
         serde_json::to_string_pretty(state).context("failed to serialize watchdog state")?;
-    std::fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))
+    crate::atomic_file::write(&path, content)
 }
 
 /// Spawn the daemon as a detached background process.

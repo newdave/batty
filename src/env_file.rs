@@ -39,7 +39,8 @@ pub fn upsert_env_var(path: &Path, key: &str, value: &str) -> Result<()> {
     } else {
         format!("{}\n", lines.join("\n"))
     };
-    std::fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))?;
+    // Atomic and 0600: this file holds bot tokens and API keys.
+    crate::atomic_file::write(path, output)?;
     Ok(())
 }
 

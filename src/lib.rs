@@ -1,6 +1,7 @@
 #![allow(private_interfaces)]
 
 pub mod agent;
+pub mod atomic_file;
 pub mod cli;
 pub mod config;
 pub mod console_pane;

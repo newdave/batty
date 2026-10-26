@@ -58,7 +58,7 @@ impl TeamDaemon {
         let path = shim_state_path(&self.config.project_root);
         let json =
             serde_json::to_string_pretty(&state).context("failed to serialize shim state")?;
-        std::fs::write(&path, json)
+        crate::atomic_file::write(&path, json)
             .with_context(|| format!("failed to write shim state to {}", path.display()))?;
 
         info!(
