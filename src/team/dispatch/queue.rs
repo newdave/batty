@@ -1158,256 +1158,263 @@ impl TeamDaemon {
         // this re-check, the stale entry consumes the new cooldown by
         // dispatching on the very next drain.
         let rescued_task_ids = self.rescued_task_ids();
-        let mut pending: Vec<DispatchQueueEntry> = std::mem::take(&mut self.dispatch_queue);
+        let mut pending: std::collections::VecDeque<DispatchQueueEntry> =
+            std::mem::take(&mut self.dispatch_queue).into();
         let mut retained = Vec::new();
 
-        for mut entry in pending.drain(..) {
-            // Prune stale entries first: if the task is done, claimed by someone
-            // else, or no longer exists, drop the entry regardless of engineer
-            // state. Without this, entries for non-idle engineers persist forever.
-            let task_still_dispatchable =
-                self.task_for_dispatch_entry(&board_dir, &entry)?.is_some();
-            if !task_still_dispatchable {
-                debug!(
-                    engineer = %entry.engineer,
-                    task_id = entry.task_id,
-                    "dispatch queue: pruning stale entry (task done/claimed/missing)"
-                );
-                continue;
-            }
-            if rescued_task_ids.contains(&entry.task_id) {
-                info!(
-                    engineer = %entry.engineer,
-                    task_id = entry.task_id,
-                    "dispatch queue: pruning entry — task re-entered orphan-rescue cooldown"
-                );
-                continue;
-            }
-            // #697: drop entries where the engineer recently released
-            // this task. `enqueue_dispatch_candidates` filters at queue
-            // time; this catches the race where the entry was queued
-            // before the release was recorded in the same tick.
-            if self.is_release_excluded(entry.task_id, &entry.engineer) {
-                info!(
-                    engineer = %entry.engineer,
-                    task_id = entry.task_id,
-                    "dispatch queue: pruning entry — engineer recently released this task"
-                );
-                continue;
-            }
-            if benched_engineers.contains(&entry.engineer) {
-                debug!(
-                    engineer = %entry.engineer,
-                    task_id = entry.task_id,
-                    "dispatch queue: pruning benched engineer entry"
-                );
-                continue;
-            }
+        let mut in_flight: Option<DispatchQueueEntry> = None;
+        let result = (|| -> Result<()> {
+            while let Some(mut entry) = pending.pop_front() {
+                in_flight = Some(entry.clone());
+                // Prune stale entries first: if the task is done, claimed by someone
+                // else, or no longer exists, drop the entry regardless of engineer
+                // state. Without this, entries for non-idle engineers persist forever.
+                let task_still_dispatchable =
+                    self.task_for_dispatch_entry(&board_dir, &entry)?.is_some();
+                if !task_still_dispatchable {
+                    debug!(
+                        engineer = %entry.engineer,
+                        task_id = entry.task_id,
+                        "dispatch queue: pruning stale entry (task done/claimed/missing)"
+                    );
+                    continue;
+                }
+                if rescued_task_ids.contains(&entry.task_id) {
+                    info!(
+                        engineer = %entry.engineer,
+                        task_id = entry.task_id,
+                        "dispatch queue: pruning entry — task re-entered orphan-rescue cooldown"
+                    );
+                    continue;
+                }
+                // #697: drop entries where the engineer recently released
+                // this task. `enqueue_dispatch_candidates` filters at queue
+                // time; this catches the race where the entry was queued
+                // before the release was recorded in the same tick.
+                if self.is_release_excluded(entry.task_id, &entry.engineer) {
+                    info!(
+                        engineer = %entry.engineer,
+                        task_id = entry.task_id,
+                        "dispatch queue: pruning entry — engineer recently released this task"
+                    );
+                    continue;
+                }
+                if benched_engineers.contains(&entry.engineer) {
+                    debug!(
+                        engineer = %entry.engineer,
+                        task_id = entry.task_id,
+                        "dispatch queue: pruning benched engineer entry"
+                    );
+                    continue;
+                }
 
-            // Recover engineers stuck in Working with no active task.
-            // This happens when mark_member_working() fires but task
-            // delivery fails, leaving the state map inconsistent.
-            if self.states.get(&entry.engineer) == Some(&MemberState::Working)
-                && !self.active_tasks.contains_key(&entry.engineer)
-            {
-                info!(
-                    engineer = %entry.engineer,
-                    task_id = entry.task_id,
-                    "dispatch queue: recovering engineer stuck in Working with no active task"
-                );
-                self.states
-                    .insert(entry.engineer.clone(), MemberState::Idle);
-                self.update_automation_timers_for_state(&entry.engineer, MemberState::Idle);
-            }
+                // Recover engineers stuck in Working with no active task.
+                // This happens when mark_member_working() fires but task
+                // delivery fails, leaving the state map inconsistent.
+                if self.states.get(&entry.engineer) == Some(&MemberState::Working)
+                    && !self.active_tasks.contains_key(&entry.engineer)
+                {
+                    info!(
+                        engineer = %entry.engineer,
+                        task_id = entry.task_id,
+                        "dispatch queue: recovering engineer stuck in Working with no active task"
+                    );
+                    self.states
+                        .insert(entry.engineer.clone(), MemberState::Idle);
+                    self.update_automation_timers_for_state(&entry.engineer, MemberState::Idle);
+                }
 
-            if self.states.get(&entry.engineer) != Some(&MemberState::Idle) {
-                retained.push(entry);
-                continue;
-            }
-            if self.should_hold_dispatch_for_stabilization(&entry.engineer) {
-                retained.push(entry);
-                continue;
-            }
+                if self.states.get(&entry.engineer) != Some(&MemberState::Idle) {
+                    retained.push(entry);
+                    continue;
+                }
+                if self.should_hold_dispatch_for_stabilization(&entry.engineer) {
+                    retained.push(entry);
+                    continue;
+                }
 
-            let Some(task) = self.task_for_dispatch_entry(&board_dir, &entry)? else {
-                continue;
-            };
+                let Some(task) = self.task_for_dispatch_entry(&board_dir, &entry)? else {
+                    continue;
+                };
 
-            let retry_dispatchable = self.verification_retry_dispatchable_task(&task, true);
-            // Skip if the task is already in-progress, except retry-required
-            // rework that was intentionally left in-progress to preserve its
-            // failed verification metadata.
-            if task.status == "in-progress" && !retry_dispatchable {
-                info!(
-                    engineer = %entry.engineer,
-                    task_id = task.id,
-                    "dispatch queue: task already in-progress, skipping"
-                );
-                continue;
-            }
-
-            // Skip if the task body has unmet text dependencies
-            // (e.g. "Blocked on: #65, #66" where those tasks aren't done)
-            if let Some(blocked_ids) = parse_body_dependency_ids(&task.description) {
-                let all_tasks =
-                    crate::task::load_tasks_from_dir(&board_dir.join("tasks")).unwrap_or_default();
-                let unmet: Vec<u32> = blocked_ids
-                    .iter()
-                    .filter(|id| {
-                        !all_tasks
-                            .iter()
-                            .any(|t| t.id == **id && dep_status_satisfied(&t.status))
-                    })
-                    .copied()
-                    .collect();
-                if blocked_ids.is_empty() || !unmet.is_empty() {
-                    warn!(
+                let retry_dispatchable = self.verification_retry_dispatchable_task(&task, true);
+                // Skip if the task is already in-progress, except retry-required
+                // rework that was intentionally left in-progress to preserve its
+                // failed verification metadata.
+                if task.status == "in-progress" && !retry_dispatchable {
+                    info!(
                         engineer = %entry.engineer,
                         task_id = task.id,
-                        ?unmet,
-                        "dispatch queue: task has unmet body dependencies, skipping"
-                    );
-                    // Move to blocked status
-                    let _ = crate::team::task_cmd::transition_task_with_attribution(
-                        &board_dir,
-                        task.id,
-                        "blocked",
-                        StatusTransitionAttribution::daemon("daemon.dispatch.queue.dependencies"),
+                        "dispatch queue: task already in-progress, skipping"
                     );
                     continue;
                 }
-            }
 
-            let active_count =
-                self.engineer_active_board_item_count(&board_dir, &entry.engineer)?;
-            let retry_same_owner =
-                retry_dispatchable && task.claimed_by.as_deref() == Some(entry.engineer.as_str());
-            let effective_active_count = if retry_same_owner {
-                active_count.saturating_sub(1)
-            } else {
-                active_count
-            };
-            if effective_active_count > 0 {
-                // Try to reassign to an idle engineer with no active items
-                let retained_engineers: HashSet<&str> =
-                    retained.iter().map(|e| e.engineer.as_str()).collect();
-                let alt = self.idle_engineer_names().into_iter().find(|name| {
-                    name != &entry.engineer
-                        && !retained_engineers.contains(name.as_str())
-                        && self.engineer_role_eligible(&task, name)
-                        && self
-                            .engineer_active_board_item_count(&board_dir, name)
-                            .unwrap_or(1)
-                            == 0
-                });
-                if let Some(alt_engineer) = alt {
-                    debug!(
-                        from = %entry.engineer,
-                        to = %alt_engineer,
-                        task_id = entry.task_id,
-                        "dispatch queue: reassigning to idle engineer"
-                    );
-                    entry.engineer = alt_engineer;
-                    entry.validation_failures = 0;
-                    entry.last_failure = None;
-                    retained.push(entry);
+                // Skip if the task body has unmet text dependencies
+                // (e.g. "Blocked on: #65, #66" where those tasks aren't done)
+                if let Some(blocked_ids) = parse_body_dependency_ids(&task.description) {
+                    let all_tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))
+                        .unwrap_or_default();
+                    let unmet: Vec<u32> = blocked_ids
+                        .iter()
+                        .filter(|id| {
+                            !all_tasks
+                                .iter()
+                                .any(|t| t.id == **id && dep_status_satisfied(&t.status))
+                        })
+                        .copied()
+                        .collect();
+                    if blocked_ids.is_empty() || !unmet.is_empty() {
+                        warn!(
+                            engineer = %entry.engineer,
+                            task_id = task.id,
+                            ?unmet,
+                            "dispatch queue: task has unmet body dependencies, skipping"
+                        );
+                        // Move to blocked status
+                        let _ = crate::team::task_cmd::transition_task_with_attribution(
+                            &board_dir,
+                            task.id,
+                            "blocked",
+                            StatusTransitionAttribution::daemon(
+                                "daemon.dispatch.queue.dependencies",
+                            ),
+                        );
+                        continue;
+                    }
+                }
+
+                let active_count =
+                    self.engineer_active_board_item_count(&board_dir, &entry.engineer)?;
+                let retry_same_owner = retry_dispatchable
+                    && task.claimed_by.as_deref() == Some(entry.engineer.as_str());
+                let effective_active_count = if retry_same_owner {
+                    active_count.saturating_sub(1)
+                } else {
+                    active_count
+                };
+                if effective_active_count > 0 {
+                    // Try to reassign to an idle engineer with no active items
+                    let retained_engineers: HashSet<&str> =
+                        retained.iter().map(|e| e.engineer.as_str()).collect();
+                    let alt = self.idle_engineer_names().into_iter().find(|name| {
+                        name != &entry.engineer
+                            && !retained_engineers.contains(name.as_str())
+                            && self.engineer_role_eligible(&task, name)
+                            && self
+                                .engineer_active_board_item_count(&board_dir, name)
+                                .unwrap_or(1)
+                                == 0
+                    });
+                    if let Some(alt_engineer) = alt {
+                        debug!(
+                            from = %entry.engineer,
+                            to = %alt_engineer,
+                            task_id = entry.task_id,
+                            "dispatch queue: reassigning to idle engineer"
+                        );
+                        entry.engineer = alt_engineer;
+                        entry.validation_failures = 0;
+                        entry.last_failure = None;
+                        retained.push(entry);
+                        continue;
+                    }
+
+                    // No alternative — increment failure count
+                    entry.validation_failures += 1;
+                    entry.last_failure = Some(format!(
+                        "Dispatch guard blocked assignment for '{}' with {} active board item(s); no idle alternative",
+                        entry.engineer, effective_active_count
+                    ));
+                    if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
+                        // Drop silently — will be re-queued by auto-dispatch when
+                        // an engineer frees up. No need to escalate what is just
+                        // a "everyone is busy" situation.
+                        debug!(
+                            engineer = %entry.engineer,
+                            task_id = entry.task_id,
+                            "dispatch queue: all engineers busy, dropping entry (will re-queue)"
+                        );
+                    } else {
+                        retained.push(entry);
+                    }
                     continue;
                 }
 
-                // No alternative — increment failure count
-                entry.validation_failures += 1;
-                entry.last_failure = Some(format!(
-                    "Dispatch guard blocked assignment for '{}' with {} active board item(s); no idle alternative",
-                    entry.engineer, effective_active_count
-                ));
-                if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
-                    // Drop silently — will be re-queued by auto-dispatch when
-                    // an engineer frees up. No need to escalate what is just
-                    // a "everyone is busy" situation.
-                    debug!(
-                        engineer = %entry.engineer,
-                        task_id = entry.task_id,
-                        "dispatch queue: all engineers busy, dropping entry (will re-queue)"
-                    );
-                } else {
-                    retained.push(entry);
-                }
-                continue;
-            }
-
-            if !check_wip_limit(
-                &self.config.team_config.workflow_policy,
-                RoleType::Engineer,
-                effective_active_count,
-            ) {
-                entry.validation_failures += 1;
-                entry.last_failure = Some(format!(
-                    "WIP gate blocked dispatch for '{}' with {} active board task(s)",
-                    entry.engineer, effective_active_count
-                ));
-                warn!(
-                    engineer = %entry.engineer,
-                    task_id = entry.task_id,
-                    failures = entry.validation_failures,
-                    "dispatch queue: WIP limit blocked dispatch"
-                );
-                if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
-                    self.escalate_dispatch_queue_entry(
-                        &entry,
-                        entry
-                            .last_failure
-                            .as_deref()
-                            .unwrap_or("wip gate blocked dispatch"),
-                    )?;
-                } else {
-                    retained.push(entry);
-                }
-                continue;
-            }
-
-            let member_uses_worktrees = self.member_uses_worktrees(&entry.engineer);
-            if member_uses_worktrees {
-                let worktree_dir = self.worktree_dir(&entry.engineer);
-                if let Err(error) = engineer_worktree_ready_for_dispatch_from_trunk(
-                    &self.config.project_root,
-                    &worktree_dir,
-                    &entry.engineer,
-                    self.config.team_config.trunk_branch(),
+                if !check_wip_limit(
+                    &self.config.team_config.workflow_policy,
+                    RoleType::Engineer,
+                    effective_active_count,
                 ) {
                     entry.validation_failures += 1;
-                    entry.last_failure = Some(error.to_string());
+                    entry.last_failure = Some(format!(
+                        "WIP gate blocked dispatch for '{}' with {} active board task(s)",
+                        entry.engineer, effective_active_count
+                    ));
                     warn!(
                         engineer = %entry.engineer,
                         task_id = entry.task_id,
                         failures = entry.validation_failures,
-                        error = %error,
-                        "dispatch queue: worktree not ready for dispatch"
+                        "dispatch queue: WIP limit blocked dispatch"
                     );
+                    if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
+                        self.escalate_dispatch_queue_entry(
+                            &entry,
+                            entry
+                                .last_failure
+                                .as_deref()
+                                .unwrap_or("wip gate blocked dispatch"),
+                        )?;
+                    } else {
+                        retained.push(entry);
+                    }
+                    continue;
+                }
 
-                    // Auto-recover: try rebase first, only reset as last resort.
-                    let base_branch = format!("eng-main/{}", entry.engineer);
-
-                    // SAFETY: if worktree has commits ahead of trunk, try rebase not reset.
-                    let has_work = crate::worktree::commits_ahead(
+                let member_uses_worktrees = self.member_uses_worktrees(&entry.engineer);
+                if member_uses_worktrees {
+                    let worktree_dir = self.worktree_dir(&entry.engineer);
+                    if let Err(error) = engineer_worktree_ready_for_dispatch_from_trunk(
+                        &self.config.project_root,
                         &worktree_dir,
+                        &entry.engineer,
                         self.config.team_config.trunk_branch(),
-                    )
-                    .map(|n| n > 0)
-                    .unwrap_or(false)
-                        || crate::worktree::has_uncommitted_changes(&worktree_dir).unwrap_or(false);
-
-                    if has_work {
-                        info!(
+                    ) {
+                        entry.validation_failures += 1;
+                        entry.last_failure = Some(error.to_string());
+                        warn!(
                             engineer = %entry.engineer,
-                            "dispatch queue: worktree has work; trying rebase instead of reset"
+                            task_id = entry.task_id,
+                            failures = entry.validation_failures,
+                            error = %error,
+                            "dispatch queue: worktree not ready for dispatch"
                         );
-                        // Try to rebase onto trunk to preserve work.
-                        let rebase_result = std::process::Command::new("git")
-                            .args(["rebase", self.config.team_config.trunk_branch()])
-                            .current_dir(&worktree_dir)
-                            .output();
-                        if rebase_result.map(|o| o.status.success()).unwrap_or(false) {
-                            match crate::team::task_loop::engineer_worktree_ready_for_dispatch_from_trunk(
+
+                        // Auto-recover: try rebase first, only reset as last resort.
+                        let base_branch = format!("eng-main/{}", entry.engineer);
+
+                        // SAFETY: if worktree has commits ahead of trunk, try rebase not reset.
+                        let has_work = crate::worktree::commits_ahead(
+                            &worktree_dir,
+                            self.config.team_config.trunk_branch(),
+                        )
+                        .map(|n| n > 0)
+                        .unwrap_or(false)
+                            || crate::worktree::has_uncommitted_changes(&worktree_dir)
+                                .unwrap_or(false);
+
+                        if has_work {
+                            info!(
+                                engineer = %entry.engineer,
+                                "dispatch queue: worktree has work; trying rebase instead of reset"
+                            );
+                            // Try to rebase onto trunk to preserve work.
+                            let rebase_result = std::process::Command::new("git")
+                                .args(["rebase", self.config.team_config.trunk_branch()])
+                                .current_dir(&worktree_dir)
+                                .output();
+                            if rebase_result.map(|o| o.status.success()).unwrap_or(false) {
+                                match crate::team::task_loop::engineer_worktree_ready_for_dispatch_from_trunk(
                                 &self.config.project_root,
                                 &worktree_dir,
                                 &entry.engineer,
@@ -1431,166 +1438,115 @@ impl TeamDaemon {
                                     );
                                 }
                             }
-                        }
-                        // Rebase failed — abort and fall through to reset
-                        let _ = std::process::Command::new("git")
-                            .args(["rebase", "--abort"])
-                            .current_dir(&worktree_dir)
-                            .output();
-                        warn!(
-                            engineer = %entry.engineer,
-                            "dispatch queue: rebase failed; falling through to reset (work may be lost)"
-                        );
-                    }
-
-                    info!(
-                        engineer = %entry.engineer,
-                        base_branch = %base_branch,
-                        "dispatch queue: auto-resetting worktree to base branch"
-                    );
-                    match crate::worktree::reset_worktree_to_base_if_clean_from_trunk(
-                        &worktree_dir,
-                        &base_branch,
-                        "dispatch/reset recovery",
-                        self.config.team_config.trunk_branch(),
-                    ) {
-                        Err(reset_err) => {
+                            }
+                            // Rebase failed — abort and fall through to reset
+                            let _ = std::process::Command::new("git")
+                                .args(["rebase", "--abort"])
+                                .current_dir(&worktree_dir)
+                                .output();
                             warn!(
                                 engineer = %entry.engineer,
-                                error = %reset_err,
-                                "dispatch queue: worktree auto-reset failed; escalating"
+                                "dispatch queue: rebase failed; falling through to reset (work may be lost)"
                             );
-                            entry.validation_failures += 1;
-                            entry.last_failure = Some(reset_err.to_string());
-                            self.report_preserve_failure(
-                                &entry.engineer,
-                                None,
-                                "dispatch/reset recovery",
-                                &reset_err.to_string(),
-                            );
-                            if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
-                                self.escalate_dispatch_queue_entry(
-                                    &entry,
-                                    entry
-                                        .last_failure
-                                        .as_deref()
-                                        .unwrap_or("worktree readiness validation failed"),
-                                )?;
-                            } else {
+                        }
+
+                        info!(
+                            engineer = %entry.engineer,
+                            base_branch = %base_branch,
+                            "dispatch queue: auto-resetting worktree to base branch"
+                        );
+                        match crate::worktree::reset_worktree_to_base_if_clean_from_trunk(
+                            &worktree_dir,
+                            &base_branch,
+                            "dispatch/reset recovery",
+                            self.config.team_config.trunk_branch(),
+                        ) {
+                            Err(reset_err) => {
+                                warn!(
+                                    engineer = %entry.engineer,
+                                    error = %reset_err,
+                                    "dispatch queue: worktree auto-reset failed; escalating"
+                                );
+                                entry.validation_failures += 1;
+                                entry.last_failure = Some(reset_err.to_string());
+                                self.report_preserve_failure(
+                                    &entry.engineer,
+                                    None,
+                                    "dispatch/reset recovery",
+                                    &reset_err.to_string(),
+                                );
+                                if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
+                                    self.escalate_dispatch_queue_entry(
+                                        &entry,
+                                        entry
+                                            .last_failure
+                                            .as_deref()
+                                            .unwrap_or("worktree readiness validation failed"),
+                                    )?;
+                                } else {
+                                    retained.push(entry);
+                                }
+                            }
+                            Ok(reason) if reason.reset_performed() => {
+                                info!(
+                                    engineer = %entry.engineer,
+                                    reset_reason = reason.as_str(),
+                                    "dispatch queue: worktree auto-reset succeeded; retrying dispatch"
+                                );
+                                entry.validation_failures = 0;
+                                entry.last_failure = None;
                                 retained.push(entry);
                             }
-                        }
-                        Ok(reason) if reason.reset_performed() => {
-                            info!(
-                                engineer = %entry.engineer,
-                                reset_reason = reason.as_str(),
-                                "dispatch queue: worktree auto-reset succeeded; retrying dispatch"
-                            );
-                            entry.validation_failures = 0;
-                            entry.last_failure = None;
-                            retained.push(entry);
-                        }
-                        Ok(reason) => {
-                            warn!(
-                                engineer = %entry.engineer,
-                                reset_reason = reason.as_str(),
-                                "dispatch queue: worktree auto-reset skipped"
-                            );
-                            entry.validation_failures += 1;
-                            entry.last_failure = Some(
+                            Ok(reason) => {
+                                warn!(
+                                    engineer = %entry.engineer,
+                                    reset_reason = reason.as_str(),
+                                    "dispatch queue: worktree auto-reset skipped"
+                                );
+                                entry.validation_failures += 1;
+                                entry.last_failure = Some(
                                 crate::team::task_loop::dirty_worktree_preservation_blocked_reason(
                                     &worktree_dir,
                                     "dispatch/reset recovery",
                                 ),
                             );
-                            self.report_preserve_failure(
-                                &entry.engineer,
-                                None,
-                                "dispatch/reset recovery",
-                                reason.as_str(),
-                            );
-                            retained.push(entry);
+                                self.report_preserve_failure(
+                                    &entry.engineer,
+                                    None,
+                                    "dispatch/reset recovery",
+                                    reason.as_str(),
+                                );
+                                retained.push(entry);
+                            }
                         }
+                        continue;
                     }
-                    continue;
                 }
-            }
 
-            // Transition to in-progress BEFORE assigning. If this fails,
-            // keep the task in the queue — don't send work that the board
-            // doesn't reflect, or reconciliation will undo it in a loop.
-            if task.status == "backlog" {
-                let _ = transition_task_with_attribution(
-                    &board_dir,
-                    task.id,
-                    "todo",
-                    StatusTransitionAttribution::daemon("daemon.dispatch.queue"),
-                );
-            }
-            if let Err(e) = transition_task_with_attribution(
-                &board_dir,
-                task.id,
-                "in-progress",
-                StatusTransitionAttribution::daemon("daemon.dispatch.queue"),
-            ) {
-                entry.validation_failures += 1;
-                entry.last_failure = Some(format!("board transition failed: {e}"));
-                warn!(
-                    engineer = %entry.engineer,
-                    task_id = task.id,
-                    error = %e,
-                    "dispatch queue: cannot transition task to in-progress, deferring"
-                );
-                if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
-                    self.escalate_dispatch_queue_entry(
-                        &entry,
-                        entry
-                            .last_failure
-                            .as_deref()
-                            .unwrap_or("board transition failed"),
-                    )?;
-                } else {
-                    retained.push(entry);
-                }
-                continue;
-            }
-            assign_task_owners(&board_dir, task.id, Some(&entry.engineer), None)?;
-
-            let assignment_message =
-                format!("Task #{}: {}\n\n{}", task.id, task.title, task.description);
-            let assignment_message =
-                if let Some(context) = verification_retry_assignment_context(&task) {
-                    format!("{assignment_message}\n\n{context}")
-                } else {
-                    assignment_message
-                };
-            match self.assign_task_with_task_id(&entry.engineer, &assignment_message, Some(task.id))
-            {
-                Ok(_) => {
-                    self.active_tasks.insert(entry.engineer.clone(), task.id);
-                    self.retry_counts.remove(&entry.engineer);
-                    self.recent_dispatches
-                        .insert((task.id, entry.engineer.clone()), Instant::now());
-                    self.record_orchestrator_action(format!(
-                        "dispatch queue: selected runnable task #{} ({}) and dispatched it to {}",
-                        task.id, task.title, entry.engineer
-                    ));
-                    info!(
-                        engineer = %entry.engineer,
-                        task_id = task.id,
-                        task_title = %task.title,
-                        "queued task dispatched"
+                // Transition to in-progress BEFORE assigning. If this fails,
+                // keep the task in the queue — don't send work that the board
+                // doesn't reflect, or reconciliation will undo it in a loop.
+                if task.status == "backlog" {
+                    let _ = transition_task_with_attribution(
+                        &board_dir,
+                        task.id,
+                        "todo",
+                        StatusTransitionAttribution::daemon("daemon.dispatch.queue"),
                     );
                 }
-                Err(error) => {
+                if let Err(e) = transition_task_with_attribution(
+                    &board_dir,
+                    task.id,
+                    "in-progress",
+                    StatusTransitionAttribution::daemon("daemon.dispatch.queue"),
+                ) {
                     entry.validation_failures += 1;
-                    entry.last_failure = Some(error.to_string());
+                    entry.last_failure = Some(format!("board transition failed: {e}"));
                     warn!(
                         engineer = %entry.engineer,
-                        task_id = entry.task_id,
-                        failures = entry.validation_failures,
-                        error = %error,
-                        "dispatch queue: assignment launch failed"
+                        task_id = task.id,
+                        error = %e,
+                        "dispatch queue: cannot transition task to in-progress, deferring"
                     );
                     if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
                         self.escalate_dispatch_queue_entry(
@@ -1598,17 +1554,79 @@ impl TeamDaemon {
                             entry
                                 .last_failure
                                 .as_deref()
-                                .unwrap_or("assignment launch failed"),
+                                .unwrap_or("board transition failed"),
                         )?;
                     } else {
                         retained.push(entry);
                     }
+                    continue;
+                }
+                assign_task_owners(&board_dir, task.id, Some(&entry.engineer), None)?;
+
+                let assignment_message =
+                    format!("Task #{}: {}\n\n{}", task.id, task.title, task.description);
+                let assignment_message =
+                    if let Some(context) = verification_retry_assignment_context(&task) {
+                        format!("{assignment_message}\n\n{context}")
+                    } else {
+                        assignment_message
+                    };
+                match self.assign_task_with_task_id(
+                    &entry.engineer,
+                    &assignment_message,
+                    Some(task.id),
+                ) {
+                    Ok(_) => {
+                        self.active_tasks.insert(entry.engineer.clone(), task.id);
+                        self.retry_counts.remove(&entry.engineer);
+                        self.recent_dispatches
+                            .insert((task.id, entry.engineer.clone()), Instant::now());
+                        self.record_orchestrator_action(format!(
+                        "dispatch queue: selected runnable task #{} ({}) and dispatched it to {}",
+                        task.id, task.title, entry.engineer
+                    ));
+                        info!(
+                            engineer = %entry.engineer,
+                            task_id = task.id,
+                            task_title = %task.title,
+                            "queued task dispatched"
+                        );
+                    }
+                    Err(error) => {
+                        entry.validation_failures += 1;
+                        entry.last_failure = Some(error.to_string());
+                        warn!(
+                            engineer = %entry.engineer,
+                            task_id = entry.task_id,
+                            failures = entry.validation_failures,
+                            error = %error,
+                            "dispatch queue: assignment launch failed"
+                        );
+                        if entry.validation_failures >= DISPATCH_QUEUE_FAILURE_LIMIT {
+                            self.escalate_dispatch_queue_entry(
+                                &entry,
+                                entry
+                                    .last_failure
+                                    .as_deref()
+                                    .unwrap_or("assignment launch failed"),
+                            )?;
+                        } else {
+                            retained.push(entry);
+                        }
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
 
+        // On error, put every unprocessed entry back (including the one that
+        // failed) instead of losing the whole queue for this tick.
+        if result.is_err() {
+            retained.extend(in_flight);
+            retained.extend(pending);
+        }
         self.dispatch_queue = retained;
-        Ok(())
+        result
     }
 
     /// Whether `name` may take `task` under `board.tag_roles`, body owner

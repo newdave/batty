@@ -2229,3 +2229,29 @@ fn dispatch_queue_entry_serde_no_failure() {
     let restored: DispatchQueueEntry = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, entry);
 }
+
+#[test]
+fn dispatch_queue_is_preserved_when_processing_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let members = vec![
+        manager_member("manager", None),
+        engineer_member("eng-1", Some("manager"), false),
+        engineer_member("eng-2", Some("manager"), false),
+    ];
+    let mut daemon = TestDaemonBuilder::new(tmp.path()).members(members).build();
+    let entry = |engineer: &str, task_id: u32| DispatchQueueEntry {
+        engineer: engineer.to_string(),
+        task_id,
+        task_title: format!("task {task_id}"),
+        queued_at: 1,
+        validation_failures: 0,
+        last_failure: None,
+    };
+    daemon.dispatch_queue = vec![entry("eng-1", 101), entry("eng-2", 102)];
+    // No board tasks directory, so loading the task for the first entry fails.
+
+    assert!(daemon.process_dispatch_queue().is_err());
+
+    let queued: Vec<u32> = daemon.dispatch_queue.iter().map(|e| e.task_id).collect();
+    assert_eq!(queued, vec![101, 102]);
+}

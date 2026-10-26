@@ -85,6 +85,11 @@ impl MergeQueue {
         self.queue.push_back(request);
     }
 
+    /// Move all queued requests from `other` to the back of this queue.
+    fn append(&mut self, mut other: MergeQueue) {
+        self.queue.append(&mut other.queue);
+    }
+
     #[allow(dead_code)]
     pub(crate) fn queued_len(&self) -> usize {
         self.queue.len()
@@ -185,7 +190,17 @@ impl TeamDaemon {
                 "processing merge queue"
             );
         }
-        let event = merge_queue.process_next(|request| self.execute_queued_merge(request))?;
+        let result = merge_queue.process_next(|request| self.execute_queued_merge(request));
+        // Restore the queue before propagating any error, keeping requests
+        // that were enqueued while it was taken out. Returning early here used
+        // to drop every remaining queued merge.
+        merge_queue.append(std::mem::take(&mut self.merge_queue));
+        let status = merge_queue.take_status_update();
+        self.merge_queue = merge_queue;
+        if let Some(status) = status {
+            self.record_orchestrator_action(status);
+        }
+        let event = result?;
         if let Some(ref event) = event {
             info!(
                 task_id = event.task_id,
@@ -194,10 +209,6 @@ impl TeamDaemon {
                 "merge queue processed request"
             );
         }
-        if let Some(status) = merge_queue.take_status_update() {
-            self.record_orchestrator_action(status);
-        }
-        self.merge_queue = merge_queue;
         Ok(())
     }
 
@@ -1369,6 +1380,26 @@ mod tests {
             message.body.contains("requires another verification pass")
                 && message.body.contains("verification_retry_required")
         }));
+    }
+
+    #[test]
+    fn daemon_process_merge_queue_keeps_remaining_requests_on_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-merge-queue-error");
+        let members = vec![
+            manager_member("manager", None),
+            engineer_member("eng-1", Some("manager"), true),
+        ];
+        let mut daemon = make_test_daemon(&repo, members);
+        // Multi-repo merges are unsupported, so execute_queued_merge errors.
+        daemon.is_multi_repo = true;
+        daemon.enqueue_merge_request(request(41));
+        daemon.enqueue_merge_request(request(42));
+
+        assert!(daemon.process_merge_queue().is_err());
+
+        assert_eq!(daemon.merge_queue.queued_len(), 1);
+        assert_eq!(daemon.merge_queue.active_task_id(), None);
     }
 
     #[test]

@@ -996,8 +996,26 @@ impl TeamDaemon {
             count = messages.len(),
             "draining pending delivery queue after agent became ready"
         );
-        for msg in messages {
-            self.deliver_message_with_id(&msg.from, recipient, &msg.body, msg.message_id)?;
+        let mut messages = messages.into_iter();
+        while let Some(msg) = messages.next() {
+            if let Err(error) = self.deliver_message_with_id(
+                &msg.from,
+                recipient,
+                &msg.body,
+                msg.message_id.clone(),
+            ) {
+                // Put the failed message and everything after it back at the
+                // front of the queue, ahead of anything queued during the drain.
+                let mut requeue = vec![msg];
+                requeue.extend(messages);
+                let queued = self
+                    .pending_delivery_queue
+                    .entry(recipient.to_string())
+                    .or_default();
+                requeue.append(queued);
+                *queued = requeue;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -3754,6 +3772,40 @@ mod tests {
         let messages = inbox::pending_messages(&root, "eng-1").unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].body, "queued assignment");
+    }
+
+    #[test]
+    fn drain_pending_queue_requeues_undelivered_messages_on_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = failed_delivery_test_daemon(&tmp);
+        for body in ["first", "second"] {
+            daemon
+                .pending_delivery_queue
+                .entry("eng-1".to_string())
+                .or_default()
+                .push(PendingMessage {
+                    from: "manager".to_string(),
+                    body: body.to_string(),
+                    message_id: None,
+                    queued_at: Instant::now(),
+                });
+        }
+        let mut watcher = crate::team::watcher::SessionWatcher::new("%9999999", "eng-1", 300, None);
+        watcher.confirm_ready();
+        daemon.watchers.insert("eng-1".to_string(), watcher);
+        // Make inbox delivery fail: the inboxes root is a regular file.
+        let root = inbox::inboxes_root(tmp.path());
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::write(&root, "not a directory").unwrap();
+
+        assert!(daemon.drain_pending_queue("eng-1").is_err());
+
+        let bodies: Vec<&str> = daemon.pending_delivery_queue["eng-1"]
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect();
+        assert_eq!(bodies, vec!["first", "second"]);
     }
 
     #[test]
