@@ -428,10 +428,12 @@ fn try_auto_resolve_rebase(worktree_dir: &Path) -> bool {
 
     for conflict in &conflicts {
         if auto_resolvable(conflict) {
-            // Accept main's version for managed files
+            // Accept trunk's version for managed files. During a rebase,
+            // "ours" is the upstream being rebased onto (trunk) and "theirs"
+            // is the engineer commit being replayed.
             let _ = run_git_with_context(
                 worktree_dir,
-                &["checkout", "--theirs", conflict],
+                &["checkout", "--ours", conflict],
                 &format!("auto-resolve conflict in {conflict} (accept main)"),
             );
             let _ = run_git_with_context(
@@ -485,7 +487,7 @@ fn try_auto_resolve_rebase(worktree_dir: &Path) -> bool {
                     if auto_resolvable(r) {
                         let _ = run_git_with_context(
                             worktree_dir,
-                            &["checkout", "--theirs", r],
+                            &["checkout", "--ours", r],
                             &format!("auto-resolve {r}"),
                         );
                         let _ =
@@ -1171,6 +1173,58 @@ overall_parity: 100%
         assert!(merged.contains("\"main\""));
         assert!(merged.contains("\"engineer\""));
         assert!(merged.contains("\"existing\""));
+    }
+
+    fn managed_config_conflict_keeps_trunk_version(engineer_only_touches_config: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-merge-test");
+        let (worktree_dir, team_config_dir) = engineer_worktree_paths(&repo, "eng-2");
+        let config = repo.join(".cargo").join("config.toml");
+
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[build]\njobs = 1\n").unwrap();
+        git_ok(&repo, &["add", ".cargo/config.toml"]);
+        git_ok(&repo, &["commit", "-m", "add cargo config"]);
+
+        setup_engineer_worktree(&repo, &worktree_dir, "eng-2", &team_config_dir).unwrap();
+
+        std::fs::write(
+            worktree_dir.join(".cargo").join("config.toml"),
+            "[build]\njobs = 99\n",
+        )
+        .unwrap();
+        git_ok(&worktree_dir, &["add", ".cargo/config.toml"]);
+        if !engineer_only_touches_config {
+            std::fs::write(worktree_dir.join("feature.txt"), "engineer work\n").unwrap();
+            git_ok(&worktree_dir, &["add", "feature.txt"]);
+        }
+        git_ok(&worktree_dir, &["commit", "-m", "engineer change"]);
+
+        std::fs::write(&config, "[build]\njobs = 4\n").unwrap();
+        git_ok(&repo, &["add", ".cargo/config.toml"]);
+        git_ok(&repo, &["commit", "-m", "main config change"]);
+
+        let result = merge_engineer_branch(&repo, "eng-2").unwrap();
+
+        assert!(matches!(result, MergeOutcome::Success(_)), "{result:?}");
+        let merged = String::from_utf8(
+            git(&repo, &["show", "main:.cargo/config.toml"]).stdout,
+        )
+        .unwrap();
+        assert_eq!(merged, "[build]\njobs = 4\n");
+        if !engineer_only_touches_config {
+            assert!(git(&repo, &["cat-file", "-e", "main:feature.txt"]).status.success());
+        }
+    }
+
+    #[test]
+    fn merge_rebase_managed_conflict_keeps_trunk_version() {
+        managed_config_conflict_keeps_trunk_version(false);
+    }
+
+    #[test]
+    fn merge_rebase_managed_conflict_only_change_keeps_trunk_version() {
+        managed_config_conflict_keeps_trunk_version(true);
     }
 
     fn setup_rebase_conflict_repo(
