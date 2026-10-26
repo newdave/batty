@@ -2280,6 +2280,57 @@ impl TeamDaemon {
         Ok(())
     }
 
+    /// Clear the blocker a failed worktree preservation left on a task that has since finished.
+    /// The lane was dirty during a recovery, so Batty blocked the task rather than reset it; the
+    /// work was then committed and merged, but nothing cleared the blocker. Clear it once the
+    /// task is done or archived and its work is on the trunk: a recorded commit or branch must be
+    /// merged into the trunk; with neither recorded, done is enough, because a task is marked done
+    /// only after its merge. A recorded commit not on the trunk keeps the blocker, since that work
+    /// might be lost. Only the blocking fields change: status and claim stay.
+    pub(super) fn maybe_clear_stale_preserve_blockers(&mut self) -> Result<()> {
+        let board_dir = self
+            .config
+            .project_root
+            .join(".batty")
+            .join("team_config")
+            .join("board");
+        let trunk = self.config.team_config.trunk_branch().to_string();
+        let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+        for task in tasks {
+            if !stale_preserve_blocker(&task) {
+                continue;
+            }
+            let recorded = task
+                .commit
+                .as_deref()
+                .or(task.branch.as_deref())
+                .filter(|reference| !reference.is_empty());
+            if let Some(reference) = recorded {
+                let merged = crate::team::task_loop::branch_is_merged_into(
+                    &self.config.project_root,
+                    reference,
+                    &trunk,
+                )
+                .unwrap_or(false);
+                if !merged {
+                    continue;
+                }
+            }
+            task_cmd::clear_blocked_fields(&board_dir, task.id).with_context(|| {
+                format!(
+                    "failed to clear stale preservation blocker for task #{}",
+                    task.id
+                )
+            })?;
+            self.record_orchestrator_action(format!(
+                "cleared stale worktree preservation blocker on done task #{} ({})",
+                task.id, task.title
+            ));
+            info!(task_id = task.id, task_title = %task.title, "cleared stale preservation blocker");
+        }
+        Ok(())
+    }
+
     pub(super) fn manager_for_member_name(&self, member_name: &str) -> Option<&str> {
         self.config
             .members
@@ -3326,6 +3377,20 @@ impl TeamDaemon {
             self.config.project_root.clone()
         })
     }
+}
+
+/// A done or archived task still carrying the blocker `report_preserve_failure` sets.
+pub(super) fn stale_preserve_blocker(task: &crate::task::Task) -> bool {
+    if !matches!(task.status.as_str(), "done" | "archived") {
+        return false;
+    }
+    [task.blocked_on.as_deref(), task.blocked.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|reason| {
+            reason.contains("preserve_failed_reset_skipped")
+                || reason.contains("could not safely auto-save")
+        })
 }
 
 #[cfg(test)]
@@ -8322,5 +8387,90 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
                 && event.role.as_deref() == Some("eng-1")
                 && event.reason.as_deref() == Some("done_lane_reset")
         }));
+    }
+
+    #[test]
+    fn stale_preserve_blocker_on_a_done_task_is_cleared_keeping_status_and_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = make_test_daemon(tmp.path(), vec![]);
+        let reason = "Task 17 is blocked because Batty could not safely auto-save eng-1's dirty worktree before merge-conflict recovery. preserve_failed_reset_skipped";
+        write_board_task_file(
+            tmp.path(),
+            17,
+            "done-task",
+            "done",
+            Some("eng-1"),
+            &[],
+            Some(reason),
+        );
+
+        daemon.maybe_clear_stale_preserve_blockers().unwrap();
+
+        let tasks_dir = daemon.board_dir().join("tasks");
+        let task = crate::task::load_task_by_id(&tasks_dir, 17).unwrap();
+        assert_eq!(task.status, "done");
+        assert_eq!(task.claimed_by.as_deref(), Some("eng-1"));
+        assert!(task.blocked.is_none() && task.blocked_on.is_none());
+    }
+
+    #[test]
+    fn preserve_blocker_stays_unless_the_task_is_done_and_its_work_is_on_trunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = make_test_daemon(tmp.path(), vec![]);
+        let reason = "Batty could not safely auto-save eng-1's dirty worktree before reset. preserve_failed_reset_skipped";
+        write_board_task_file(
+            tmp.path(),
+            21,
+            "still-working",
+            "in-progress",
+            Some("eng-1"),
+            &[],
+            Some(reason),
+        );
+        write_board_task_file(
+            tmp.path(),
+            22,
+            "other-blocker",
+            "done",
+            None,
+            &[],
+            Some("waiting on owner"),
+        );
+        write_board_task_file(
+            tmp.path(),
+            23,
+            "unmerged-commit",
+            "done",
+            None,
+            &[],
+            Some(reason),
+        );
+        let tasks_dir = daemon.board_dir().join("tasks");
+        let unmerged = std::fs::read_dir(&tasks_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("023")
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(&unmerged).unwrap();
+        std::fs::write(
+            &unmerged,
+            text.replacen("---\nid: 23", "---\ncommit: deadbeefdeadbeef\nid: 23", 1),
+        )
+        .unwrap();
+
+        daemon.maybe_clear_stale_preserve_blockers().unwrap();
+
+        for id in [21, 22, 23] {
+            let task = crate::task::load_task_by_id(&tasks_dir, id).unwrap();
+            assert!(
+                task.blocked_on.is_some(),
+                "task #{id} should keep its blocker"
+            );
+        }
     }
 }
