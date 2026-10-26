@@ -133,6 +133,13 @@ pub enum DeliveryError {
     },
     #[error("channel delivery failed for '{recipient}': {detail}")]
     ChannelSend { recipient: String, detail: String },
+    #[error(
+        "channel delivery to '{recipient}' backing off after failures; retry in {retry_in_secs}s"
+    )]
+    ChannelBackoff {
+        recipient: String,
+        retry_in_secs: u64,
+    },
     #[error("live pane delivery failed for '{recipient}' via pane '{pane_id}': {detail}")]
     PaneInject {
         recipient: String,
@@ -147,6 +154,9 @@ impl DeliveryError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::UnsupportedChannel { .. } => false,
+            // The channel itself schedules the retry; in-process retries would
+            // only spin against the backoff.
+            Self::ChannelBackoff { .. } => false,
             Self::ProviderExec { source, .. } => matches!(
                 source.kind(),
                 std::io::ErrorKind::TimedOut

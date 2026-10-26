@@ -426,8 +426,10 @@ impl TeamDaemon {
                     }
                 };
                 if let Err(error) = send_result {
-                    warn!(to = %user_name, error = %error, "failed to send via channel");
-                    continue;
+                    // The channel logs real failures and backs off; leave the rest of
+                    // this inbox for a later poll instead of hammering a broken channel.
+                    debug!(to = %user_name, error = %error, "user channel send failed; deferring inbox");
+                    break;
                 }
 
                 if let Err(error) = inbox::mark_delivered(&root, user_name, &msg.id) {
@@ -1777,6 +1779,60 @@ mod tests {
         // Message should still be pending since it couldn't be delivered
         let pending = inbox::pending_messages(&root, "human").unwrap();
         assert_eq!(pending.len(), 1);
+    }
+
+    struct FailingCountingChannel {
+        attempts: Arc<Mutex<usize>>,
+    }
+
+    impl Channel for FailingCountingChannel {
+        fn send(&self, _message: &str) -> std::result::Result<(), DeliveryError> {
+            *self.attempts.lock().unwrap() += 1;
+            Err(DeliveryError::ChannelSend {
+                recipient: "12345".to_string(),
+                detail: "Bad Request: chat not found".to_string(),
+            })
+        }
+
+        fn channel_type(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn deliver_user_inbox_stops_after_first_channel_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roles = vec![RoleDef {
+            name: "human".to_string(),
+            role_type: RoleType::User,
+            talks_to: vec!["architect".to_string()],
+            use_worktrees: false,
+            ..Default::default()
+        }];
+        let config = daemon_config_with_roles(tmp.path(), roles);
+        let mut daemon = TeamDaemon::new(config).unwrap();
+        let attempts = Arc::new(Mutex::new(0));
+        daemon.channels.insert(
+            "human".to_string(),
+            Box::new(FailingCountingChannel {
+                attempts: Arc::clone(&attempts),
+            }),
+        );
+
+        let root = inbox::inboxes_root(tmp.path());
+        for body in ["one", "two", "three"] {
+            inbox::deliver_to_inbox(
+                &root,
+                &inbox::InboxMessage::new_send("architect", "human", body),
+            )
+            .unwrap();
+        }
+
+        daemon.process_telegram_queue().unwrap();
+
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        let pending = inbox::pending_messages(&root, "human").unwrap();
+        assert_eq!(pending.len(), 3);
     }
 
     #[test]

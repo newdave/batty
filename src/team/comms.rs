@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::config::ChannelConfig;
 use super::discord::DiscordBot;
@@ -18,6 +18,75 @@ use super::telegram::TelegramBot;
 
 const TELEGRAM_DEDUP_TTL: Duration = Duration::from_secs(300);
 const TELEGRAM_DEDUP_CAPACITY: usize = 512;
+const SEND_BACKOFF_TRANSIENT_BASE: Duration = Duration::from_secs(30);
+const SEND_BACKOFF_PERMANENT_BASE: Duration = Duration::from_secs(300);
+const SEND_BACKOFF_MAX: Duration = Duration::from_secs(1800);
+
+/// Exponential backoff after failed sends, so a broken channel (bad chat id,
+/// missing token, provider error) is not retried on every daemon poll.
+#[derive(Debug, Default)]
+struct SendBackoff {
+    state: Mutex<Option<(u32, Instant)>>,
+}
+
+impl SendBackoff {
+    /// Returns the remaining wait if a retry is not yet due.
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        let state = self.state.lock().unwrap();
+        state
+            .and_then(|(_, retry_at)| retry_at.checked_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn record_failure(&self, now: Instant, transient: bool) -> Duration {
+        let mut state = self.state.lock().unwrap();
+        let failures = state.map_or(0, |(failures, _)| failures).saturating_add(1);
+        let base = if transient {
+            SEND_BACKOFF_TRANSIENT_BASE
+        } else {
+            SEND_BACKOFF_PERMANENT_BASE
+        };
+        let delay = base
+            .saturating_mul(1u32 << (failures - 1).min(16))
+            .min(SEND_BACKOFF_MAX);
+        *state = Some((failures, now + delay));
+        delay
+    }
+
+    fn record_success(&self) {
+        *self.state.lock().unwrap() = None;
+    }
+
+    /// Gate a send attempt: skip while backing off, and update the backoff
+    /// from the attempt's outcome.
+    fn run(
+        &self,
+        recipient: &str,
+        send: impl FnOnce() -> std::result::Result<(), DeliveryError>,
+    ) -> std::result::Result<(), DeliveryError> {
+        let now = Instant::now();
+        if let Some(remaining) = self.remaining(now) {
+            return Err(DeliveryError::ChannelBackoff {
+                recipient: recipient.to_string(),
+                retry_in_secs: remaining.as_secs().max(1),
+            });
+        }
+        let result = send();
+        match &result {
+            Ok(()) => self.record_success(),
+            Err(error) => {
+                let delay = self.record_failure(now, error.is_transient());
+                warn!(
+                    recipient,
+                    error = %error,
+                    retry_in_secs = delay.as_secs(),
+                    "channel send failed; backing off"
+                );
+            }
+        }
+        result
+    }
+}
 
 #[derive(Debug)]
 struct RecentTelegramSends {
@@ -83,6 +152,7 @@ pub struct TelegramChannel {
     target: String,
     provider: String,
     recent_sends: RecentTelegramSends,
+    backoff: SendBackoff,
 }
 
 impl TelegramChannel {
@@ -109,6 +179,7 @@ impl TelegramChannel {
             target,
             provider,
             recent_sends: RecentTelegramSends::new(ttl, capacity),
+            backoff: SendBackoff::default(),
         }
     }
 }
@@ -121,17 +192,25 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
+        self.backoff
+            .run(&self.target, || self.send_via_provider(message, message_id))
+    }
+
+    fn channel_type(&self) -> &str {
+        "telegram"
+    }
+}
+
+impl TelegramChannel {
+    fn send_via_provider(
+        &self,
+        message: &str,
+        message_id: u64,
+    ) -> std::result::Result<(), DeliveryError> {
         debug!(target = %self.target, provider = %self.provider, len = message.len(), "sending via telegram channel");
 
         let output = std::process::Command::new(&self.provider)
-            .args([
-                "message",
-                "send",
-                "--to",
-                &self.target,
-                "--message",
-                message,
-            ])
+            .args(provider_send_args(&self.target, message))
             .output();
 
         match output {
@@ -142,14 +221,14 @@ impl Channel for TelegramChannel {
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                warn!(status = ?out.status, stderr = %stderr, "telegram send failed");
+                debug!(status = ?out.status, stderr = %stderr, "telegram send failed");
                 Err(DeliveryError::ChannelSend {
                     recipient: self.target.clone(),
                     detail: stderr.to_string(),
                 })
             }
             Err(e) => {
-                warn!(error = %e, provider = %self.provider, "failed to execute channel provider");
+                debug!(error = %e, provider = %self.provider, "failed to execute channel provider");
                 Err(DeliveryError::ProviderExec {
                     provider: self.provider.clone(),
                     source: e,
@@ -157,10 +236,20 @@ impl Channel for TelegramChannel {
             }
         }
     }
+}
 
-    fn channel_type(&self) -> &str {
-        "telegram"
-    }
+/// Arguments for `<provider> message send` (openclaw CLI contract).
+fn provider_send_args<'a>(target: &'a str, message: &'a str) -> [&'a str; 8] {
+    [
+        "message",
+        "send",
+        "--channel",
+        "telegram",
+        "--target",
+        target,
+        "--message",
+        message,
+    ]
 }
 
 /// Native Telegram channel using the Bot API directly (no CLI provider).
@@ -168,6 +257,7 @@ pub struct NativeTelegramChannel {
     bot: TelegramBot,
     target: String,
     recent_sends: RecentTelegramSends,
+    backoff: SendBackoff,
 }
 
 impl NativeTelegramChannel {
@@ -190,6 +280,7 @@ impl NativeTelegramChannel {
             bot,
             target,
             recent_sends: RecentTelegramSends::new(ttl, capacity),
+            backoff: SendBackoff::default(),
         }
     }
 }
@@ -206,16 +297,18 @@ impl Channel for NativeTelegramChannel {
             return Ok(());
         }
 
-        debug!(target = %self.target, len = message.len(), "sending via native telegram channel");
-        self.bot
-            .send_message(&self.target, message)
-            .map(|_| {
-                self.recent_sends.record(message_id);
-            })
-            .map_err(|error| DeliveryError::ChannelSend {
-                recipient: self.target.clone(),
-                detail: error.to_string(),
-            })
+        self.backoff.run(&self.target, || {
+            debug!(target = %self.target, len = message.len(), "sending via native telegram channel");
+            self.bot
+                .send_message(&self.target, message)
+                .map(|_| {
+                    self.recent_sends.record(message_id);
+                })
+                .map_err(|error| DeliveryError::ChannelSend {
+                    recipient: self.target.clone(),
+                    detail: error.to_string(),
+                })
+        })
     }
 
     fn channel_type(&self) -> &str {
@@ -268,6 +361,10 @@ pub fn channel_from_config(
             if let Some(native) = NativeTelegramChannel::from_config(config) {
                 Ok(Box::new(native))
             } else {
+                info!(
+                    provider = %config.provider,
+                    "telegram channel has no bot_token or BATTY_TELEGRAM_BOT_TOKEN; using CLI provider"
+                );
                 Ok(Box::new(TelegramChannel::from_config(config)))
             }
         }
@@ -496,5 +593,131 @@ mod tests {
 
         let lines = fs::read_to_string(&log_path).unwrap();
         assert_eq!(lines.lines().count(), 3);
+    }
+
+    fn write_fake_provider(dir: &std::path::Path, log_path: &std::path::Path, exit: i32) -> String {
+        let script_path = dir.join("fake-provider.sh");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit {exit}\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script_path.display().to_string()
+    }
+
+    #[test]
+    fn provider_send_args_use_openclaw_target_flag() {
+        let args = provider_send_args("12345", "hi");
+        assert_eq!(
+            args,
+            [
+                "message",
+                "send",
+                "--channel",
+                "telegram",
+                "--target",
+                "12345",
+                "--message",
+                "hi"
+            ]
+        );
+        assert!(!args.contains(&"--to"));
+    }
+
+    #[test]
+    fn telegram_send_passes_target_flag_to_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("provider.log");
+        let provider = write_fake_provider(tmp.path(), &log_path, 0);
+
+        TelegramChannel::new("12345".into(), provider)
+            .send("hello")
+            .unwrap();
+
+        let line = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            line.trim(),
+            "message send --channel telegram --target 12345 --message hello"
+        );
+    }
+
+    #[test]
+    fn telegram_send_backs_off_after_failure_without_reinvoking_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("provider.log");
+        let provider = write_fake_provider(tmp.path(), &log_path, 1);
+        let ch = TelegramChannel::new("12345".into(), provider);
+
+        let first = ch.send("one").unwrap_err();
+        assert!(matches!(first, DeliveryError::ChannelSend { .. }));
+        let second = ch.send("two").unwrap_err();
+        assert!(matches!(second, DeliveryError::ChannelBackoff { .. }));
+
+        let lines = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            lines.lines().count(),
+            1,
+            "provider must not run while backing off"
+        );
+    }
+
+    #[test]
+    fn send_backoff_grows_exponentially_and_caps() {
+        let backoff = SendBackoff::default();
+        let now = Instant::now();
+        assert_eq!(backoff.record_failure(now, true), Duration::from_secs(30));
+        assert_eq!(backoff.record_failure(now, true), Duration::from_secs(60));
+        assert_eq!(backoff.record_failure(now, true), Duration::from_secs(120));
+        for _ in 0..20 {
+            backoff.record_failure(now, true);
+        }
+        assert_eq!(backoff.record_failure(now, true), SEND_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn send_backoff_uses_longer_base_for_permanent_errors() {
+        let backoff = SendBackoff::default();
+        let now = Instant::now();
+        assert_eq!(backoff.record_failure(now, false), Duration::from_secs(300));
+        assert!(backoff.remaining(now).is_some());
+        assert!(backoff.remaining(now + Duration::from_secs(301)).is_none());
+    }
+
+    #[test]
+    fn send_backoff_resets_after_success() {
+        let backoff = SendBackoff::default();
+        backoff.record_failure(Instant::now(), true);
+        backoff.record_success();
+        assert!(backoff.remaining(Instant::now()).is_none());
+        assert_eq!(
+            backoff.record_failure(Instant::now(), true),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn channel_backoff_error_is_not_retried_in_process() {
+        let error = DeliveryError::ChannelBackoff {
+            recipient: "12345".into(),
+            retry_in_secs: 30,
+        };
+        assert!(!error.is_transient());
+    }
+
+    #[test]
+    fn telegram_chat_not_found_is_permanent() {
+        let error = DeliveryError::ChannelSend {
+            recipient: "12345".into(),
+            detail: r#"Telegram sendMessage failed with status 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}"#.into(),
+        };
+        assert!(!error.is_transient());
     }
 }
