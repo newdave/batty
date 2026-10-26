@@ -24,6 +24,30 @@ use crate::tmux;
 pub(crate) const LOG_ROTATION_BYTES: u64 = 5 * 1024 * 1024;
 const LOG_ROTATION_KEEP: usize = 3;
 pub(super) const DAEMON_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// How long a daemon needs to stop cleanly: the agents' shutdown warning window plus the shim
+/// shutdown timeout. The watchdog waits this long after SIGTERM before SIGKILL.
+pub(super) fn daemon_shutdown_budget(team_config: &config::TeamConfig) -> Duration {
+    let budget = Duration::from_secs(
+        team_config.workflow_policy.graceful_shutdown_timeout_secs
+            + u64::from(team_config.shim_shutdown_timeout_secs),
+    );
+    std::cmp::max(DAEMON_SHUTDOWN_GRACE_PERIOD, budget)
+}
+
+/// The shutdown budget from the project's team config, or the short grace period if it can't
+/// be read.
+fn project_daemon_shutdown_budget(project_root: &Path) -> Duration {
+    config::TeamConfig::load(&team_config_path(project_root))
+        .map(|team_config| daemon_shutdown_budget(&team_config))
+        .unwrap_or(DAEMON_SHUTDOWN_GRACE_PERIOD)
+}
+
+/// How long a caller waits for the watchdog and daemon to stop: the budget plus a margin, so
+/// the daemon's clean snapshot lands before the caller gives up.
+pub(super) fn daemon_stop_wait(project_root: &Path) -> Duration {
+    project_daemon_shutdown_budget(project_root) + DAEMON_SHUTDOWN_GRACE_PERIOD
+}
 const DAEMON_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const WATCHDOG_INITIAL_BACKOFF_SECS: u64 = 1;
@@ -246,7 +270,7 @@ pub(crate) fn restart_daemon_if_stale_with_binary_path(
     let commands = decision.commands.clone();
 
     rebuild_reinstall_and_resign_batty(project_root)?;
-    if !request_graceful_daemon_shutdown(project_root, DAEMON_SHUTDOWN_GRACE_PERIOD) {
+    if !request_graceful_daemon_shutdown(project_root, daemon_stop_wait(project_root)) {
         bail!(
             "daemon did not stop gracefully; refusing to force restart after reinstall. Manual fallback: {}",
             STALE_MANUAL_RECOVERY_COMMAND
@@ -731,13 +755,13 @@ fn clear_watchdog_child_pid(project_root: &Path, state: &mut PersistedWatchdogSt
     save_watchdog_state(project_root, state)
 }
 
-fn terminate_daemon_child(child: &mut std::process::Child) {
+fn terminate_daemon_child(child: &mut std::process::Child, grace: Duration) {
     #[cfg(unix)]
     {
         let _ = send_unix_signal(child.id(), libc::SIGTERM);
     }
 
-    let deadline = std::time::Instant::now() + DAEMON_SHUTDOWN_GRACE_PERIOD;
+    let deadline = std::time::Instant::now() + grace;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return,
@@ -1005,7 +1029,7 @@ pub fn start_team(project_root: &Path, attach: bool) -> Result<String> {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                if !request_graceful_daemon_shutdown(project_root, DAEMON_SHUTDOWN_GRACE_PERIOD) {
+                if !request_graceful_daemon_shutdown(project_root, daemon_stop_wait(project_root)) {
                     #[cfg(unix)]
                     unsafe {
                         libc::kill(pid as i32, libc::SIGTERM);
@@ -1166,7 +1190,7 @@ pub fn run_watchdog(project_root: &Path, resume: bool) -> Result<()> {
 
         loop {
             if watchdog_shutdown_requested() {
-                terminate_daemon_child(&mut child);
+                terminate_daemon_child(&mut child, project_daemon_shutdown_budget(project_root));
                 let _ = std::fs::remove_file(watchdog_pid_path(project_root));
                 clear_watchdog_child_pid(project_root, &mut state)?;
                 return Ok(());
@@ -1313,6 +1337,63 @@ fn should_resume_from_daemon_state(project_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_daemon_child_waits_for_a_slow_clean_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        // Exits cleanly 1 s after SIGTERM, like a daemon finishing its shutdown work.
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "trap 'sleep 1; exit 0' TERM; while :; do sleep 0.1; done",
+            ])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        terminate_daemon_child(&mut child, Duration::from_secs(10));
+        let status = child.try_wait().unwrap().unwrap();
+        assert_eq!(
+            status.signal(),
+            None,
+            "the child was killed instead of exiting"
+        );
+        assert_eq!(status.code(), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_daemon_child_kills_after_the_grace_period() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.1; done"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        terminate_daemon_child(&mut child, Duration::from_millis(300));
+        let status = child.try_wait().unwrap().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn daemon_shutdown_budget_covers_the_warning_window_and_shim_timeout() {
+        let mut team_config: config::TeamConfig = serde_yaml::from_str(
+            "name: test-team\nroles:\n  - name: architect\n    role_type: architect\n    agent: claude\n    instances: 1\n    talks_to: []\n",
+        )
+        .unwrap();
+        team_config.workflow_policy.graceful_shutdown_timeout_secs = 30;
+        team_config.shim_shutdown_timeout_secs = 10;
+        assert_eq!(
+            daemon_shutdown_budget(&team_config),
+            Duration::from_secs(40)
+        );
+        team_config.workflow_policy.graceful_shutdown_timeout_secs = 0;
+        team_config.shim_shutdown_timeout_secs = 0;
+        assert_eq!(
+            daemon_shutdown_budget(&team_config),
+            DAEMON_SHUTDOWN_GRACE_PERIOD
+        );
+    }
     use serial_test::serial;
     use std::process::Command;
 
