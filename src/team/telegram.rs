@@ -111,6 +111,8 @@ impl TelegramBot {
                 bail!("Telegram sendMessage failed with status {status}: {detail}");
             }
             Err(ureq::Error::Transport(error)) => {
+                // ureq's error text includes the request URL, which embeds the token.
+                let error = redact_token(&error.to_string(), &self.bot_token);
                 warn!(error = %error, "sendMessage transport failed");
                 bail!("Telegram sendMessage transport failed: {error}");
             }
@@ -134,6 +136,7 @@ impl TelegramBot {
         let body: serde_json::Value = match resp {
             Ok(r) => r.into_json()?,
             Err(e) => {
+                let e = redact_token(&e.to_string(), &self.bot_token);
                 warn!(error = %e, "getUpdates failed");
                 bail!("Telegram getUpdates failed: {e}");
             }
@@ -323,11 +326,23 @@ fn prompt_bot_token() -> Result<String> {
     }
 }
 
+/// Replace every occurrence of the bot token in `text`. Telegram puts the
+/// token in the request path, and ureq includes the URL in its error text.
+fn redact_token(text: &str, token: &str) -> String {
+    if token.is_empty() {
+        return text.to_string();
+    }
+    text.replace(token, "<redacted>")
+}
+
 /// Validate a bot token by calling the getMe API.
 /// Returns the bot username on success.
 fn validate_bot_token(token: &str) -> Result<String> {
     let url = format!("https://api.telegram.org/bot{token}/getMe");
-    let resp: serde_json::Value = ureq::get(&url).call()?.into_json()?;
+    let resp: serde_json::Value = ureq::get(&url)
+        .call()
+        .map_err(|e| anyhow::anyhow!(redact_token(&e.to_string(), token)))?
+        .into_json()?;
 
     if resp["ok"].as_bool() != Some(true) {
         bail!("Telegram API returned ok=false");
@@ -517,6 +532,18 @@ fn split_message(text: &str, max_len: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_token_removes_token_from_ureq_error_text() {
+        let token = "123456:ABC-secret";
+        let text = format!(
+            "https://api.telegram.org/bot{token}/getUpdates?offset=0: Dns Failed: no such host"
+        );
+        let redacted = redact_token(&text, token);
+        assert!(!redacted.contains(token));
+        assert!(redacted.contains("bot<redacted>/getUpdates"));
+        assert_eq!(redact_token("unchanged", ""), "unchanged");
+    }
 
     #[test]
     fn split_message_does_not_split_multibyte_chars() {
