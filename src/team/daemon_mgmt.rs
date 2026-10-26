@@ -658,6 +658,19 @@ fn watchdog_shutdown_requested() -> bool {
     false
 }
 
+/// Sleep for `duration`, waking early if the watchdog is asked to shut down.
+/// Keeps `batty stop` responsive while the watchdog is in crash backoff.
+fn sleep_unless_shutdown(duration: Duration) {
+    let deadline = std::time::Instant::now() + duration;
+    while !watchdog_shutdown_requested() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep(WATCHDOG_POLL_INTERVAL.min(deadline - now));
+    }
+}
+
 fn event_count(path: &Path) -> usize {
     events::read_events(path)
         .map(|events| events.len())
@@ -1209,7 +1222,7 @@ pub fn run_watchdog(project_root: &Path, resume: bool) -> Result<()> {
                             exit_category = %observation.exit_category,
                             "daemon crashed; watchdog restarting with backoff"
                         );
-                        std::thread::sleep(Duration::from_secs(backoff_secs));
+                        sleep_unless_shutdown(Duration::from_secs(backoff_secs));
                         break;
                     }
 
@@ -1235,7 +1248,7 @@ pub fn run_watchdog(project_root: &Path, resume: bool) -> Result<()> {
                         record_watchdog_crash(project_root, &mut state, observation)?
                     {
                         warn!(backoff_secs, reason = %reason, "watchdog poll failed; retrying daemon launch");
-                        std::thread::sleep(Duration::from_secs(backoff_secs));
+                        sleep_unless_shutdown(Duration::from_secs(backoff_secs));
                         break;
                     }
                     warn!(
@@ -1396,6 +1409,26 @@ mod tests {
     }
     use serial_test::serial;
     use std::process::Command;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn sleep_unless_shutdown_wakes_early_when_shutdown_requested() {
+        WATCHDOG_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        sleep_unless_shutdown(Duration::from_secs(30));
+        WATCHDOG_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[serial]
+    fn sleep_unless_shutdown_sleeps_full_duration_otherwise() {
+        WATCHDOG_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        sleep_unless_shutdown(Duration::from_millis(50));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
 
     fn init_repo(dir: &Path) {
         run_git(dir, &["init", "-q", "-b", "main"]);
