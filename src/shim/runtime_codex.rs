@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,11 +22,12 @@ use anyhow::{Context, Result};
 use chrono::TimeZone;
 use regex::Regex;
 
+use super::child::{OwnedChild, spawn_stderr_logger, terminate_shared};
 use super::codex_types::{self, CodexEvent};
 use super::common::shim_eprintln;
 use super::common::{
     self, MAX_QUEUE_DEPTH, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors,
-    format_injected_message,
+    format_injected_message, last_n_lines_of,
 };
 use super::protocol::{Channel, Command as ShimCommand, Event, ShimState};
 use super::pty_log::PtyLogWriter;
@@ -63,7 +64,7 @@ struct CodexState {
     cumulative_output_bytes: u64,
     input_tokens: u64,
     output_tokens: u64,
-    active_child: Option<Arc<Mutex<Child>>>,
+    active_child: Option<Arc<Mutex<OwnedChild>>>,
     /// The codex binary name/path.
     program: String,
     /// Working directory for spawning subprocesses.
@@ -485,23 +486,12 @@ fn run_codex_exec_attempt(
     }
     // Spawn the subprocess
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove("CLAUDECODE");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    command.args(args).current_dir(cwd);
     let mut start_guard = state.lock().unwrap();
     if start_guard.state == ShimState::Dead {
         return;
     }
-    let child = match command.spawn() {
+    let child = match OwnedChild::spawn(&mut command) {
         Ok(c) => c,
         Err(e) => {
             drop(start_guard);
@@ -544,44 +534,33 @@ fn run_codex_exec_attempt(
     let child_pid = child.lock().unwrap().id();
     shim_eprintln!("[shim-codex {shim_id}] codex exec spawned (pid {child_pid})");
 
-    let stdin = child.lock().unwrap().stdin.take();
+    let stdin = child.lock().unwrap().take_stdin();
     if let Some(mut stdin) = stdin {
         if let Err(e) = stdin.write_all(prompt.as_bytes()) {
             shim_eprintln!("[shim-codex {shim_id}] failed to write prompt to stdin: {e}");
         }
     }
 
-    let stdout = child.lock().unwrap().stdout.take().unwrap();
-    let stderr = child.lock().unwrap().stderr.take().unwrap();
+    let stdout = child.lock().unwrap().take_stdout().unwrap();
+    let stderr = child.lock().unwrap().take_stderr().unwrap();
 
     // stderr reader (log only). Non-recoverable auth failures are detected
     // in the structured `turn.failed` / `error` events below — the codex
     // CLI surfaces the same message there, so we don't need to race the
     // stderr thread against the stdout JSONL path.
-    let shim_id_err = shim_id.to_string();
-    let pty_log_err = pty_log.map(Arc::clone);
     let thread_conflict = Arc::new(AtomicBool::new(false));
     let thread_conflict_err = Arc::clone(&thread_conflict);
-    thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    shim_eprintln!("[shim-codex {shim_id_err}] stderr: {line}");
-                    if is_thread_store_conflict(&line) {
-                        thread_conflict_err.store(true, Ordering::SeqCst);
-                    }
-                    if let Some(ref log) = pty_log_err {
-                        let _ = log
-                            .lock()
-                            .unwrap()
-                            .write(format!("[stderr] {line}\n").as_bytes());
-                    }
-                }
-                Err(_) => break,
+    spawn_stderr_logger(
+        stderr,
+        "codex",
+        shim_id.to_string(),
+        pty_log.map(Arc::clone),
+        move |line| {
+            if is_thread_store_conflict(line) {
+                thread_conflict_err.store(true, Ordering::SeqCst);
             }
-        }
-    });
+        },
+    );
 
     let mut turn_usage = super::codex_types::CodexUsage::default();
     let mut turn_completed = false;
@@ -886,7 +865,7 @@ fn run_codex_exec_attempt(
                     if state.lock().unwrap().state == ShimState::Dead {
                         return;
                     }
-                    terminate_child(&mut child.lock().unwrap());
+                    terminate_shared(&child, Duration::from_secs(GROUP_TERM_GRACE_SECS));
                     return run_codex_exec_attempt(
                         shim_id,
                         program,
@@ -1206,7 +1185,7 @@ fn fail_queued_messages(queue: &mut VecDeque<QueuedMessage>) -> Vec<Event> {
 }
 
 struct CodexExecGuard {
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<OwnedChild>>,
     state: Arc<Mutex<CodexState>>,
 }
 impl Drop for CodexExecGuard {
@@ -1220,7 +1199,7 @@ impl Drop for CodexExecGuard {
             st.active_child = None;
         }
         drop(st);
-        terminate_child(&mut self.child.lock().unwrap());
+        terminate_shared(&self.child, Duration::from_secs(GROUP_TERM_GRACE_SECS));
     }
 }
 fn stop_codex_exec(state: &Arc<Mutex<CodexState>>) {
@@ -1232,47 +1211,8 @@ fn stop_codex_exec(state: &Arc<Mutex<CodexState>>) {
         st.active_child.take()
     };
     if let Some(child) = child {
-        terminate_child(&mut child.lock().unwrap());
+        terminate_shared(&child, Duration::from_secs(GROUP_TERM_GRACE_SECS));
     }
-}
-
-/// Terminate a child process: SIGTERM, grace period, then SIGKILL.
-#[allow(dead_code)]
-fn terminate_child(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_some() {
-        return;
-    }
-    let pid = child.id();
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(GROUP_TERM_GRACE_SECS);
-        loop {
-            if Instant::now() > deadline {
-                break;
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                _ => thread::sleep(Duration::from_millis(PROCESS_EXIT_POLL_MS)),
-            }
-        }
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = child.kill();
-    }
-}
-
-/// Extract the last N lines from a string.
-fn last_n_lines_of(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,13 +1223,6 @@ fn last_n_lines_of(text: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use crate::shim::protocol;
-
-    #[test]
-    fn last_n_lines_basic() {
-        assert_eq!(last_n_lines_of("a\nb\nc", 2), "b\nc");
-        assert_eq!(last_n_lines_of("a\nb\nc", 10), "a\nb\nc");
-        assert_eq!(last_n_lines_of("", 5), "");
-    }
 
     #[test]
     fn codex_state_initial() {
@@ -1516,15 +1449,10 @@ mod tests {
 
     #[test]
     fn shutdown_terminates_the_owned_exec_and_discards_queued_work() {
-        use std::os::unix::process::CommandExt;
         let tmp = tempfile::tempdir().unwrap();
         let state = fake_working_state(tmp.path());
         let child = Arc::new(Mutex::new(
-            Command::new("/bin/sleep")
-                .arg("30")
-                .process_group(0)
-                .spawn()
-                .unwrap(),
+            OwnedChild::spawn(Command::new("/bin/sleep").arg("30")).unwrap(),
         ));
         {
             let mut st = state.lock().unwrap();

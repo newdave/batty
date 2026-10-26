@@ -74,6 +74,13 @@ pub fn format_injected_message(sender: &str, body: &str) -> String {
     )
 }
 
+/// Extract the last N lines from a string.
+pub fn last_n_lines_of(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
 // ---------------------------------------------------------------------------
 // Queued message
 // ---------------------------------------------------------------------------
@@ -256,12 +263,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn last_n_lines_basic() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(last_n_lines_of(text, 3), "c\nd\ne");
+        assert_eq!(last_n_lines_of(text, 10), "a\nb\nc\nd\ne");
+        assert_eq!(last_n_lines_of(text, 0), "");
+    }
+
+    #[test]
+    fn last_n_lines_empty() {
+        assert_eq!(last_n_lines_of("", 5), "");
+    }
+
+    #[test]
     fn format_message_includes_sender_and_body() {
         let msg = format_injected_message("manager", "Fix the bug");
         assert!(msg.contains("Message from manager"));
         assert!(msg.contains("Reply-To: manager"));
         assert!(msg.contains("Fix the bug"));
         assert!(msg.contains("batty send manager"));
+        assert!(msg.starts_with("--- Message from manager ---"));
+        assert!(msg.ends_with("Fix the bug"));
     }
 
     #[test]
@@ -291,6 +313,24 @@ mod tests {
             Event::Error { reason, .. } => {
                 assert!(reason.contains("dead"));
                 assert!(reason.contains("id-1"));
+            }
+            _ => panic!("expected Error event"),
+        }
+    }
+
+    #[test]
+    fn drain_queue_errors_omits_id_suffix_and_names_terminal_state() {
+        let mut queue = VecDeque::new();
+        queue.push_back(QueuedMessage {
+            from: "u".into(),
+            body: "b".into(),
+            message_id: None,
+        });
+        let events = drain_queue_errors(&mut queue, ShimState::ContextExhausted);
+        match &events[0] {
+            Event::Error { reason, .. } => {
+                assert!(reason.contains("context_exhausted"));
+                assert!(!reason.contains("(id:"));
             }
             _ => panic!("expected Error event"),
         }

@@ -295,7 +295,7 @@ impl TeamDaemon {
                 } else {
                     if let Some(handle) = self.shim_handles.get_mut(member_name) {
                         handle.apply_state_change(ShimState::Idle);
-                        handle.clear_in_flight_message();
+                        handle.clear_in_flight_messages();
                     }
                     self.states
                         .insert(member_name.to_string(), MemberState::Idle);
@@ -445,7 +445,7 @@ impl TeamDaemon {
             }
 
             Event::Completion {
-                message_id: _,
+                message_id,
                 response,
                 last_lines,
             } => {
@@ -467,7 +467,7 @@ impl TeamDaemon {
 
                 if let Some(handle) = self.shim_handles.get_mut(member_name) {
                     handle.apply_state_change(ShimState::Idle);
-                    handle.clear_in_flight_message();
+                    handle.complete_in_flight_message(message_id.as_deref());
                 }
                 self.states
                     .insert(member_name.to_string(), MemberState::Idle);
@@ -751,13 +751,7 @@ impl TeamDaemon {
                 );
                 if let Some(handle) = self.shim_handles.get_mut(member_name) {
                     handle.record_activity();
-                    let failed_in_flight = handle
-                        .in_flight_message
-                        .as_ref()
-                        .and_then(|message| message.message_id.as_deref())
-                        == Some(id.as_str());
-                    if failed_in_flight {
-                        handle.clear_in_flight_message();
+                    if handle.remove_in_flight_message(&id) {
                         handle.apply_state_change(ShimState::Idle);
                     }
                 }
@@ -1092,44 +1086,51 @@ impl TeamDaemon {
             return Ok(false);
         }
 
-        let Some(in_flight) = previous_handle.take_in_flight_message() else {
+        let in_flight = previous_handle.take_in_flight_messages();
+        if in_flight.is_empty() {
             return Ok(false);
-        };
+        }
 
         let queue = self
             .pending_delivery_queue
             .entry(member_name.to_string())
             .or_default();
-        queue.insert(
-            0,
-            PendingMessage {
-                from: in_flight.from.clone(),
-                body: in_flight.body.clone(),
-                message_id: in_flight.message_id.clone(),
-                queued_at: std::time::Instant::now(),
-            },
-        );
+        // Replay oldest first, ahead of anything already queued.
+        for message in in_flight.iter().rev() {
+            queue.insert(
+                0,
+                PendingMessage {
+                    from: message.from.clone(),
+                    body: message.body.clone(),
+                    message_id: message.message_id.clone(),
+                    queued_at: std::time::Instant::now(),
+                },
+            );
+        }
 
-        let preview = in_flight
-            .body
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(160)
-            .collect::<String>();
-        let details = format!(
-            "requeued in-flight supervisory message during restart handoff: from={} preview={preview}",
-            in_flight.from
-        );
-        let _ = append_shim_event_log(
-            &self.config.project_root,
-            member_name,
-            &format!("<- replay pending after respawn: {details}"),
-        );
+        for message in &in_flight {
+            let preview = message
+                .body
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(160)
+                .collect::<String>();
+            let details = format!(
+                "requeued in-flight supervisory message during restart handoff: from={} preview={preview}",
+                message.from
+            );
+            let _ = append_shim_event_log(
+                &self.config.project_root,
+                member_name,
+                &format!("<- replay pending after respawn: {details}"),
+            );
+        }
         self.record_orchestrator_action(format!(
-            "delivery: requeued supervisory in-flight message for {member_name} during restart handoff"
+            "delivery: requeued {} supervisory in-flight message(s) for {member_name} during restart handoff",
+            in_flight.len()
         ));
         Ok(true)
     }
@@ -2000,11 +2001,13 @@ mod tests {
         {
             let handle = daemon.shim_handles.get_mut("eng-1").unwrap();
             handle.apply_state_change(ShimState::Working);
-            handle.in_flight_message = Some(crate::team::daemon::agent_handle::InFlightMessage {
-                from: "manager".to_string(),
-                body: "test assignment".to_string(),
-                message_id: Some(message_id.clone()),
-            });
+            handle.in_flight_messages.push_back(
+                crate::team::daemon::agent_handle::InFlightMessage {
+                    from: "manager".to_string(),
+                    body: "test assignment".to_string(),
+                    message_id: Some(message_id.clone()),
+                },
+            );
         }
 
         daemon
@@ -2026,7 +2029,7 @@ mod tests {
         );
         assert_eq!(pending[0].id, inbox_id);
         assert!(daemon.shim_handles["eng-1"].is_ready());
-        assert!(daemon.shim_handles["eng-1"].in_flight_message.is_none());
+        assert!(daemon.shim_handles["eng-1"].in_flight_messages.is_empty());
     }
 
     /// Regression: Starting→Ready race where drain_pending_queue ran
@@ -2756,6 +2759,39 @@ mod tests {
                     })
             }));
         }
+    }
+
+    #[test]
+    fn restart_handoff_replays_every_in_flight_message_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![
+                architect_member("architect"),
+                manager_member("manager", Some("architect")),
+            ])
+            .build();
+        let _child = insert_mock_handle(&mut daemon, "manager");
+        let mut previous = daemon.shim_handles.remove("manager").unwrap();
+        previous
+            .send_message_with_id("architect", "first", Some("m1".into()))
+            .unwrap();
+        previous
+            .send_message_with_id("architect", "second", Some("m2".into()))
+            .unwrap();
+
+        let requeued = daemon
+            .replay_or_requeue_pending_messages_after_respawn(
+                "manager",
+                &mut previous,
+                ShimDisconnectDisposition::RestartHandoff,
+            )
+            .unwrap();
+
+        assert!(requeued);
+        let queue = daemon.pending_delivery_queue.get("manager").unwrap();
+        let bodies: Vec<_> = queue.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["first", "second"]);
+        assert!(previous.in_flight_messages.is_empty());
     }
 
     #[test]

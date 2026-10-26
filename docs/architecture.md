@@ -130,7 +130,7 @@ PID is stored at `.batty/daemon.pid`. Logs go to `.batty/daemon.log`.
 | `team/layout.rs`    | tmux layout builder (zones to panes)                                   |
 | `team/daemon.rs`    | Core daemon: shim spawning, polling loop, message delivery             |
 | `team/inbox.rs`     | Maildir-based inbox: deliver, pending, mark_delivered, all_messages    |
-| `team/message.rs`   | Message formatting and prompt composition for delivery                 |
+| `team/legacy_command_queue.rs` | Legacy `commands.jsonl` queue (atomic drain, failures retained) |
 | `team/comms.rs`     | Channel abstraction (tmux pane, Telegram, etc.)                        |
 | `team/telegram.rs`  | Telegram bot integration and setup wizard                              |
 | `team/standup.rs`   | Standup report generation from agent output                            |

@@ -5,6 +5,7 @@
 //! orchestrator side of the socketpair channel, the child process, and the
 //! last known shim state.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -16,6 +17,9 @@ pub(in crate::team) struct InFlightMessage {
     pub body: String,
     pub message_id: Option<String>,
 }
+
+/// Upper bound on tracked in-flight messages (active turn + shim queue).
+const MAX_IN_FLIGHT: usize = crate::shim::common::MAX_QUEUE_DEPTH + 1;
 
 /// Per-agent handle for a shim subprocess.
 pub(in crate::team) struct AgentHandle {
@@ -47,8 +51,9 @@ pub(in crate::team) struct AgentHandle {
     pub input_bytes: u64,
     /// When the shim last reported activity.
     pub last_activity_at: Option<Instant>,
-    /// Most recent message delivered into the shim and still awaiting completion.
-    pub in_flight_message: Option<InFlightMessage>,
+    /// Messages sent to the shim and still awaiting completion, oldest first.
+    /// All of them are replayed if the shim dies.
+    pub in_flight_messages: VecDeque<InFlightMessage>,
     /// Set when a write hit EPIPE/ECONNRESET: the shim end of the socketpair
     /// is gone. The poll loop turns this into the normal died/respawn path.
     pub channel_broken: bool,
@@ -99,7 +104,7 @@ impl AgentHandle {
             output_bytes: 0,
             input_bytes: 0,
             last_activity_at: None,
-            in_flight_message: None,
+            in_flight_messages: VecDeque::new(),
             channel_broken: false,
         }
     }
@@ -143,11 +148,16 @@ impl AgentHandle {
             .input_bytes
             .saturating_add(from.len() as u64 + body.len() as u64);
         self.record_activity();
-        self.in_flight_message = Some(InFlightMessage {
+        self.in_flight_messages.push_back(InFlightMessage {
             from: from.to_string(),
             body: body.to_string(),
             message_id: message_id.clone(),
         });
+        // The shim queues at most MAX_QUEUE_DEPTH behind the active turn; a
+        // longer backlog means completions were lost, so drop the stalest.
+        while self.in_flight_messages.len() > MAX_IN_FLIGHT {
+            self.in_flight_messages.pop_front();
+        }
         let result = self.channel.send(&Command::SendMessage {
             from: from.to_string(),
             body: body.to_string(),
@@ -155,7 +165,7 @@ impl AgentHandle {
         });
         if let Err(error) = &result {
             // Nothing was sent, so there is nothing in flight to replay.
-            self.in_flight_message = None;
+            self.in_flight_messages.pop_back();
             if is_broken_pipe_error(error) {
                 self.mark_channel_broken();
             }
@@ -228,12 +238,45 @@ impl AgentHandle {
         self.last_activity_at = Some(Instant::now());
     }
 
-    pub fn clear_in_flight_message(&mut self) {
-        self.in_flight_message = None;
+    /// Forget every in-flight message (fresh shim, nothing outstanding).
+    pub fn clear_in_flight_messages(&mut self) {
+        self.in_flight_messages.clear();
     }
 
-    pub fn take_in_flight_message(&mut self) -> Option<InFlightMessage> {
-        self.in_flight_message.take()
+    /// Remove the in-flight message with this id. Returns whether it was tracked.
+    pub fn remove_in_flight_message(&mut self, id: &str) -> bool {
+        match self
+            .in_flight_messages
+            .iter()
+            .position(|m| m.message_id.as_deref() == Some(id))
+        {
+            Some(index) => {
+                self.in_flight_messages.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A turn completed. Remove the message it reports, or the oldest
+    /// outstanding one when the completion carries no (known) id.
+    pub fn complete_in_flight_message(&mut self, id: Option<&str>) {
+        if id.is_some_and(|id| self.remove_in_flight_message(id)) {
+            return;
+        }
+        self.in_flight_messages.pop_front();
+    }
+
+    #[cfg(test)]
+    pub fn has_in_flight_message(&self, id: &str) -> bool {
+        self.in_flight_messages
+            .iter()
+            .any(|m| m.message_id.as_deref() == Some(id))
+    }
+
+    /// Take all in-flight messages, oldest first.
+    pub fn take_in_flight_messages(&mut self) -> Vec<InFlightMessage> {
+        self.in_flight_messages.drain(..).collect()
     }
 
     /// Seconds since last Pong, or None if no Pong received yet.
@@ -309,7 +352,7 @@ mod tests {
         assert!(!handle.is_terminal());
         assert!(handle.last_pong_at.is_none());
         assert!(handle.last_activity_at.is_none());
-        assert!(handle.in_flight_message.is_none());
+        assert!(handle.in_flight_messages.is_empty());
         assert_eq!(handle.agent_type, "claude");
         assert_eq!(handle.agent_cmd, "claude");
         assert_eq!(handle.work_dir, PathBuf::from("/tmp/test"));
@@ -370,7 +413,7 @@ mod tests {
         assert!(is_broken_pipe_error(&error), "{error:?}");
         assert!(handle.channel_broken);
         assert!(handle.is_terminal());
-        assert!(handle.in_flight_message.is_none());
+        assert!(handle.in_flight_messages.is_empty());
     }
 
     #[test]
@@ -498,10 +541,59 @@ mod tests {
 
         let cmd: Command = child.recv().unwrap().unwrap();
         assert!(matches!(cmd, Command::SendMessage { .. }));
-        let tracked = handle.take_in_flight_message().unwrap();
-        assert_eq!(tracked.from, "manager");
-        assert_eq!(tracked.body, "do the thing");
-        assert!(handle.in_flight_message.is_none());
+        let tracked = handle.take_in_flight_messages();
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].from, "manager");
+        assert_eq!(tracked[0].body, "do the thing");
+        assert!(handle.in_flight_messages.is_empty());
+    }
+
+    #[test]
+    fn multiple_sends_are_all_tracked_in_order() {
+        let (mut handle, _child) = make_test_handle();
+        handle
+            .send_message_with_id("manager", "one", Some("m1".into()))
+            .unwrap();
+        handle
+            .send_message_with_id("manager", "two", Some("m2".into()))
+            .unwrap();
+
+        let ids: Vec<_> = handle
+            .in_flight_messages
+            .iter()
+            .map(|m| m.message_id.clone().unwrap())
+            .collect();
+        assert_eq!(ids, ["m1", "m2"]);
+    }
+
+    #[test]
+    fn completion_and_failure_remove_only_their_message() {
+        let (mut handle, _child) = make_test_handle();
+        for id in ["m1", "m2", "m3"] {
+            handle
+                .send_message_with_id("manager", id, Some(id.into()))
+                .unwrap();
+        }
+        handle.complete_in_flight_message(Some("m2"));
+        assert!(!handle.has_in_flight_message("m2"));
+        assert!(handle.remove_in_flight_message("m3"));
+        assert!(!handle.remove_in_flight_message("m3"));
+        // Unknown / absent id retires the oldest.
+        handle.complete_in_flight_message(None);
+        assert!(handle.in_flight_messages.is_empty());
+    }
+
+    #[test]
+    fn in_flight_tracking_is_bounded() {
+        let (mut handle, mut child) = make_test_handle();
+        child.set_read_timeout(None).unwrap();
+        for i in 0..(MAX_IN_FLIGHT + 5) {
+            handle
+                .send_message_with_id("m", "b", Some(format!("m{i}")))
+                .unwrap();
+        }
+        assert_eq!(handle.in_flight_messages.len(), MAX_IN_FLIGHT);
+        assert!(!handle.has_in_flight_message("m0"));
     }
 
     #[test]

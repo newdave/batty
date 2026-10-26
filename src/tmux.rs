@@ -177,6 +177,20 @@ where
     command_output_with_timeout(command, command_label, target, tmux_command_timeout())
 }
 
+fn spawn_pipe_drain<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
+fn join_pipe_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle.and_then(|h| h.join().ok()).unwrap_or_default()
+}
+
 fn command_output_with_timeout(
     mut command: Command,
     command_label: &'static str,
@@ -188,14 +202,20 @@ fn command_output_with_timeout(
         .spawn()
         .map_err(|error| TmuxError::exec(command_label, error))?;
     let started_at = Instant::now();
+    // Drain both pipes concurrently: a child writing more than the pipe
+    // buffer (~64KB) would otherwise block until the timeout kills it.
+    let stdout_reader = child.stdout.take().map(spawn_pipe_drain);
+    let stderr_reader = child.stderr.take().map(spawn_pipe_drain);
 
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
+            Ok(Some(status)) => {
                 let elapsed = started_at.elapsed();
-                let output = child
-                    .wait_with_output()
-                    .map_err(|error| TmuxError::exec(command_label, error))?;
+                let output = Output {
+                    status,
+                    stdout: join_pipe_drain(stdout_reader),
+                    stderr: join_pipe_drain(stderr_reader),
+                };
                 debug!(
                     command = command_label,
                     target,
@@ -1333,6 +1353,29 @@ mod tests {
 
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout), "marker-ok");
+    }
+
+    #[test]
+    fn command_timeout_drains_output_larger_than_pipe_buffer() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "head -c 300000 /dev/zero; head -c 200000 /dev/zero >&2",
+        ]);
+        let started_at = Instant::now();
+
+        let output = command_output_with_timeout(
+            command,
+            "supervision-harness-large-output",
+            None,
+            Duration::from_secs(10),
+        )
+        .expect("large output must not deadlock the child");
+
+        assert!(started_at.elapsed() < Duration::from_secs(5));
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 300_000);
+        assert_eq!(output.stderr.len(), 200_000);
     }
 
     #[test]

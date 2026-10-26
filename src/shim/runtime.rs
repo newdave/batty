@@ -20,7 +20,7 @@ use portable_pty::{Child, CommandBuilder, PtySize};
 
 use super::classifier::{self, AgentType, ScreenVerdict};
 use super::common::shim_eprintln;
-use super::common::{self, QueuedMessage};
+use super::common::{self, QueuedMessage, drain_queue_errors, format_injected_message};
 use super::protocol::{Channel, Command, Event, ShimState};
 use super::pty_log::PtyLogWriter;
 use crate::prompt::strip_ansi;
@@ -266,10 +266,6 @@ fn extract_test_commands(output: &str) -> Vec<String> {
     }
 
     commands
-}
-
-fn format_injected_message(sender: &str, body: &str) -> String {
-    common::format_injected_message(sender, body)
 }
 
 fn shell_single_quote(input: &str) -> String {
@@ -1468,13 +1464,6 @@ pub fn run(args: ShimArgs, channel: Channel) -> Result<()> {
     Ok(())
 }
 
-fn drain_queue_errors(
-    queue: &mut VecDeque<QueuedMessage>,
-    terminal_state: ShimState,
-) -> Vec<Event> {
-    common::drain_queue_errors(queue, terminal_state)
-}
-
 // ---------------------------------------------------------------------------
 // Build events for a state transition
 // ---------------------------------------------------------------------------
@@ -1945,57 +1934,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_queue_errors_empty() {
-        let mut queue: VecDeque<QueuedMessage> = VecDeque::new();
-        let events = drain_queue_errors(&mut queue, ShimState::Dead);
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn drain_queue_errors_with_messages() {
-        let mut queue: VecDeque<QueuedMessage> = VecDeque::new();
-        queue.push_back(make_queued_msg("m1", "hello"));
-        queue.push_back(make_queued_msg("m2", "world"));
-        queue.push_back(QueuedMessage {
-            from: "user".into(),
-            body: "no id".into(),
-            message_id: None,
-        });
-
-        let events = drain_queue_errors(&mut queue, ShimState::Dead);
-        assert_eq!(events.len(), 3);
-        assert!(queue.is_empty());
-
-        // All should be Error events
-        for event in &events {
-            assert!(matches!(event, Event::Error { .. }));
-        }
-
-        // First error should mention the message_id
-        if let Event::Error { reason, .. } = &events[0] {
-            assert!(reason.contains("dead"));
-            assert!(reason.contains("m1"));
-        }
-
-        // Third error (no message_id) should not contain "(id:"
-        if let Event::Error { reason, .. } = &events[2] {
-            assert!(!reason.contains("(id:"));
-        }
-    }
-
-    #[test]
-    fn drain_queue_errors_context_exhausted() {
-        let mut queue: VecDeque<QueuedMessage> = VecDeque::new();
-        queue.push_back(make_queued_msg("m1", "hello"));
-
-        let events = drain_queue_errors(&mut queue, ShimState::ContextExhausted);
-        assert_eq!(events.len(), 1);
-        if let Event::Error { reason, .. } = &events[0] {
-            assert!(reason.contains("context_exhausted"));
-        }
-    }
-
-    #[test]
     fn queued_message_preserves_fields() {
         let msg = QueuedMessage {
             from: "manager".into(),
@@ -2020,22 +1958,6 @@ mod tests {
     #[test]
     fn max_queue_depth_is_16() {
         assert_eq!(MAX_QUEUE_DEPTH, 16);
-    }
-
-    #[test]
-    fn format_injected_message_includes_sender_and_reply_target() {
-        let formatted = format_injected_message("human", "what is 2+2?");
-        assert!(formatted.contains("--- Message from human ---"));
-        assert!(formatted.contains("Reply-To: human"));
-        assert!(formatted.contains("batty send human"));
-        assert!(formatted.ends_with("what is 2+2?"));
-    }
-
-    #[test]
-    fn format_injected_message_uses_sender_as_reply_target() {
-        let formatted = format_injected_message("manager", "status?");
-        assert!(formatted.contains("Reply-To: manager"));
-        assert!(formatted.contains("batty send manager"));
     }
 
     #[test]

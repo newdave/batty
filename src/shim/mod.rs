@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod bench;
 pub mod chat;
+pub mod child;
 pub mod classifier;
 pub mod codex_session;
 pub mod codex_types;

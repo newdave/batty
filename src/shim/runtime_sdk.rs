@@ -6,7 +6,6 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write as IoWrite};
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use super::child::{spawn_piped_agent, spawn_stderr_logger};
 use super::common::shim_eprintln;
 use super::common::{
     self, MAX_QUEUE_DEPTH, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors,
-    format_injected_message,
+    format_injected_message, last_n_lines_of,
 };
 use super::protocol::{Channel, Command as ShimCommand, Event, ShimState};
 use super::pty_log::PtyLogWriter;
@@ -96,14 +96,7 @@ struct ForcedCompletion {
 /// `args.cmd` must be a shell command that launches Claude Code in stream-json mode.
 pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
     // -- Spawn subprocess with piped stdin/stdout/stderr --
-    let mut child = Command::new("bash")
-        .args(["-lc", &args.cmd])
-        .current_dir(&args.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove("CLAUDECODE") // prevent nested detection
-        .spawn()
+    let mut child = spawn_piped_agent(&args.cmd, &args.cwd, &[])
         .with_context(|| format!("[shim-sdk {}] failed to spawn agent", args.id))?;
 
     let child_pid = child.id();
@@ -113,9 +106,9 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
         child_pid
     );
 
-    let child_stdin = child.stdin.take().context("failed to take child stdin")?;
-    let child_stdout = child.stdout.take().context("failed to take child stdout")?;
-    let child_stderr = child.stderr.take().context("failed to take child stderr")?;
+    let child_stdin = child.take_stdin().context("failed to take child stdin")?;
+    let child_stdout = child.take_stdout().context("failed to take child stdout")?;
+    let child_stderr = child.take_stderr().context("failed to take child stderr")?;
 
     // Shared state
     let state = Arc::new(Mutex::new(SdkState {
@@ -508,25 +501,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
     });
 
     // -- stderr reader thread --
-    let shim_id_err = args.id.clone();
-    let pty_log_stderr = pty_log;
-    thread::spawn(move || {
-        let reader = BufReader::new(child_stderr);
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    shim_eprintln!("[shim-sdk {shim_id_err}] stderr: {line}");
-                    if let Some(ref log) = pty_log_stderr {
-                        let _ = log
-                            .lock()
-                            .unwrap()
-                            .write(format!("[stderr] {line}\n").as_bytes());
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    spawn_stderr_logger(child_stderr, "sdk", args.id.clone(), pty_log, |_| {});
 
     // -- Session stats thread --
     let state_stats = Arc::clone(&state);
@@ -578,7 +553,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                     "[shim-sdk {}] orchestrator disconnected, shutting down",
                     args.id
                 );
-                terminate_child(&mut child);
+                child.terminate(Duration::from_secs(GROUP_TERM_GRACE_SECS));
                 break;
             }
             Err(error)
@@ -598,7 +573,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
             }
             Err(e) => {
                 shim_eprintln!("[shim-sdk {}] channel error: {e}", args.id);
-                terminate_child(&mut child);
+                child.terminate(Duration::from_secs(GROUP_TERM_GRACE_SECS));
                 break;
             }
         };
@@ -762,7 +737,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                 let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
                 loop {
                     if Instant::now() > deadline {
-                        terminate_child(&mut child);
+                        child.terminate(Duration::from_secs(GROUP_TERM_GRACE_SECS));
                         break;
                     }
                     match child.try_wait() {
@@ -777,7 +752,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                 if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
                     shim_eprintln!("[shim-sdk {}] work preservation failed: {error}", args.id);
                 }
-                terminate_child(&mut child);
+                child.terminate(Duration::from_secs(GROUP_TERM_GRACE_SECS));
                 break;
             }
         }
@@ -963,43 +938,6 @@ impl RequestContextTracker {
     }
 }
 
-/// Terminate a child process: SIGTERM, grace period, then SIGKILL.
-fn terminate_child(child: &mut Child) {
-    let pid = child.id();
-
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(GROUP_TERM_GRACE_SECS);
-        loop {
-            if Instant::now() > deadline {
-                break;
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                _ => thread::sleep(Duration::from_millis(PROCESS_EXIT_POLL_MS)),
-            }
-        }
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-    }
-
-    #[allow(unreachable_code)]
-    {
-        let _ = child.kill();
-    }
-}
-
-/// Extract the last N lines from a string.
-fn last_n_lines_of(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
-
 fn stdout_read_timeout(state: &Arc<Mutex<SdkState>>) -> Option<Duration> {
     let st = state.lock().unwrap();
     (st.state == ShimState::Working).then_some(WORKING_READ_TIMEOUT)
@@ -1120,19 +1058,6 @@ fn emit_forced_completion<W: IoWrite>(
 mod tests {
     use super::*;
     use crate::shim::protocol;
-
-    #[test]
-    fn last_n_lines_basic() {
-        let text = "a\nb\nc\nd\ne";
-        assert_eq!(last_n_lines_of(text, 3), "c\nd\ne");
-        assert_eq!(last_n_lines_of(text, 10), "a\nb\nc\nd\ne");
-        assert_eq!(last_n_lines_of(text, 0), "");
-    }
-
-    #[test]
-    fn last_n_lines_empty() {
-        assert_eq!(last_n_lines_of("", 5), "");
-    }
 
     #[test]
     fn sdk_state_initial_values() {

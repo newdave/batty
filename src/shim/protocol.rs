@@ -202,7 +202,9 @@ impl std::fmt::Display for ShimState {
 /// Uses 4-byte big-endian length + JSON payload for robustness.
 pub struct Channel {
     stream: UnixStream,
-    read_buf: Vec<u8>,
+    /// Bytes of an incoming frame (length prefix + body) read so far. Kept
+    /// across read timeouts so a partial frame is resumed, not lost.
+    partial_in: Vec<u8>,
     /// Unsent tail of a frame whose write timed out mid-frame. It must be
     /// flushed before any new frame, otherwise the length-prefixed stream
     /// would be corrupted by interleaving.
@@ -215,7 +217,7 @@ impl Channel {
     pub fn new(stream: UnixStream) -> Self {
         Self {
             stream,
-            read_buf: vec![0u8; 4096],
+            partial_in: Vec::new(),
             pending_out: Vec::new(),
         }
     }
@@ -299,25 +301,50 @@ impl Channel {
         }
     }
 
+    /// Read from the socket into `partial_in` until it holds `target` bytes.
+    /// Bytes already consumed stay in `partial_in` when a read times out, so
+    /// the next call resumes the same frame. Returns `Ok(false)` on EOF.
+    fn fill_partial(&mut self, target: usize) -> io::Result<bool> {
+        let mut chunk = [0u8; 4096];
+        while self.partial_in.len() < target {
+            let want = (target - self.partial_in.len()).min(chunk.len());
+            match self.stream.read(&mut chunk[..want]) {
+                Ok(0) => return Ok(false),
+                Ok(n) => self.partial_in.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
     /// Receive a deserializable message. Blocks until a message arrives.
     /// Returns Ok(None) on clean EOF (peer closed).
+    ///
+    /// With a read timeout set, a timeout (`WouldBlock`/`TimedOut`) may fire
+    /// mid-frame. The bytes consumed so far are retained and the next call
+    /// resumes the frame, so the stream never desynchronises.
     pub fn recv<T: for<'de> Deserialize<'de>>(&mut self) -> anyhow::Result<Option<T>> {
-        let mut len_buf = [0u8; 4];
-        match self.stream.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
+        if !self.fill_partial(4)? {
+            return Ok(None);
         }
-        let len = u32::from_be_bytes(len_buf) as usize;
+        let len = u32::from_be_bytes([
+            self.partial_in[0],
+            self.partial_in[1],
+            self.partial_in[2],
+            self.partial_in[3],
+        ]) as usize;
         if len > MAX_MSG {
+            self.partial_in.clear();
             anyhow::bail!("incoming message too large: {} bytes", len);
         }
-        if self.read_buf.len() < len {
-            self.read_buf.resize(len, 0);
+        if !self.fill_partial(4 + len)? {
+            self.partial_in.clear();
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
-        self.stream.read_exact(&mut self.read_buf[..len])?;
-        let msg = serde_json::from_slice(&self.read_buf[..len])?;
-        Ok(Some(msg))
+        let result = serde_json::from_slice(&self.partial_in[4..4 + len]);
+        self.partial_in.clear();
+        Ok(Some(result?))
     }
 
     /// Set a read timeout on the underlying socket.
@@ -348,10 +375,21 @@ impl Channel {
     }
 
     /// Clone the underlying fd for use in a second thread.
+    ///
+    /// The clone has its own (empty) `partial_in` / `pending_out`, so the
+    /// original and the clone must never be used for the same direction, and
+    /// neither should rely on timeouts: partial-frame state is per-handle.
+    /// The shim uses clones with one thread reading and another writing and
+    /// no timeouts, which is safe. Cloning a channel that holds partial
+    /// state would orphan it, hence the assertion.
     pub fn try_clone(&self) -> anyhow::Result<Self> {
+        debug_assert!(
+            self.partial_in.is_empty() && self.pending_out.is_empty(),
+            "Channel::try_clone with partial frame state would lose it"
+        );
         Ok(Self {
             stream: self.stream.try_clone()?,
-            read_buf: vec![0u8; 4096],
+            partial_in: Vec::new(),
             pending_out: Vec::new(),
         })
     }
@@ -375,6 +413,63 @@ pub fn socketpair() -> anyhow::Result<(UnixStream, UnixStream)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recv_resumes_partial_frame_after_read_timeout() {
+        use std::time::Duration;
+        let (a, b) = socketpair().unwrap();
+        let mut receiver = Channel::new(b);
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+
+        let json = serde_json::to_vec(&Command::SendMessage {
+            from: "u".into(),
+            body: "x".repeat(300),
+            message_id: Some("m1".into()),
+        })
+        .unwrap();
+        let mut frame = (json.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&json);
+
+        let writer = std::thread::spawn(move || {
+            let mut a = a;
+            // Split inside the length prefix, then inside the body.
+            for piece in [&frame[..2], &frame[2..10], &frame[10..]] {
+                a.write_all(piece).unwrap();
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            a
+        });
+
+        let mut timeouts = 0;
+        let cmd = loop {
+            match receiver.recv::<Command>() {
+                Ok(Some(c)) => break c,
+                Ok(None) => panic!("unexpected EOF"),
+                Err(e) => {
+                    let io = e.downcast_ref::<io::Error>().expect("io error");
+                    assert!(matches!(
+                        io.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ));
+                    timeouts += 1;
+                }
+            }
+        };
+        assert!(timeouts >= 2, "expected mid-frame timeouts, got {timeouts}");
+        match cmd {
+            Command::SendMessage {
+                body, message_id, ..
+            } => {
+                assert_eq!(body.len(), 300);
+                assert_eq!(message_id.as_deref(), Some("m1"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        drop(writer.join().unwrap());
+        assert!(receiver.recv::<Command>().unwrap().is_none());
+    }
 
     #[test]
     fn roundtrip_command_send_message() {

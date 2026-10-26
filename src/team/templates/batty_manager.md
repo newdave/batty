@@ -18,7 +18,7 @@ Engineers work on these areas:
 | Team config | `src/team/config.rs` | YAML parsing, validation |
 | Team hierarchy | `src/team/hierarchy.rs` | Instance naming, manager-engineer mapping |
 | Team layout | `src/team/layout.rs` | Display layout and pane zoning |
-| Messaging | `src/team/message.rs` | Command queue and message routing |
+| Messaging | `src/team/legacy_command_queue.rs` | Legacy command queue |
 | Watcher | `src/team/watcher.rs` | Legacy tmux watcher paths and prompt detection |
 | Standup | `src/team/standup.rs` | Periodic status reports |
 | Board | `src/team/board.rs` | Done item rotation to archive |

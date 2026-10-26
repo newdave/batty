@@ -14,7 +14,7 @@ Contributor-facing map of Batty source modules.
 | `src/team/layout.rs`    | tmux pane layout builder for team zones and manager/engineer groupings.   |
 | `src/team/daemon.rs`    | Background runtime loop: spawn shims, poll state, route messages.         |
 | `src/team/inbox.rs`     | Maildir inbox storage for inter-role messages.                            |
-| `src/team/message.rs`   | Message types and prompt composition for shim delivery.                   |
+| `src/team/legacy_command_queue.rs` | Legacy command queue types and atomic drain. |
 | `src/team/comms.rs`     | Outbound channel abstraction for user roles, including Telegram delivery. |
 | `src/team/telegram.rs`  | Telegram Bot API client and setup wizard behind `batty telegram`.         |
 | `src/team/standup.rs`   | Standup report generation from current member state.                      |

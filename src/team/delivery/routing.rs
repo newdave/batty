@@ -12,7 +12,7 @@ use crate::team::daemon::{PendingAckInboxMessage, PendingShimAck, TeamDaemon};
 use crate::team::errors::DeliveryError;
 use crate::team::events::TeamEvent;
 use crate::team::inbox;
-use crate::team::message;
+use crate::team::legacy_command_queue;
 use crate::team::standup::MemberState;
 use crate::team::status;
 use crate::team::supervisory_notice::{
@@ -1321,60 +1321,48 @@ impl TeamDaemon {
     }
 
     pub(in crate::team) fn drain_legacy_command_queue(&mut self) -> Result<()> {
-        let queue_path = message::command_queue_path(&self.config.project_root);
-        let commands = message::read_command_queue(&queue_path)?;
-        if commands.is_empty() {
-            return Ok(());
-        }
-
+        let queue_path = legacy_command_queue::command_queue_path(&self.config.project_root);
         let root = inbox::inboxes_root(&self.config.project_root);
         let tiered = self.config.team_config.workflow_policy.tiered_inboxes;
-        let mut remaining_commands = Vec::new();
-        for cmd in commands {
-            let result: Result<()> = (|| match &cmd {
-                message::QueuedCommand::Send {
-                    from,
-                    to,
-                    message: msg,
-                } => {
-                    let is_user =
-                        self.config.team_config.roles.iter().any(|role| {
-                            role.name == to.as_str() && role.role_type == RoleType::User
-                        });
+        legacy_command_queue::drain_with(&queue_path, |cmd| match cmd {
+            legacy_command_queue::QueuedCommand::Send {
+                from,
+                to,
+                message: msg,
+            } => {
+                let is_user = self
+                    .config
+                    .team_config
+                    .roles
+                    .iter()
+                    .any(|role| role.name == to.as_str() && role.role_type == RoleType::User);
 
-                    if is_user {
-                        if let Some(channel) = self.channels.get(to.as_str()) {
-                            let formatted = format!("[From {from}]\n{msg}");
-                            let _ = channel;
-                            self.deliver_channel_message(from, to, &formatted)?;
-                        }
-                    } else {
-                        let inbox_msg = inbox::InboxMessage::new_send(from, to, msg);
-                        crate::team::inbox_tiered::deliver_flag_aware(&root, &inbox_msg, tiered)?;
-                        debug!(from, to, "legacy command routed to inbox");
+                if is_user {
+                    // A user role without a live channel cannot be reached
+                    // now; fail so the command stays queued for a retry.
+                    if !self.channels.contains_key(to.as_str()) {
+                        anyhow::bail!("no channel available for user role '{to}'");
                     }
-                    Ok(())
+                    let formatted = format!("[From {from}]\n{msg}");
+                    self.deliver_channel_message(from, to, &formatted)?;
+                } else {
+                    let inbox_msg = inbox::InboxMessage::new_send(from, to, msg);
+                    crate::team::inbox_tiered::deliver_flag_aware(&root, &inbox_msg, tiered)?;
+                    debug!(from, to, "legacy command routed to inbox");
                 }
-                message::QueuedCommand::Assign {
-                    from,
-                    engineer,
-                    task,
-                } => {
-                    let msg = inbox::InboxMessage::new_assign(from, engineer, task);
-                    crate::team::inbox_tiered::deliver_flag_aware(&root, &msg, tiered)?;
-                    debug!(engineer, "legacy assign routed to inbox");
-                    Ok(())
-                }
-            })();
-
-            if let Err(error) = result {
-                warn!(error = %error, "failed to process legacy command; preserving in queue");
-                remaining_commands.push(cmd);
+                Ok(())
             }
-        }
-
-        message::write_command_queue(&queue_path, &remaining_commands)?;
-        Ok(())
+            legacy_command_queue::QueuedCommand::Assign {
+                from,
+                engineer,
+                task,
+            } => {
+                let msg = inbox::InboxMessage::new_assign(from, engineer, task);
+                crate::team::inbox_tiered::deliver_flag_aware(&root, &msg, tiered)?;
+                debug!(engineer, "legacy assign routed to inbox");
+                Ok(())
+            }
+        })
     }
 
     pub(in crate::team) fn deliver_inbox_messages(&mut self) -> Result<()> {
@@ -2028,7 +2016,7 @@ mod tests {
     use crate::team::events::EventSink;
     use crate::team::hierarchy::MemberInstance;
     use crate::team::inbox;
-    use crate::team::message;
+    use crate::team::legacy_command_queue as message;
     use crate::team::standup::MemberState;
     use crate::team::test_support::{
         TestDaemonBuilder, architect_member, engineer_member, git_ok, inferred_role_defs,
@@ -2231,6 +2219,36 @@ mod tests {
         assert_eq!(engineer_pending.len(), 1);
         assert_eq!(engineer_pending[0].from, "manager");
         assert!(engineer_pending[0].body.contains("Task #7: recover"));
+    }
+
+    #[test]
+    fn drain_legacy_command_queue_retains_send_to_user_without_channel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue_path = message::command_queue_path(tmp.path());
+        message::enqueue_command(
+            &queue_path,
+            &message::QueuedCommand::Send {
+                from: "architect".into(),
+                to: "human".into(),
+                message: "status".into(),
+            },
+        )
+        .unwrap();
+
+        let mut daemon = empty_legacy_daemon(&tmp);
+        daemon.config.team_config.roles = vec![RoleDef {
+            name: "human".to_string(),
+            role_type: RoleType::User,
+            channel: Some("telegram".to_string()),
+            channel_config: Some(test_channel_config("123", "fake")),
+            ..Default::default()
+        }];
+        daemon.channels = HashMap::new();
+
+        daemon.drain_legacy_command_queue().unwrap();
+
+        let remaining = message::read_command_queue(&queue_path).unwrap();
+        assert_eq!(remaining.len(), 1, "undeliverable command must be retained");
     }
 
     #[test]

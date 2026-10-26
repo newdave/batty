@@ -1,4 +1,4 @@
-//! Team message types and command queue management.
+//! Legacy command queue (`commands.jsonl`): types, append, and atomic draining.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -109,6 +109,52 @@ pub fn write_command_queue(queue_path: &Path, commands: &[QueuedCommand]) -> Res
     Ok(())
 }
 
+/// Path of the batch currently being drained from `queue_path`.
+fn draining_path(queue_path: &Path) -> PathBuf {
+    queue_path.with_extension("jsonl.draining")
+}
+
+/// Drain the queue by atomically claiming it, then processing each command.
+///
+/// The live queue is first renamed to `<queue>.draining`, so commands
+/// appended by `enqueue_command` while a batch is being processed land in a
+/// fresh live file and are never overwritten. Commands for which `process`
+/// returns an error are appended back to the live queue; the batch file is
+/// removed only after that succeeds. A batch left behind by a crash (or a
+/// failed append-back) is picked up first on the next call.
+pub fn drain_with<F>(queue_path: &Path, mut process: F) -> Result<()>
+where
+    F: FnMut(&QueuedCommand) -> Result<()>,
+{
+    let batch_path = draining_path(queue_path);
+    if !batch_path.exists() {
+        match std::fs::rename(queue_path, &batch_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to claim command queue {}", queue_path.display())
+                });
+            }
+        }
+    }
+
+    let commands = read_command_queue(&batch_path)?;
+    let mut failed = Vec::new();
+    for cmd in commands {
+        if let Err(error) = process(&cmd) {
+            tracing::warn!(error = %error, "failed to process legacy command; preserving in queue");
+            failed.push(cmd);
+        }
+    }
+    for cmd in &failed {
+        enqueue_command(queue_path, cmd)?;
+    }
+    std::fs::remove_file(&batch_path)
+        .with_context(|| format!("failed to remove drained batch {}", batch_path.display()))?;
+    Ok(())
+}
+
 /// Resolve the command queue path.
 pub fn command_queue_path(project_root: &Path) -> PathBuf {
     project_root
@@ -120,6 +166,86 @@ pub fn command_queue_path(project_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn send(to: &str, message: &str) -> QueuedCommand {
+        QueuedCommand::Send {
+            from: "human".into(),
+            to: to.into(),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn drain_with_retains_only_failures_and_clears_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = tmp.path().join("commands.jsonl");
+        enqueue_command(&queue, &send("ok", "one")).unwrap();
+        enqueue_command(&queue, &send("bad", "two")).unwrap();
+
+        drain_with(&queue, |cmd| match cmd {
+            QueuedCommand::Send { to, .. } if to == "bad" => anyhow::bail!("nope"),
+            _ => Ok(()),
+        })
+        .unwrap();
+
+        let remaining = read_command_queue(&queue).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(&remaining[0], QueuedCommand::Send { to, .. } if to == "bad"));
+        assert!(!draining_path(&queue).exists());
+    }
+
+    #[test]
+    fn drain_with_keeps_commands_enqueued_during_processing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = tmp.path().join("commands.jsonl");
+        enqueue_command(&queue, &send("a", "first")).unwrap();
+
+        let mut seen = Vec::new();
+        drain_with(&queue, |cmd| {
+            if let QueuedCommand::Send { message, .. } = cmd {
+                seen.push(message.clone());
+            }
+            // A producer appends while the batch is being delivered.
+            enqueue_command(&queue, &send("a", "late")).unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(seen, ["first"]);
+        let remaining = read_command_queue(&queue).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(&remaining[0], QueuedCommand::Send { message, .. } if message == "late"));
+    }
+
+    #[test]
+    fn drain_with_recovers_batch_left_by_crash_without_losing_new_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = tmp.path().join("commands.jsonl");
+        enqueue_command(&draining_path(&queue), &send("a", "stranded")).unwrap();
+        enqueue_command(&queue, &send("a", "fresh")).unwrap();
+
+        let mut seen = Vec::new();
+        drain_with(&queue, |cmd| {
+            if let QueuedCommand::Send { message, .. } = cmd {
+                seen.push(message.clone());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, ["stranded"]);
+        assert_eq!(read_command_queue(&queue).unwrap().len(), 1);
+
+        drain_with(&queue, |_| Ok(())).unwrap();
+        assert!(read_command_queue(&queue).unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_with_missing_queue_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = tmp.path().join("commands.jsonl");
+        drain_with(&queue, |_| panic!("nothing to process")).unwrap();
+        assert!(!draining_path(&queue).exists());
+    }
+
     #[test]
     fn send_command_roundtrip() {
         let cmd = QueuedCommand::Send {
