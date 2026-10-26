@@ -1129,15 +1129,23 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
             );
             // A failed transition (task already Done, or still Backlog) must not
             // leave the verification state behind, or the same escalation
-            // would fire on every completion.
-            let blocked = crate::team::task_cmd::transition_task_with_attribution(
-                &board_dir,
-                task_id,
-                "blocked",
-                crate::team::task_cmd::StatusTransitionAttribution::daemon(
-                    "daemon.merge.completion.verification",
-                ),
-            );
+            // would fire on every completion. Backlog cannot block directly, so
+            // it goes via todo.
+            let transition = |status: &str| {
+                crate::team::task_cmd::transition_task_with_attribution(
+                    &board_dir,
+                    task_id,
+                    status,
+                    crate::team::task_cmd::StatusTransitionAttribution::daemon(
+                        "daemon.merge.completion.verification",
+                    ),
+                )
+            };
+            let blocked = if task_status(&board_dir, task_id).as_deref() == Some("backlog") {
+                transition("todo").and_then(|()| transition("blocked"))
+            } else {
+                transition("blocked")
+            };
             match blocked {
                 Ok(()) => {
                     let mut blocked_fields = std::collections::HashMap::new();
@@ -3033,22 +3041,35 @@ mod tests {
             .workflow_policy
             .verification
             .max_iterations = 1;
-        for _ in 0..4 {
+        let escalations = |dir: &Path| {
+            read_events(&dir.join("events.jsonl"))
+                .unwrap()
+                .iter()
+                .filter(|e| e.event == "verification_max_iterations_reached")
+                .count()
+        };
+        let mut first_escalation_at = None;
+        for attempt in 0..4 {
             daemon.set_active_task_for_test("eng-1", 42);
             daemon.set_member_state_for_test("eng-1", MemberState::Working);
             handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+            if first_escalation_at.is_none() && escalations(&team_config_dir) > 0 {
+                first_escalation_at = Some(attempt);
+                break;
+            }
         }
 
+        assert!(
+            first_escalation_at.is_some(),
+            "verification never escalated"
+        );
+        assert_eq!(escalations(&team_config_dir), 1);
         assert!(!daemon.verification_states.contains_key("eng-1"));
-        let events = read_events(&team_config_dir.join("events.jsonl")).unwrap();
-        let escalations = events
-            .iter()
-            .filter(|e| e.event == "verification_max_iterations_reached")
-            .count();
-        assert!(escalations >= 1);
-        // Each re-assigned attempt starts a fresh state, but a failed block
-        // transition must not make the state sticky.
-        assert!(escalations <= 4);
+        // Backlog -> blocked is illegal; escalation must route via todo.
+        let task =
+            crate::task::Task::from_file(&team_config_dir.join("board/tasks/042-backlog-loop.md"))
+                .unwrap();
+        assert_eq!(task.status, "blocked");
     }
 
     #[test]
