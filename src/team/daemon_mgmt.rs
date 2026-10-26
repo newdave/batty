@@ -325,7 +325,7 @@ pub(crate) fn safe_daemon_restart_decision_with_binary_path(
         });
     }
 
-    if merge_lock_path(project_root).exists() {
+    if crate::team::merge::merge_lock_is_held(project_root) {
         return Ok(StaleDaemonRestartReport {
             status: StaleDaemonRestartStatus::RefusedActiveMerge,
             message: "Refusing stale-daemon restart because a merge is active.".to_string(),
@@ -397,10 +397,6 @@ fn stale_daemon_restart_commands() -> Vec<String> {
 
 fn release_batty_path(project_root: &Path) -> PathBuf {
     project_root.join("target").join("release").join("batty")
-}
-
-fn merge_lock_path(project_root: &Path) -> PathBuf {
-    project_root.join(".batty").join("merge.lock")
 }
 
 fn installed_batty_path() -> Result<PathBuf> {
