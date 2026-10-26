@@ -257,15 +257,8 @@ impl Channel {
         if json.len() > MAX_MSG {
             anyhow::bail!("message too large: {} bytes", json.len());
         }
-        if !self.pending_out.is_empty() {
-            let pending = std::mem::take(&mut self.pending_out);
-            let n = self.write_partial(&pending).inspect_err(|_| {
-                self.pending_out = pending.clone();
-            })?;
-            if n < pending.len() {
-                self.pending_out = pending[n..].to_vec();
-                return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
-            }
+        if !self.flush_pending()? {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
         }
         let mut frame = Vec::with_capacity(4 + json.len());
         frame.extend_from_slice(&(json.len() as u32).to_be_bytes());
@@ -275,6 +268,35 @@ impl Channel {
             self.pending_out = frame[n..].to_vec();
         }
         Ok(())
+    }
+
+    /// Write any held tail of a partially sent frame. Returns `Ok(true)` once
+    /// nothing is pending. Call it periodically so a committed frame does not
+    /// sit half-delivered until the next send.
+    pub fn flush_pending(&mut self) -> io::Result<bool> {
+        if self.pending_out.is_empty() {
+            return Ok(true);
+        }
+        let pending = std::mem::take(&mut self.pending_out);
+        match self.write_partial(&pending) {
+            Ok(n) => {
+                self.pending_out = pending[n..].to_vec();
+                Ok(self.pending_out.is_empty())
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                self.pending_out = pending;
+                Ok(false)
+            }
+            Err(e) => {
+                self.pending_out = pending;
+                Err(e)
+            }
+        }
     }
 
     /// Receive a deserializable message. Blocks until a message arrives.
@@ -928,6 +950,39 @@ mod tests {
         let bodies = reader.join().unwrap();
         assert!(bodies[0].starts_with('A') && bodies[0].len() == 512 * 1024 + 1);
         assert!(bodies[1].starts_with('B') && bodies[1].len() == 512 * 1024 + 1);
+    }
+
+    #[test]
+    fn flush_pending_completes_partial_frame_without_another_send() {
+        let (a, b) = socketpair().unwrap();
+        let mut sender = Channel::new(a);
+        sender
+            .set_write_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let mut receiver = Channel::new(b);
+        assert!(sender.flush_pending().unwrap(), "nothing pending initially");
+
+        sender
+            .send(&Command::SendMessage {
+                from: "daemon".into(),
+                body: format!("A{}", "x".repeat(512 * 1024)),
+                message_id: None,
+            })
+            .unwrap();
+        assert!(!sender.pending_out.is_empty());
+
+        let reader = std::thread::spawn(move || receiver.recv::<Command>().unwrap().unwrap());
+        let start = std::time::Instant::now();
+        while !sender.flush_pending().unwrap() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        match reader.join().unwrap() {
+            Command::SendMessage { body, .. } => {
+                assert!(body.starts_with('A') && body.len() == 512 * 1024 + 1)
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

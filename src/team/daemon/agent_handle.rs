@@ -172,6 +172,19 @@ impl AgentHandle {
         }
     }
 
+    /// Push out the tail of a frame whose write timed out mid-frame, so the
+    /// shim isn't left waiting on a half-delivered message until the next send.
+    pub fn flush_pending_output(&mut self) {
+        if let Err(error) = self.channel.flush_pending()
+            && matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            )
+        {
+            self.mark_channel_broken();
+        }
+    }
+
     /// Send a shutdown command to the shim.
     pub fn send_shutdown(&mut self, timeout_secs: u32) -> anyhow::Result<()> {
         self.send_shutdown_with_reason(timeout_secs, ShutdownReason::Requested)

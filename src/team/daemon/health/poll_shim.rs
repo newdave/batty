@@ -187,6 +187,9 @@ impl TeamDaemon {
         let member_names: Vec<String> = self.shim_handles.keys().cloned().collect();
 
         for name in &member_names {
+            if let Some(handle) = self.shim_handles.get_mut(name) {
+                handle.flush_pending_output();
+            }
             // A write hit EPIPE: the shim is gone. Route through the normal
             // died/respawn handling exactly once.
             if self
