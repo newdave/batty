@@ -16,6 +16,38 @@ use crate::team::watcher::SessionWatcher;
 
 pub(crate) static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+const ISOLATED_TEST_CHILD_ENV: &str = "BATTY_ISOLATED_TEST_CHILD";
+
+/// Re-runs one test in a child test process with `env` applied, so a test
+/// that needs a hostile environment (e.g. a PATH without git) cannot break
+/// other tests running concurrently in this process. Returns `true` inside
+/// the child, where the caller should run the test body; returns `false` in
+/// the parent after asserting the child passed.
+///
+/// `test_path` is `concat!(module_path!(), "::<test fn name>")`.
+pub(crate) fn run_in_isolated_process(test_path: &str, env: &[(&str, &str)]) -> bool {
+    if std::env::var_os(ISOLATED_TEST_CHILD_ENV).is_some() {
+        return true;
+    }
+    // libtest names omit the crate prefix that module_path! includes.
+    let test_name = test_path
+        .split_once("::")
+        .map_or(test_path, |(_, rest)| rest);
+    let output = Command::new(std::env::current_exe().expect("test binary path"))
+        .args([test_name, "--exact", "--test-threads=1", "--nocapture"])
+        .env(ISOLATED_TEST_CHILD_ENV, "1")
+        .envs(env.iter().copied())
+        .output()
+        .expect("failed to spawn isolated test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "isolated test {test_name} failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 pub(crate) struct EnvVarGuard {
     key: &'static str,
     original: Option<String>,

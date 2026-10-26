@@ -4104,9 +4104,16 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn planning_response_missing_kanban_binary_returns_clear_error() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        if !crate::team::test_support::run_in_isolated_process(
+            concat!(
+                module_path!(),
+                "::planning_response_missing_kanban_binary_returns_clear_error"
+            ),
+            &[("PATH", "/definitely/missing")],
+        ) {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
-        let _path_guard = EnvVarGuard::set("PATH", tmp.path().display().to_string().as_str());
 
         let mut daemon = planning_test_daemon(&tmp, 300);
         daemon.planning_cycle_active = true;

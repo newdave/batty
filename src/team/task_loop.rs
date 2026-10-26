@@ -2101,7 +2101,7 @@ pub(crate) fn recycle_cron_tasks(board_dir: &Path) -> Result<Vec<(u32, String)>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::team::test_support::{EnvVarGuard, PATH_LOCK, git, git_ok, git_stdout};
+    use crate::team::test_support::{PATH_LOCK, git, git_ok, git_stdout};
     use std::sync::MutexGuard;
 
     fn git_binary_path() -> Option<&'static str> {
@@ -2518,12 +2518,19 @@ mod tests {
 
     #[test]
     fn test_setup_engineer_worktree_finds_git_when_path_is_stripped() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         if !git_binary_available() {
             eprintln!("skipping git-dependent task_loop test: git binary unavailable");
             return;
         }
-        let _path_guard = EnvVarGuard::set("PATH", "/definitely/missing");
+        if !crate::team::test_support::run_in_isolated_process(
+            concat!(
+                module_path!(),
+                "::test_setup_engineer_worktree_finds_git_when_path_is_stripped"
+            ),
+            &[("PATH", "/definitely/missing")],
+        ) {
+            return;
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp);

@@ -195,11 +195,15 @@ mod tests {
 
     #[test]
     fn startup_preflight_reports_missing_kanban_binary() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let empty_bin = tmp.path().join("empty-bin");
-        std::fs::create_dir_all(&empty_bin).unwrap();
-        let _path = EnvVarGuard::set("PATH", empty_bin.to_string_lossy().as_ref());
+        if !crate::team::test_support::run_in_isolated_process(
+            concat!(
+                module_path!(),
+                "::startup_preflight_reports_missing_kanban_binary"
+            ),
+            &[("PATH", "/definitely/missing")],
+        ) {
+            return;
+        }
 
         let error = ensure_kanban_available().unwrap_err();
 
@@ -332,11 +336,15 @@ mod tests {
 
     #[test]
     fn startup_preflight_reports_missing_agent_binary() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let empty_bin = tmp.path().join("empty-bin");
-        std::fs::create_dir_all(&empty_bin).unwrap();
-        let _path = EnvVarGuard::set("PATH", empty_bin.to_string_lossy().as_ref());
+        if !crate::team::test_support::run_in_isolated_process(
+            concat!(
+                module_path!(),
+                "::startup_preflight_reports_missing_agent_binary"
+            ),
+            &[("PATH", "/definitely/missing")],
+        ) {
+            return;
+        }
 
         let members = vec![engineer_member("eng-1", Some("manager"), false)];
         let error = ensure_agent_binaries_available(&members).unwrap_err();
