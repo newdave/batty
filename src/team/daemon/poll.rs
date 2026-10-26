@@ -255,6 +255,8 @@ impl TeamDaemon {
         // Reset per-tick error capture so the returned report only reflects
         // failures that happened during this call.
         self.current_tick_errors.clear();
+        // Parse the board at most once per tick: drop last tick's snapshot.
+        self.invalidate_board_snapshot();
 
         self.poll_cycle_count = self.poll_cycle_count.saturating_add(1);
 

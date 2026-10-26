@@ -74,6 +74,9 @@ pub(super) mod agent_handle;
 mod automation;
 #[path = "daemon/background_tests.rs"]
 mod background_tests;
+pub(crate) mod board_snapshot;
+#[cfg(test)]
+mod board_snapshot_tests;
 #[path = "daemon/config_reload.rs"]
 mod config_reload;
 #[path = "discord_bridge.rs"]

@@ -596,8 +596,16 @@ pub(crate) fn warn_unparseable_task_once(path: &Path, error: &anyhow::Error) {
     tracing::warn!("skipping {}: {error:#}", path.display());
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Number of whole-board parses on this thread (tests assert per-tick counts).
+    pub(crate) static BOARD_PARSE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Load all task files from a kanban-md tasks directory.
 pub fn load_tasks_from_dir(dir: &Path) -> Result<Vec<Task>> {
+    #[cfg(test)]
+    BOARD_PARSE_COUNT.with(|count| count.set(count.get() + 1));
     let mut tasks = Vec::new();
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("failed to read tasks directory: {}", dir.display()))?;

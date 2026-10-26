@@ -43,10 +43,7 @@ impl TeamDaemon {
         let tasks = self.load_board_tasks()?;
         let mut actions = Vec::new();
 
-        for task in tasks
-            .into_iter()
-            .filter(|task| task.status == "in-progress")
-        {
+        for task in tasks.iter().filter(|task| task.status == "in-progress") {
             let Some(engineer) = task.claimed_by.as_deref() else {
                 continue;
             };
@@ -134,10 +131,7 @@ impl TeamDaemon {
         let now = Utc::now();
         let mut actions = Vec::new();
 
-        for task in tasks
-            .into_iter()
-            .filter(|task| task.status == "in-progress")
-        {
+        for task in tasks.iter().filter(|task| task.status == "in-progress") {
             let Some(engineer) = task.claimed_by.as_deref() else {
                 continue;
             };
@@ -149,13 +143,13 @@ impl TeamDaemon {
                 .unwrap_or_else(|| engineer.to_string());
             let lookup_name = lookup_name.as_str();
             let Some(expires_at) =
-                task_claim_expiry(&task, self.claim_ttl_secs_for_priority(&task.priority))
+                task_claim_expiry(task, self.claim_ttl_secs_for_priority(&task.priority))
             else {
                 continue;
             };
             if expires_at > now
                 || task_has_claim_progress(
-                    &task,
+                    task,
                     &self.worktree_dir(lookup_name),
                     self.config.team_config.trunk_branch(),
                 )
@@ -223,10 +217,7 @@ impl TeamDaemon {
         let team_config_dir = self.config.project_root.join(".batty").join("team_config");
         let mut actions = Vec::new();
 
-        for task in tasks
-            .into_iter()
-            .filter(|task| task.status == "in-progress")
-        {
+        for task in tasks.iter().filter(|task| task.status == "in-progress") {
             let Some(engineer) = task.claimed_by.as_deref() else {
                 continue;
             };
@@ -291,12 +282,12 @@ impl TeamDaemon {
         Ok(actions)
     }
 
-    fn load_board_tasks(&self) -> Result<Vec<crate::task::Task>> {
+    fn load_board_tasks(&mut self) -> Result<std::sync::Arc<Vec<crate::task::Task>>> {
         let tasks_dir = self.board_dir().join("tasks");
         if !tasks_dir.is_dir() {
-            return Ok(Vec::new());
+            return Ok(std::sync::Arc::new(Vec::new()));
         }
-        crate::task::load_tasks_from_dir(&tasks_dir)
+        self.board_tasks()
     }
 
     fn log_auto_doctor_action(

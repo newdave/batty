@@ -2052,7 +2052,19 @@ fn rename_branch(project_root: &Path, old_branch: &str, new_branch: &str) -> Res
 /// Recycle done cron tasks back to todo when their next occurrence is due.
 ///
 /// Returns a list of (task_id, cron_expression) for each recycled task.
+#[cfg(test)]
 pub(crate) fn recycle_cron_tasks(board_dir: &Path) -> Result<Vec<(u32, String)>> {
+    let tasks_dir = board_dir.join("tasks");
+    let tasks = crate::task::load_tasks_from_dir(&tasks_dir)
+        .with_context(|| format!("failed to load tasks from {}", tasks_dir.display()))?;
+    recycle_cron_tasks_from(board_dir, &tasks)
+}
+
+/// Like `recycle_cron_tasks`, over an already-parsed task list.
+pub(crate) fn recycle_cron_tasks_from(
+    board_dir: &Path,
+    tasks: &[crate::task::Task],
+) -> Result<Vec<(u32, String)>> {
     use chrono::Utc;
     use cron::Schedule;
     use serde_yaml::Value;
@@ -2063,14 +2075,10 @@ pub(crate) fn recycle_cron_tasks(board_dir: &Path) -> Result<Vec<(u32, String)>>
         set_optional_string, update_task_frontmatter, yaml_key,
     };
 
-    let tasks_dir = board_dir.join("tasks");
-    let tasks = crate::task::load_tasks_from_dir(&tasks_dir)
-        .with_context(|| format!("failed to load tasks from {}", tasks_dir.display()))?;
-
     let now = Utc::now();
     let mut recycled = Vec::new();
 
-    for task in &tasks {
+    for task in tasks {
         // Skip non-done tasks
         if task.status != "done" {
             continue;

@@ -521,7 +521,7 @@ impl TeamDaemon {
             return Ok(());
         }
 
-        let board_tasks = crate::task::load_tasks_from_dir(&tasks_dir)?;
+        let board_tasks = self.board_tasks()?;
         let now = Utc::now();
         let progress_interval = Duration::from_secs(
             self.config
@@ -928,9 +928,9 @@ impl TeamDaemon {
         let board_dir = self.board_dir();
         let tasks_dir = board_dir.join("tasks");
         let mut board_tasks = if tasks_dir.exists() {
-            crate::task::load_tasks_from_dir(&tasks_dir)?
+            self.board_tasks()?
         } else {
-            Vec::new()
+            std::sync::Arc::new(Vec::new())
         };
         let audit_due = self.state_reconciliation_audit_due();
         if audit_due {
@@ -1086,9 +1086,9 @@ impl TeamDaemon {
         }
         if released_claims {
             board_tasks = if tasks_dir.exists() {
-                crate::task::load_tasks_from_dir(&tasks_dir)?
+                self.board_tasks()?
             } else {
-                Vec::new()
+                std::sync::Arc::new(Vec::new())
             };
         }
 
@@ -1108,9 +1108,9 @@ impl TeamDaemon {
             )?;
             if released_excess_claims {
                 board_tasks = if tasks_dir.exists() {
-                    crate::task::load_tasks_from_dir(&tasks_dir)?
+                    self.board_tasks()?
                 } else {
-                    Vec::new()
+                    std::sync::Arc::new(Vec::new())
                 };
             }
         }
@@ -1123,7 +1123,7 @@ impl TeamDaemon {
         // Orphaned review rescue: tasks in "review" that are stuck because
         // they have no review_owner (nobody assigned to review). Review tasks
         // no longer require claimed_by once the engineer is auto-released.
-        for task in &board_tasks {
+        for task in board_tasks.iter() {
             if task.status == "review"
                 && task.review_owner.is_none()
                 && !actively_tracked.contains(&task.id)
@@ -1209,7 +1209,7 @@ impl TeamDaemon {
         // Orphaned in-progress rescue: tasks in "in-progress" with no claimed_by.
         let rescue_base_cooldown =
             Duration::from_secs(self.config.team_config.board.orphan_rescue_cooldown_secs);
-        for task in &board_tasks {
+        for task in board_tasks.iter() {
             if task.status == "in-progress"
                 && task.claimed_by.is_none()
                 && !actively_tracked.contains(&task.id)
@@ -1707,7 +1707,7 @@ impl TeamDaemon {
         if !tasks_dir.exists() {
             return Ok(());
         }
-        let tasks = crate::task::load_tasks_from_dir(&tasks_dir)?;
+        let tasks = self.board_tasks()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1752,7 +1752,7 @@ impl TeamDaemon {
             ));
         }
 
-        for task in &tasks {
+        for task in tasks.iter() {
             if task.status != "review" {
                 continue;
             }
@@ -1924,12 +1924,13 @@ impl TeamDaemon {
             aged_todo_hours: self.config.team_config.workflow_policy.aged_todo_hours,
             stale_review_hours: self.config.team_config.workflow_policy.stale_review_hours,
         };
-        let report = crate::team::board::compute_task_aging(
-            &board_dir,
+        let tasks = self.board_tasks()?;
+        let report = crate::team::board::compute_task_aging_from_tasks(
+            &tasks,
             &self.config.project_root,
             thresholds,
+            Utc::now(),
         )?;
-        let tasks = crate::task::load_tasks_from_dir(&tasks_dir)?;
         let tasks_by_id = tasks
             .iter()
             .map(|task| (task.id, task))
@@ -2182,7 +2183,7 @@ impl TeamDaemon {
             .join(".batty")
             .join("team_config")
             .join("board");
-        let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+        let tasks = self.board_tasks()?;
         let done_task_ids: HashSet<u32> = tasks
             .iter()
             .filter(|task| matches!(task.status.as_str(), "done" | "archived"))
@@ -2296,9 +2297,9 @@ impl TeamDaemon {
             .join("team_config")
             .join("board");
         let trunk = self.config.team_config.trunk_branch().to_string();
-        let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
-        for task in tasks {
-            if !stale_preserve_blocker(&task) {
+        let tasks = self.board_tasks()?;
+        for task in tasks.iter() {
+            if !stale_preserve_blocker(task) {
                 continue;
             }
             let recorded = task
@@ -2388,13 +2389,7 @@ impl TeamDaemon {
         // Already fired — stay suppressed until condition fully clears
         if self.pipeline_starvation_fired {
             // Only reset when enough unclaimed work exists for all idle engineers
-            let board_dir = self
-                .config
-                .project_root
-                .join(".batty")
-                .join("team_config")
-                .join("board");
-            let all_tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+            let all_tasks = self.board_tasks()?;
             let unclaimed_todo = all_tasks
                 .iter()
                 .filter(|t| matches!(t.status.as_str(), "todo" | "backlog"))
@@ -2438,13 +2433,7 @@ impl TeamDaemon {
             return Ok(());
         }
 
-        let board_dir = self
-            .config
-            .project_root
-            .join(".batty")
-            .join("team_config")
-            .join("board");
-        let all_tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+        let all_tasks = self.board_tasks()?;
         let idle_count = self.truly_idle_engineer_count(&all_tasks);
         if idle_count == 0 {
             return Ok(());
@@ -2512,12 +2501,20 @@ impl TeamDaemon {
             return Ok(());
         };
 
-        let board_dir = self.board_dir();
-        let board_tasks =
-            crate::task::load_tasks_from_dir(&board_dir.join("tasks")).unwrap_or_default();
+        // Cheap cooldown/active gates first: planning_cycle_ready would reject
+        // these anyway, so skip parsing the board.
+        if self.planning_cycle_active
+            || self
+                .planning_cycle_last_fired
+                .is_some_and(|last| last.elapsed() < cooldown)
+        {
+            return Ok(());
+        }
+
+        let board_tasks = self.board_tasks().unwrap_or_default();
         let idle_engineer_count = self.truly_idle_engineer_count(&board_tasks);
         let dispatchable_task_count =
-            crate::team::tact::dispatchable_task_count(&board_dir, &self.config.members)?;
+            crate::team::tact::dispatchable_task_count_from(&board_tasks, &self.config.members);
         if !crate::team::tact::should_trigger(idle_engineer_count, dispatchable_task_count) {
             return Ok(());
         }
@@ -2811,9 +2808,9 @@ impl TeamDaemon {
         }
         let tasks_dir = self.board_dir().join("tasks");
         let board_tasks = if tasks_dir.exists() {
-            crate::task::load_tasks_from_dir(&tasks_dir)?
+            self.board_tasks()?
         } else {
-            Vec::new()
+            std::sync::Arc::new(Vec::new())
         };
 
         let engineers: Vec<(String, bool)> = self
@@ -3076,7 +3073,8 @@ impl TeamDaemon {
 
     pub(super) fn maybe_recycle_cron_tasks(&mut self) -> Result<()> {
         let board_dir = self.board_dir();
-        let recycled = super::super::task_loop::recycle_cron_tasks(&board_dir)?;
+        let tasks = self.board_tasks()?;
+        let recycled = super::super::task_loop::recycle_cron_tasks_from(&board_dir, &tasks)?;
         for (task_id, cron_expr) in recycled {
             self.emit_event(TeamEvent::task_recycled(task_id, &cron_expr));
             self.record_orchestrator_action(format!(
@@ -3087,9 +3085,13 @@ impl TeamDaemon {
     }
 
     pub(super) fn maybe_generate_retrospective(&mut self) -> Result<()> {
-        let Some(stats) = super::super::retrospective::should_generate_retro(
+        if self.retro_generated || !self.board_dir().join("tasks").is_dir() {
+            return Ok(());
+        }
+        let tasks = self.board_tasks()?;
+        let Some(stats) = super::super::retrospective::should_generate_retro_with_tasks(
             &self.config.project_root,
-            self.retro_generated,
+            &tasks,
             self.config.team_config.retro_min_duration_secs,
         )?
         else {

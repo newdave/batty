@@ -642,6 +642,16 @@ pub fn should_generate_retro(
     }
 
     let tasks = task::load_tasks_from_dir(&tasks_dir)?;
+    should_generate_retro_with_tasks(project_root, &tasks, min_duration_secs)
+}
+
+/// Like `should_generate_retro` once the caller has checked `retro_generated`,
+/// over an already-parsed task list.
+pub fn should_generate_retro_with_tasks(
+    project_root: &Path,
+    tasks: &[task::Task],
+    min_duration_secs: u64,
+) -> Result<Option<RunStats>> {
     let active_tasks: Vec<&task::Task> = tasks
         .iter()
         .filter(|task| task.status != "archived")

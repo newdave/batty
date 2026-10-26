@@ -537,7 +537,9 @@ impl TeamDaemon {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        match std::process::Command::new("kanban-md").args(args).output() {
+        let kanban_result = std::process::Command::new("kanban-md").args(args).output();
+        crate::team::daemon::board_snapshot::note_board_write(&self.board_dir().join("tasks"));
+        match kanban_result {
             Ok(output) if output.status.success() => true,
             Ok(output) => {
                 let detail = describe_command_failure("kanban-md", args, &output);

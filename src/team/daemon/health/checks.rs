@@ -223,7 +223,7 @@ impl TeamDaemon {
             return Ok(());
         }
 
-        let tasks = crate::task::load_tasks_from_dir(&tasks_dir)?;
+        let tasks = self.board_tasks()?;
         let snapshot = crate::team::github_feedback::summarize_github_feedback_for_tasks(
             &self.config.project_root,
             &tasks,

@@ -274,10 +274,16 @@ impl TeamDaemon {
             return Ok(());
         }
         let review_slo_secs = self.config.team_config.workflow_policy.review_timeout_secs;
-        let snapshot = crate::team::metrics::collect_review_queue_snapshot(
-            &self.board_dir(),
-            review_slo_secs,
-        )?;
+        let snapshot = if self.board_dir().join("tasks").is_dir() {
+            let tasks = self.board_tasks()?;
+            crate::team::metrics::collect_review_queue_snapshot_from_tasks(
+                &tasks,
+                review_slo_secs,
+                chrono::Utc::now(),
+            )?
+        } else {
+            crate::team::metrics::collect_review_queue_snapshot(&self.board_dir(), review_slo_secs)?
+        };
 
         let result = match &self.telemetry_db {
             Some(conn) => crate::team::telemetry_db::record_review_queue_snapshot(conn, &snapshot),

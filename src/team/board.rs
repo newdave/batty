@@ -143,43 +143,54 @@ pub(crate) fn compute_task_aging_at(
         return Ok(TaskAgingReport::default());
     }
 
+    let tasks = load_tasks_from_dir(&tasks_dir)?;
+    compute_task_aging_from_tasks(&tasks, project_root, thresholds, now)
+}
+
+/// Aging report over an already-parsed task list (no filesystem reads of the board).
+pub(crate) fn compute_task_aging_from_tasks(
+    tasks: &[Task],
+    project_root: &Path,
+    thresholds: AgingThresholds,
+    now: DateTime<Utc>,
+) -> Result<TaskAgingReport> {
     let mut report = TaskAgingReport::default();
-    for task in load_tasks_from_dir(&tasks_dir)? {
+    for task in tasks {
         match task.status.as_str() {
             "in-progress" | "in_progress" => {
-                let age_secs = task_age_from_frontmatter(&task, now, AgeAnchor::Started)?;
+                let age_secs = task_age_from_frontmatter(task, now, AgeAnchor::Started)?;
                 if age_secs >= thresholds.stale_in_progress_hours.saturating_mul(3600)
-                    && commits_ahead_of_trunk(project_root, &task)? == 0
+                    && commits_ahead_of_trunk(project_root, task)? == 0
                 {
                     report.stale_in_progress.push(AgedTask {
                         task_id: task.id,
-                        title: task.title,
-                        status: task.status,
-                        claimed_by: task.claimed_by,
+                        title: task.title.clone(),
+                        status: task.status.clone(),
+                        claimed_by: task.claimed_by.clone(),
                         age_secs,
                     });
                 }
             }
             "todo" => {
-                let age_secs = task_age_from_frontmatter(&task, now, AgeAnchor::Updated)?;
+                let age_secs = task_age_from_frontmatter(task, now, AgeAnchor::Updated)?;
                 if age_secs >= thresholds.aged_todo_hours.saturating_mul(3600) {
                     report.aged_todo.push(AgedTask {
                         task_id: task.id,
-                        title: task.title,
-                        status: task.status,
-                        claimed_by: task.claimed_by,
+                        title: task.title.clone(),
+                        status: task.status.clone(),
+                        claimed_by: task.claimed_by.clone(),
                         age_secs,
                     });
                 }
             }
             "review" => {
-                let age_secs = task_age_from_frontmatter(&task, now, AgeAnchor::Updated)?;
+                let age_secs = task_age_from_frontmatter(task, now, AgeAnchor::Updated)?;
                 if age_secs >= thresholds.stale_review_hours.saturating_mul(3600) {
                     report.stale_review.push(AgedTask {
                         task_id: task.id,
-                        title: task.title,
-                        status: task.status,
-                        claimed_by: task.claimed_by,
+                        title: task.title.clone(),
+                        status: task.status.clone(),
+                        claimed_by: task.claimed_by.clone(),
                         age_secs,
                     });
                 }

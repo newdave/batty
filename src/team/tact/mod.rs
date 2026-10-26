@@ -40,6 +40,14 @@ pub fn dispatchable_task_count(
     Ok(crate::team::resolver::engineer_dispatchable_tasks(board_dir, members)?.len())
 }
 
+/// Like `dispatchable_task_count`, over an already-parsed task list.
+pub fn dispatchable_task_count_from(
+    tasks: &[crate::task::Task],
+    members: &[crate::team::hierarchy::MemberInstance],
+) -> usize {
+    crate::team::resolver::engineer_dispatchable_tasks_from(tasks, members).len()
+}
+
 pub fn should_trigger_planning_cycle(idle_engineers: usize, dispatchable_tasks: usize) -> bool {
     idle_engineers > dispatchable_tasks
 }

@@ -18,9 +18,16 @@ impl TeamDaemon {
 
         // Load board tasks once so we can check whether engineers actually
         // have in-progress work before nudging them.
+        if self.nudges.is_empty() {
+            return Ok(());
+        }
         let board_tasks = {
             let tasks_dir = self.board_dir().join("tasks");
-            crate::task::load_tasks_from_dir(&tasks_dir).unwrap_or_default()
+            if tasks_dir.is_dir() {
+                self.board_tasks().unwrap_or_default()
+            } else {
+                Default::default()
+            }
         };
 
         let member_names: Vec<String> = self.nudges.keys().cloned().collect();

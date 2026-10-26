@@ -119,6 +119,7 @@ pub(crate) fn write_task_file(path: &Path, expected: &str, contents: &str) -> Re
     };
     let lock = BoardLock::acquire(board)?;
     let result = write_locked(path, expected, contents);
+    crate::team::daemon::board_snapshot::note_board_write(directory);
     finish(result, lock.release())
 }
 

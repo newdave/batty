@@ -28,14 +28,8 @@ impl TeamDaemon {
             return Ok(());
         }
 
-        let board_dir = self
-            .config
-            .project_root
-            .join(".batty")
-            .join("team_config")
-            .join("board");
         let inbox_root = inbox::inboxes_root(&self.config.project_root);
-        let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+        let tasks = self.board_tasks()?;
         let member_names: Vec<String> = self.config.pane_map.keys().cloned().collect();
 
         for name in member_names {

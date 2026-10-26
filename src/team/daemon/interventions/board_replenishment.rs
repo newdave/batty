@@ -37,19 +37,7 @@ impl TeamDaemon {
             return Ok(());
         }
 
-        let board_dir = self
-            .config
-            .project_root
-            .join(".batty")
-            .join("team_config")
-            .join("board");
         let inbox_root = inbox::inboxes_root(&self.config.project_root);
-        let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
-        let dispatchable_task_ids: std::collections::HashSet<u32> =
-            crate::team::resolver::engineer_dispatchable_tasks(&board_dir, &self.config.members)?
-                .into_iter()
-                .map(|task| task.id)
-                .collect();
         let replenishment_targets: Vec<MemberInstance> = self
             .config
             .members
@@ -75,6 +63,14 @@ impl TeamDaemon {
         if engineer_names.is_empty() {
             return Ok(());
         }
+
+        // Config gates passed; only now parse the board (shared per-tick snapshot).
+        let tasks = self.board_tasks()?;
+        let dispatchable_task_ids: std::collections::HashSet<u32> =
+            crate::team::resolver::engineer_dispatchable_tasks_from(&tasks, &self.config.members)
+                .into_iter()
+                .map(|task| task.id)
+                .collect();
 
         // Suppress when all engineers have active tasks — transient idle is not starvation.
         if super::all_engineers_have_active_tasks(&engineer_names, &tasks) {

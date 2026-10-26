@@ -102,16 +102,22 @@ pub fn runnable_tasks(resolutions: &[TaskResolution]) -> Vec<TaskResolution> {
 
 pub fn dispatchable_tasks(board_dir: &Path) -> Result<Vec<Task>> {
     let tasks = load_tasks_from_dir(&board_dir.join("tasks"))?;
+    Ok(dispatchable_tasks_from(&tasks))
+}
+
+/// Dispatchable subset of an already-parsed task list.
+pub fn dispatchable_tasks_from(tasks: &[Task]) -> Vec<Task> {
     let done: HashSet<u32> = tasks
         .iter()
         .filter(|task| matches!(task.status.as_str(), "done" | "archived"))
         .map(|task| task.id)
         .collect();
 
-    Ok(tasks
-        .into_iter()
+    tasks
+        .iter()
         .filter(|task| is_dispatchable_task(task, &done))
-        .collect())
+        .cloned()
+        .collect()
 }
 
 pub fn is_dispatchable_task(task: &Task, done: &HashSet<u32>) -> bool {
@@ -210,17 +216,23 @@ pub fn engineer_dispatchable_tasks(
     board_dir: &Path,
     members: &[MemberInstance],
 ) -> Result<Vec<Task>> {
+    let tasks = load_tasks_from_dir(&board_dir.join("tasks"))?;
+    Ok(engineer_dispatchable_tasks_from(&tasks, members))
+}
+
+/// Engineer-dispatchable subset of an already-parsed task list.
+pub fn engineer_dispatchable_tasks_from(tasks: &[Task], members: &[MemberInstance]) -> Vec<Task> {
     let non_engineer_names: HashSet<String> = members
         .iter()
         .filter(|member| member.role_type != RoleType::Engineer)
         .map(|member| member.name.clone())
         .collect();
-    let mut tasks: Vec<Task> = dispatchable_tasks(board_dir)?
+    let mut tasks: Vec<Task> = dispatchable_tasks_from(tasks)
         .into_iter()
         .filter(|task| is_engineer_dispatchable(task, &non_engineer_names))
         .collect();
     tasks.sort_by_key(|task| (dispatch_priority_rank(&task.priority), task.id));
-    Ok(tasks)
+    tasks
 }
 
 pub fn is_engineer_dispatchable(task: &Task, non_engineer_names: &HashSet<String>) -> bool {

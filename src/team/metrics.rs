@@ -294,10 +294,20 @@ pub fn collect_review_queue_snapshot_at(
         });
     }
 
+    let tasks = load_tasks_from_dir(&tasks_dir)?;
+    collect_review_queue_snapshot_from_tasks(&tasks, review_slo_secs, now)
+}
+
+/// Review queue snapshot over an already-parsed task list.
+pub fn collect_review_queue_snapshot_from_tasks(
+    tasks: &[Task],
+    review_slo_secs: u64,
+    now: DateTime<Utc>,
+) -> Result<ReviewQueueSnapshot> {
     let mut ages = Vec::new();
-    for task in load_tasks_from_dir(&tasks_dir)? {
+    for task in tasks {
         if task.status == "review" {
-            ages.push(review_task_age_secs(&task, now)?);
+            ages.push(review_task_age_secs(task, now)?);
         }
     }
 
