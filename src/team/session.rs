@@ -11,8 +11,8 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use super::daemon_mgmt::{
-    DAEMON_SHUTDOWN_GRACE_PERIOD, force_kill_daemon, request_graceful_daemon_shutdown,
-    resume_marker_path,
+    DAEMON_SHUTDOWN_GRACE_PERIOD, daemon_shutdown_budget, force_kill_daemon,
+    request_graceful_daemon_shutdown, resume_marker_path,
 };
 use super::{
     config, estimation, events, hierarchy, now_unix, status, team_config_dir, team_config_path,
@@ -193,13 +193,10 @@ fn write_resume_marker(project_root: &Path, discord_event_cursor: Option<usize>)
     }
 }
 
+/// The watchdog gives the daemon its shutdown budget before SIGKILL; wait a margin beyond that
+/// so the daemon's clean snapshot is seen.
 fn graceful_shutdown_wait(team_config: &config::TeamConfig) -> Duration {
-    let requested = Duration::from_secs(
-        team_config.workflow_policy.graceful_shutdown_timeout_secs
-            + u64::from(team_config.shim_shutdown_timeout_secs)
-            + 5,
-    );
-    std::cmp::max(DAEMON_SHUTDOWN_GRACE_PERIOD, requested)
+    daemon_shutdown_budget(team_config) + DAEMON_SHUTDOWN_GRACE_PERIOD
 }
 
 #[derive(Debug, serde::Deserialize)]
