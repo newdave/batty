@@ -681,6 +681,8 @@ impl TeamDaemon {
                 agent::health_check_by_name(agent_name).unwrap_or(BackendHealth::Healthy);
             if *agent_name == "claude"
                 && let Some(credentials_path) = claude_credentials_path()
+                // No credentials file (e.g. macOS Keychain storage) means unknown, not expired.
+                && credentials_path.exists()
                 && !claude_oauth_healthy(&credentials_path)
             {
                 new_health = BackendHealth::Degraded;
@@ -1078,6 +1080,8 @@ mod tests {
             "PATH",
             &format!("{}:{original_path}", fake_bin.to_string_lossy()),
         );
+        // Keep the real ~/.claude/.credentials.json out of the test.
+        let _home = EnvVarGuard::set("HOME", tmp.path().to_str().unwrap());
 
         let engineer = MemberInstance {
             name: "eng-transition".to_string(),
@@ -1115,6 +1119,8 @@ mod tests {
             "PATH",
             &format!("{}:{original_path}", fake_bin.to_string_lossy()),
         );
+        // Keep the real ~/.claude/.credentials.json out of the test.
+        let _home = EnvVarGuard::set("HOME", tmp.path().to_str().unwrap());
 
         let engineer = MemberInstance {
             name: "eng-stable".to_string(),
