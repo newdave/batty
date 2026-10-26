@@ -26,15 +26,24 @@ pub fn load_overrides(project_root: &Path) -> HashMap<u32, bool> {
 /// Save a per-task auto-merge override to disk.
 pub fn save_override(project_root: &Path, task_id: u32, enabled: bool) -> Result<()> {
     let path = project_root.join(OVERRIDES_FILE);
-    let mut overrides = load_overrides(project_root);
+    // Unlike load_overrides, refuse to continue past a corrupt file: saving
+    // would silently replace every existing override with just this one.
+    let mut overrides: HashMap<u32, bool> = match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).with_context(|| {
+            format!(
+                "refusing to overwrite unreadable auto-merge overrides file {}",
+                path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
     overrides.insert(task_id, enabled);
     let content = serde_json::to_string_pretty(&overrides)
         .context("failed to serialize auto-merge overrides")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, content).context("failed to write auto-merge overrides file")?;
-    Ok(())
+    crate::atomic_file::write(&path, content).context("failed to write auto-merge overrides file")
 }
 
 /// Summary of a git diff between two refs.
@@ -1100,6 +1109,20 @@ mod tests {
         // Valid JSON but wrong type (array instead of object)
         std::fs::write(&path, "[1, 2, 3]").unwrap();
         assert!(load_overrides(root).is_empty());
+    }
+
+    #[test]
+    fn save_override_refuses_to_overwrite_corrupt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(OVERRIDES_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"1\": true, truncated").unwrap();
+
+        assert!(save_override(tmp.path(), 2, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"1\": true, truncated"
+        );
     }
 
     #[test]

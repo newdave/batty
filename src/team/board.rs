@@ -552,9 +552,6 @@ pub fn rotate_done_items(kanban_path: &Path, archive_path: &Path, threshold: u32
         new_kanban.push_str(after_done);
     }
 
-    std::fs::write(kanban_path, &new_kanban)
-        .with_context(|| format!("failed to write {}", kanban_path.display()))?;
-
     let mut archive_content = if archive_path.exists() {
         std::fs::read_to_string(archive_path)
             .with_context(|| format!("failed to read {}", archive_path.display()))?
@@ -570,8 +567,12 @@ pub fn rotate_done_items(kanban_path: &Path, archive_path: &Path, threshold: u32
         archive_content.push('\n');
     }
 
-    std::fs::write(archive_path, &archive_content)
+    // Write the archive before removing items from the board: a failure
+    // between the two writes then duplicates items instead of losing them.
+    crate::atomic_file::write(archive_path, &archive_content)
         .with_context(|| format!("failed to write {}", archive_path.display()))?;
+    crate::atomic_file::write(kanban_path, &new_kanban)
+        .with_context(|| format!("failed to write {}", kanban_path.display()))?;
 
     info!(rotated, threshold, "rotated done items to archive");
     Ok(rotated)
