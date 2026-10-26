@@ -827,11 +827,14 @@ pub(super) fn role_author_label(role: &str) -> String {
 }
 
 fn truncate_for_discord(input: &str, limit: usize) -> String {
-    let mut output = input.chars().take(limit).collect::<String>();
-    if input.chars().count() > limit && limit > 3 {
-        output.truncate(limit.saturating_sub(3));
-        output.push_str("...");
+    if input.chars().count() <= limit {
+        return input.to_string();
     }
+    if limit <= 3 {
+        return input.chars().take(limit).collect();
+    }
+    let mut output = input.chars().take(limit - 3).collect::<String>();
+    output.push_str("...");
     output
 }
 
@@ -1278,6 +1281,15 @@ fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_for_discord_handles_multibyte_chars() {
+        let input = "é".repeat(10);
+        assert_eq!(truncate_for_discord(&input, 6), "ééé...");
+        assert_eq!(truncate_for_discord(&input, 10), input);
+        assert_eq!(truncate_for_discord("🎉🎉🎉🎉", 3), "🎉🎉🎉");
+        assert_eq!(truncate_for_discord("short", 100), "short");
+    }
 
     #[test]
     fn parse_bot_identity_extracts_username_and_id() {

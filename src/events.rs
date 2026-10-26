@@ -259,8 +259,9 @@ impl EventBuffer {
                 }
                 PipeEvent::OutputLine { line } => {
                     // Truncate long output lines
-                    if line.len() > 80 {
-                        format!("  {}...", &line[..77])
+                    if line.chars().count() > 80 {
+                        let head: String = line.chars().take(77).collect();
+                        format!("  {head}...")
                     } else {
                         format!("  {line}")
                     }
@@ -586,6 +587,16 @@ mod tests {
 
         buf.clear();
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn buffer_format_summary_truncates_multibyte_output_lines() {
+        let buf = EventBuffer::new(10);
+        // 76 ASCII bytes then box-drawing chars, so byte 77 is mid-character.
+        let line = format!("{}{}", "x".repeat(76), "─".repeat(10));
+        buf.push(PipeEvent::OutputLine { line });
+        let summary = buf.format_summary();
+        assert!(summary.contains(&format!("{}─...", "x".repeat(76))));
     }
 
     #[test]

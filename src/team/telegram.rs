@@ -469,7 +469,8 @@ fn update_team_yaml(path: &Path, bot_token: &str, user_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Split a message into chunks of at most `max_len` characters.
+/// Split a message into chunks of at most `max_len` bytes, never splitting
+/// a UTF-8 character.
 ///
 /// Tries to split on newline boundaries first, falling back to hard splits
 /// when a single line exceeds `max_len`.
@@ -487,11 +488,24 @@ fn split_message(text: &str, max_len: usize) -> Vec<&str> {
             break;
         }
 
+        // Never split inside a multi-byte UTF-8 character.
+        let mut limit = max_len;
+        while !remaining.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        if limit == 0 {
+            // max_len is smaller than the first character; emit it whole.
+            limit = remaining
+                .chars()
+                .next()
+                .map_or(remaining.len(), char::len_utf8);
+        }
+
         // Try to find a newline to split on within the limit
-        let split_at = remaining[..max_len]
+        let split_at = remaining[..limit]
             .rfind('\n')
             .map(|pos| pos + 1) // include the newline in the current chunk
-            .unwrap_or(max_len); // hard split if no newline found
+            .unwrap_or(limit); // hard split if no newline found
 
         chunks.push(&remaining[..split_at]);
         remaining = &remaining[split_at..];
@@ -503,6 +517,22 @@ fn split_message(text: &str, max_len: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_message_does_not_split_multibyte_chars() {
+        // "é" is two bytes; a 5-byte limit lands mid-character.
+        let text = "aéééé";
+        let chunks = split_message(text, 4);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 4));
+
+        let emoji = "🎉🎉🎉";
+        let chunks = split_message(emoji, 5);
+        assert_eq!(chunks, vec!["🎉", "🎉", "🎉"]);
+
+        let chunks = split_message(emoji, 2);
+        assert_eq!(chunks.concat(), emoji);
+    }
 
     #[test]
     fn new_constructor_sets_fields() {
