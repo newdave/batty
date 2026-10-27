@@ -94,3 +94,30 @@ fn tick_parses_board_at_most_once_when_nothing_changes() {
         "expected at most 1 snapshot reload per tick, got {per_tick}"
     );
 }
+
+#[test]
+fn board_write_invalidates_every_daemon_snapshot_of_that_board_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tasks_dir = board(&tmp);
+    write_task(&tasks_dir, 1, "todo");
+    let other_tmp = tempfile::tempdir().unwrap();
+    let other_dir = board(&other_tmp);
+    write_task(&other_dir, 1, "todo");
+    let mut first = TestDaemonBuilder::new(tmp.path()).build();
+    let mut second = TestDaemonBuilder::new(tmp.path()).build();
+    let mut other = TestDaemonBuilder::new(other_tmp.path()).build();
+    first.board_tasks().unwrap();
+    second.board_tasks().unwrap();
+    other.board_tasks().unwrap();
+
+    // Nothing changed on disk, so only the write generation can invalidate.
+    note_board_write(&tasks_dir);
+    let before = parses();
+    first.board_tasks().unwrap();
+    second.board_tasks().unwrap();
+    assert_eq!(parses() - before, 2, "both daemons on the board reload");
+
+    let before = parses();
+    other.board_tasks().unwrap();
+    assert_eq!(parses() - before, 0, "a write to another board is ignored");
+}

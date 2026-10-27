@@ -81,7 +81,8 @@ impl TeamDaemon {
             // escalates (`escalation_sent = true`), the architect signal becomes
             // load-bearing again, so we only suppress the pre-escalation window.
             .filter(|name| {
-                self.owned_task_interventions
+                self.interventions
+                    .owned_task_interventions
                     .get(name.as_str())
                     .is_none_or(|state| state.escalation_sent)
             })
@@ -166,6 +167,7 @@ impl TeamDaemon {
                 &unassigned_open_tasks,
             );
             if self
+                .interventions
                 .owned_task_interventions
                 .get(&utilization_key)
                 .is_some_and(|state| state.signature == signature)
@@ -208,11 +210,12 @@ impl TeamDaemon {
                 unassigned_open_tasks.len()
             ));
             let idle_epoch = self
+                .interventions
                 .triage_idle_epochs
                 .get(&architect.name)
                 .copied()
                 .unwrap_or(0);
-            self.owned_task_interventions.insert(
+            self.interventions.owned_task_interventions.insert(
                 utilization_key.clone(),
                 OwnedTaskInterventionState {
                     idle_epoch,
@@ -221,7 +224,8 @@ impl TeamDaemon {
                     escalation_sent: false,
                 },
             );
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(utilization_key, Instant::now());
             if delivered_live {
                 self.mark_member_working(&architect.name);

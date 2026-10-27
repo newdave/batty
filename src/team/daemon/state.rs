@@ -138,7 +138,10 @@ impl TeamDaemon {
         };
 
         self.states = state.states;
-        self.discord_event_cursor = self.discord_event_cursor.max(state.discord_event_cursor);
+        self.integrations.discord_event_cursor = self
+            .integrations
+            .discord_event_cursor
+            .max(state.discord_event_cursor);
         self.idle_started_at = self
             .states
             .iter()
@@ -147,7 +150,7 @@ impl TeamDaemon {
             .collect();
         self.active_tasks = state.active_tasks;
         self.retry_counts = state.retry_counts;
-        self.discord_event_cursor = state.discord_event_cursor;
+        self.integrations.discord_event_cursor = state.discord_event_cursor;
         // #694: do NOT restore dispatch_queue across restarts. A queue entry
         // carries a (task_id, engineer) routing decision frozen at enqueue
         // time. When the daemon binary is upgraded to fix a routing bug, any
@@ -159,11 +162,11 @@ impl TeamDaemon {
         // re-populates the queue from current board state within one tick, so
         // dropping it on restore costs at most a brief delay.
         let _discarded_dispatch_queue = state.dispatch_queue;
-        self.paused_standups = state.paused_standups;
-        self.last_standup = standup::restore_timer_state(state.last_standup_elapsed_secs);
+        self.scheduler.paused_standups = state.paused_standups;
+        self.scheduler.last_standup = standup::restore_timer_state(state.last_standup_elapsed_secs);
 
         for (member_name, persisted) in state.nudge_state {
-            let Some(schedule) = self.nudges.get_mut(&member_name) else {
+            let Some(schedule) = self.interventions.nudges.get_mut(&member_name) else {
                 continue;
             };
             schedule.idle_since = persisted.idle_elapsed_secs.map(|elapsed_secs| {
@@ -174,9 +177,9 @@ impl TeamDaemon {
             schedule.fired_this_idle = persisted.fired_this_idle;
             schedule.paused = persisted.paused;
         }
-        self.pipeline_starvation_fired = state.pipeline_starvation_fired;
-        self.background_tests.retriggers = state.pending_verifications;
-        self.merge_queue.restore(state.merge_queue);
+        self.scheduler.pipeline_starvation_fired = state.pipeline_starvation_fired;
+        self.verification.background_tests.retriggers = state.pending_verifications;
+        self.merge.queue.restore(state.merge_queue);
         self.restore_optional_subsystem_budget_state(
             &state.optional_subsystem_backoff,
             &state.optional_subsystem_disabled_remaining_secs,
@@ -187,18 +190,17 @@ impl TeamDaemon {
         // planning cycle seconds later — re-wasting orchestrator tokens
         // on an empty board the previous daemon had already learned was
         // stuck.
-        self.planning_cycle_consecutive_empty = state.planning_cycle_consecutive_empty;
-        self.planning_cycle_last_fired =
-            state
-                .planning_cycle_last_fired_elapsed_secs
-                .map(|elapsed_secs| {
-                    Instant::now()
-                        .checked_sub(Duration::from_secs(elapsed_secs))
-                        .unwrap_or_else(Instant::now)
-                });
+        self.scheduler.planning_cycle_consecutive_empty = state.planning_cycle_consecutive_empty;
+        self.scheduler.planning_cycle_last_fired = state
+            .planning_cycle_last_fired_elapsed_secs
+            .map(|elapsed_secs| {
+                Instant::now()
+                    .checked_sub(Duration::from_secs(elapsed_secs))
+                    .unwrap_or_else(Instant::now)
+            });
         // #689: restore orphan-rescue records so the exponential-backoff
         // counter survives a daemon restart mid-cascade.
-        self.recently_rescued_tasks = state
+        self.dispatch.recently_rescued_tasks = state
             .recently_rescued_tasks
             .into_iter()
             .map(|(task_id, persisted)| {
@@ -218,7 +220,7 @@ impl TeamDaemon {
         // engineer is not immediately re-given the parked task after a
         // restart, and so the exponential-backoff counter survives
         // mid-cascade.
-        self.recently_released_by = state
+        self.dispatch.recently_released_by = state
             .recently_released_by
             .into_iter()
             .filter_map(|(key, persisted)| {
@@ -248,11 +250,12 @@ impl TeamDaemon {
             states: self.states.clone(),
             active_tasks: self.active_tasks.clone(),
             retry_counts: self.retry_counts.clone(),
-            discord_event_cursor: self.discord_event_cursor,
-            dispatch_queue: self.dispatch_queue.clone(),
-            paused_standups: self.paused_standups.clone(),
-            last_standup_elapsed_secs: standup::snapshot_timer_state(&self.last_standup),
+            discord_event_cursor: self.integrations.discord_event_cursor,
+            dispatch_queue: self.dispatch.queue.clone(),
+            paused_standups: self.scheduler.paused_standups.clone(),
+            last_standup_elapsed_secs: standup::snapshot_timer_state(&self.scheduler.last_standup),
             nudge_state: self
+                .interventions
                 .nudges
                 .iter()
                 .map(|(member, schedule)| {
@@ -266,16 +269,18 @@ impl TeamDaemon {
                     )
                 })
                 .collect(),
-            pipeline_starvation_fired: self.pipeline_starvation_fired,
+            pipeline_starvation_fired: self.scheduler.pipeline_starvation_fired,
             optional_subsystem_backoff,
             optional_subsystem_disabled_remaining_secs,
             // #687: snapshot the architect planning-cycle backoff so it
             // survives a daemon restart.
             planning_cycle_last_fired_elapsed_secs: self
+                .scheduler
                 .planning_cycle_last_fired
                 .map(|t| t.elapsed().as_secs()),
-            planning_cycle_consecutive_empty: self.planning_cycle_consecutive_empty,
+            planning_cycle_consecutive_empty: self.scheduler.planning_cycle_consecutive_empty,
             recently_rescued_tasks: self
+                .dispatch
                 .recently_rescued_tasks
                 .iter()
                 .map(|(task_id, record)| {
@@ -289,6 +294,7 @@ impl TeamDaemon {
                 })
                 .collect(),
             recently_released_by: self
+                .dispatch
                 .recently_released_by
                 .iter()
                 .map(|((task_id, engineer), record)| {
@@ -301,8 +307,8 @@ impl TeamDaemon {
                     )
                 })
                 .collect(),
-            pending_verifications: self.background_tests.pending_verifications(),
-            merge_queue: self.merge_queue.snapshot(),
+            pending_verifications: self.verification.background_tests.pending_verifications(),
+            merge_queue: self.merge.queue.snapshot(),
         };
         save_daemon_state(&self.config.project_root, &state)
     }

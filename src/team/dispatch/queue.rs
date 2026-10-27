@@ -770,7 +770,9 @@ impl TeamDaemon {
             queued_task_ids,
             &self.config.team_config.board.dispatch_excluded_tags,
             &self.non_engineer_member_names(),
-            &self.rescued_task_ids(),
+            &self
+                .dispatch
+                .rescued_task_ids(self.orphan_rescue_cooldown()),
             &HashSet::new(),
         )?;
         let allow_peer_pickup =
@@ -780,49 +782,19 @@ impl TeamDaemon {
             queued_task_ids,
             &self.config.team_config.board.dispatch_excluded_tags,
             &self.non_engineer_member_names(),
-            &self.rescued_task_ids(),
+            &self
+                .dispatch
+                .rescued_task_ids(self.orphan_rescue_cooldown()),
             &self.verification_retry_dispatchable_task_ids(board_dir, allow_peer_pickup)?,
         )?
         .into_iter()
         .next())
     }
 
-    /// #684 / #686: task IDs currently within the orphan-rescue cooldown
-    /// window (exponentially grown per repeated rescue). Dispatch filters
-    /// these out so a task the releasing engineer parked doesn't immediately
-    /// bounce to a peer, and tasks that keep getting rescued stay quiet
-    /// longer instead of re-cascading every base window.
-    pub(super) fn rescued_task_ids(&self) -> HashSet<u32> {
-        let base = Duration::from_secs(self.config.team_config.board.orphan_rescue_cooldown_secs);
-        self.recently_rescued_tasks
-            .iter()
-            .filter(|(_, record)| record.dispatch_blocked(base))
-            .map(|(task_id, _)| *task_id)
-            .collect()
-    }
-
-    /// #686 / #689: record a rescue event for `task_id`. Growth condition
-    /// uses the cascade-observation window (2× effective cooldown), not
-    /// the dispatch-gate window — rescues can only fire *after* the
-    /// dispatch gate has opened, so gating growth on `dispatch_blocked`
-    /// meant the counter never climbed past 1 in production.
-    pub(in super::super) fn record_task_rescue(&mut self, task_id: u32) {
-        let base = Duration::from_secs(self.config.team_config.board.orphan_rescue_cooldown_secs);
-        let now = Instant::now();
-        self.recently_rescued_tasks
-            .entry(task_id)
-            .and_modify(|record| {
-                if record.in_cascade_window(base) {
-                    record.count = record.count.saturating_add(1);
-                } else {
-                    record.count = 1;
-                }
-                record.last_rescued_at = now;
-            })
-            .or_insert(crate::team::daemon::RescueRecord {
-                last_rescued_at: now,
-                count: 1,
-            });
+    /// #684 / #686: base orphan-rescue dispatch cooldown (before the
+    /// per-task exponential growth applied by `RescueRecord`).
+    pub(in super::super) fn orphan_rescue_cooldown(&self) -> Duration {
+        Duration::from_secs(self.config.team_config.board.orphan_rescue_cooldown_secs)
     }
 
     /// #697: window within which an engineer who just released a task's
@@ -834,44 +806,6 @@ impl TeamDaemon {
                 .board
                 .dispatch_release_exclusion_secs,
         )
-    }
-
-    /// #697 / #698: record that `engineer` just released task `task_id`
-    /// (state reconciliation observed `claimed_by` cleared). Subsequent
-    /// dispatch cycles skip this pair until the exclusion window
-    /// elapses. #698: if the previous release for this pair is still
-    /// inside the cascade-observation window (2× effective window), the
-    /// counter grows — widening the next exclusion window exponentially
-    /// up to 16× base. This prevents a human-parked task (owner
-    /// awaiting a Saturday ping, for instance) from cycling through
-    /// dispatch→release every base window for ~14 hours.
-    pub(in super::super) fn record_task_release_by(&mut self, task_id: u32, engineer: &str) {
-        let base = self.release_exclusion_window();
-        let now = Instant::now();
-        self.recently_released_by
-            .entry((task_id, engineer.to_string()))
-            .and_modify(|record| {
-                if record.in_cascade_window(base) {
-                    record.count = record.count.saturating_add(1);
-                } else {
-                    record.count = 1;
-                }
-                record.last_released_at = now;
-            })
-            .or_insert(crate::team::daemon::ReleaseRecord {
-                last_released_at: now,
-                count: 1,
-            });
-    }
-
-    /// #697 / #698: true if `engineer` is still within the current
-    /// (exponentially-grown) release-exclusion window for `task_id`.
-    pub(in super::super) fn is_release_excluded(&self, task_id: u32, engineer: &str) -> bool {
-        let base = self.release_exclusion_window();
-        self.recently_released_by
-            .get(&(task_id, engineer.to_string()))
-            .map(|record| record.dispatch_excluded(base))
-            .unwrap_or(false)
     }
 
     /// Returns names of configured members whose role is NOT `Engineer`.
@@ -903,7 +837,8 @@ impl TeamDaemon {
             Duration::from_secs(self.config.team_config.board.dispatch_dedup_window_secs);
 
         // Expire stale dedup entries.
-        self.recent_dispatches
+        self.dispatch
+            .recent_dispatches
             .retain(|_, dispatched_at| dispatched_at.elapsed() < dedup_window);
         // #697 / #698: retain release-exclusion records through the
         // full cascade-observation window (2× effective window). Dropping
@@ -911,7 +846,8 @@ impl TeamDaemon {
         // on every release, killing the exponential backoff the same way
         // the pre-#689 rescue map did.
         let release_base_window = self.release_exclusion_window();
-        self.recently_released_by
+        self.dispatch
+            .recently_released_by
             .retain(|_, record| record.in_cascade_window(release_base_window));
 
         // #684 / #686 / #689: retain rescue records through the full
@@ -921,24 +857,28 @@ impl TeamDaemon {
         // rescue in production — killing the exponential backoff.
         let rescue_base_cooldown =
             Duration::from_secs(self.config.team_config.board.orphan_rescue_cooldown_secs);
-        self.recently_rescued_tasks
+        self.dispatch
+            .recently_rescued_tasks
             .retain(|_, record| record.in_cascade_window(rescue_base_cooldown));
         // Only task IDs still behind the dispatch gate should block new
         // dispatch; past-gate-but-in-window entries live on only so the
         // next rescue can see them and grow the counter.
         let rescued_task_ids: HashSet<u32> = self
+            .dispatch
             .recently_rescued_tasks
             .iter()
             .filter(|(_, record)| record.dispatch_blocked(rescue_base_cooldown))
             .map(|(task_id, _)| *task_id)
             .collect();
         let mut queued_task_ids: HashSet<u32> = self
-            .dispatch_queue
+            .dispatch
+            .queue
             .iter()
             .map(|entry| entry.task_id)
             .collect();
         let mut queued_engineers: HashSet<String> = self
-            .dispatch_queue
+            .dispatch
+            .queue
             .iter()
             .map(|entry| entry.engineer.clone())
             .collect();
@@ -1103,10 +1043,10 @@ impl TeamDaemon {
             }
             let Some(engineer_name) = ranked_engineers.into_iter().find(|engineer_name| {
                 !self
-                    .recent_dispatches
+                    .dispatch.recent_dispatches
                     .contains_key(&(task.id, engineer_name.clone()))
                     // #697: skip engineers who recently released this task.
-                    && !self.is_release_excluded(task.id, engineer_name)
+                    && !self.dispatch.is_release_excluded(task.id, engineer_name, self.release_exclusion_window())
             }) else {
                 // No eligible engineer for THIS task right now — defer it and
                 // let the loop consider lower-priority tasks. Without this,
@@ -1119,7 +1059,7 @@ impl TeamDaemon {
 
             queued_task_ids.insert(task.id);
             queued_engineers.insert(engineer_name.clone());
-            self.dispatch_queue.push(DispatchQueueEntry {
+            self.dispatch.queue.push(DispatchQueueEntry {
                 engineer: engineer_name,
                 task_id: task.id,
                 task_title: task.title,
@@ -1168,9 +1108,11 @@ impl TeamDaemon {
         // orphan-rescue runs after the queue was populated). Without
         // this re-check, the stale entry consumes the new cooldown by
         // dispatching on the very next drain.
-        let rescued_task_ids = self.rescued_task_ids();
+        let rescued_task_ids = self
+            .dispatch
+            .rescued_task_ids(self.orphan_rescue_cooldown());
         let mut pending: std::collections::VecDeque<DispatchQueueEntry> =
-            std::mem::take(&mut self.dispatch_queue).into();
+            std::mem::take(&mut self.dispatch.queue).into();
         let mut retained = Vec::new();
 
         let mut in_flight: Option<DispatchQueueEntry> = None;
@@ -1202,7 +1144,11 @@ impl TeamDaemon {
                 // this task. `enqueue_dispatch_candidates` filters at queue
                 // time; this catches the race where the entry was queued
                 // before the release was recorded in the same tick.
-                if self.is_release_excluded(entry.task_id, &entry.engineer) {
+                if self.dispatch.is_release_excluded(
+                    entry.task_id,
+                    &entry.engineer,
+                    self.release_exclusion_window(),
+                ) {
                     info!(
                         engineer = %entry.engineer,
                         task_id = entry.task_id,
@@ -1634,7 +1580,8 @@ impl TeamDaemon {
                     Ok(_) => {
                         self.active_tasks.insert(entry.engineer.clone(), task.id);
                         self.retry_counts.remove(&entry.engineer);
-                        self.recent_dispatches
+                        self.dispatch
+                            .recent_dispatches
                             .insert((task.id, entry.engineer.clone()), Instant::now());
                         self.record_orchestrator_action(format!(
                         "dispatch queue: selected runnable task #{} ({}) and dispatched it to {}",
@@ -1680,7 +1627,7 @@ impl TeamDaemon {
             retained.extend(in_flight);
             retained.extend(pending);
         }
-        self.dispatch_queue = retained;
+        self.dispatch.queue = retained;
         result
     }
 
@@ -1747,14 +1694,18 @@ impl TeamDaemon {
                 // a stale cached `Healthy` state or the 15-minute stall-timer
                 // reclaim would rotate tasks through every quota-blocked
                 // engineer on every dispatch tick.
-                if self.member_backend_parked(engineer_name) {
+                if self
+                    .health
+                    .member_backend_parked(&self.config.project_root, engineer_name)
+                {
                     debug!(
                         engineer = %engineer_name,
                         "skipping dispatch — backend quota parked"
                     );
                     return false;
                 }
-                let Some(assigned_at) = self.manual_assign_cooldowns.get(engineer_name) else {
+                let Some(assigned_at) = self.dispatch.manual_assign_cooldowns.get(engineer_name)
+                else {
                     return true;
                 };
                 if assigned_at.elapsed() < manual_cooldown {
@@ -2428,7 +2379,7 @@ mod tests {
             .states(HashMap::from([("eng-1".to_string(), MemberState::Working)]))
             .build();
 
-        daemon.dispatch_queue.push(DispatchQueueEntry {
+        daemon.dispatch.queue.push(DispatchQueueEntry {
             engineer: "eng-1".to_string(),
             task_id: 10,
             task_title: "finished".to_string(),
@@ -2439,7 +2390,7 @@ mod tests {
 
         daemon.process_dispatch_queue().unwrap();
         assert!(
-            daemon.dispatch_queue.is_empty(),
+            daemon.dispatch.queue.is_empty(),
             "entry for done task should be pruned even when engineer is Working"
         );
     }
@@ -2459,7 +2410,7 @@ mod tests {
             .states(HashMap::from([("eng-1".to_string(), MemberState::Working)]))
             .build();
 
-        daemon.dispatch_queue.push(DispatchQueueEntry {
+        daemon.dispatch.queue.push(DispatchQueueEntry {
             engineer: "eng-1".to_string(),
             task_id: 10,
             task_title: "pending-work".to_string(),
@@ -2470,7 +2421,7 @@ mod tests {
 
         daemon.process_dispatch_queue().unwrap();
         assert_eq!(
-            daemon.dispatch_queue.len(),
+            daemon.dispatch.queue.len(),
             1,
             "entry for valid todo task should be retained while engineer is Working"
         );
@@ -2512,7 +2463,7 @@ mod tests {
             "eng-1".to_string(),
             std::time::Instant::now() - std::time::Duration::from_secs(1),
         );
-        daemon.dispatch_queue.push(DispatchQueueEntry {
+        daemon.dispatch.queue.push(DispatchQueueEntry {
             engineer: "eng-1".to_string(),
             task_id: 42,
             task_title: "dispatch-reset".to_string(),
@@ -2523,10 +2474,10 @@ mod tests {
 
         daemon.process_dispatch_queue().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].validation_failures, 2);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].validation_failures, 2);
         assert!(
-            daemon.dispatch_queue[0]
+            daemon.dispatch.queue[0]
                 .last_failure
                 .as_deref()
                 .unwrap_or("")
@@ -2588,7 +2539,7 @@ mod tests {
             "eng-1".to_string(),
             std::time::Instant::now() - std::time::Duration::from_secs(1),
         );
-        daemon.dispatch_queue.push(DispatchQueueEntry {
+        daemon.dispatch.queue.push(DispatchQueueEntry {
             engineer: "eng-1".to_string(),
             task_id: 42,
             task_title: "dispatch-reset".to_string(),
@@ -2599,10 +2550,10 @@ mod tests {
 
         daemon.process_dispatch_queue().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].validation_failures, 2);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].validation_failures, 2);
         assert!(
-            daemon.dispatch_queue[0]
+            daemon.dispatch.queue[0]
                 .last_failure
                 .as_deref()
                 .unwrap_or("")
@@ -2671,9 +2622,9 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
         assert_eq!(
-            daemon.dispatch_queue[0].task_id, 31,
+            daemon.dispatch.queue[0].task_id, 31,
             "blocked task #30 must be filtered out; only the runnable #31 should be queued"
         );
     }
@@ -2706,9 +2657,9 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
         assert_eq!(
-            daemon.dispatch_queue[0].task_id, 41,
+            daemon.dispatch.queue[0].task_id, 41,
             "non-engineer-assigned task #40 must be filtered out; only #41 should dispatch"
         );
     }
@@ -2738,10 +2689,10 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 50);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 50);
         assert_eq!(
-            daemon.dispatch_queue[0].engineer, "eng-2",
+            daemon.dispatch.queue[0].engineer, "eng-2",
             "task with `assignee: eng-2` must dispatch to eng-2, not a peer"
         );
     }
@@ -2766,7 +2717,7 @@ mod tests {
         daemon.enqueue_dispatch_candidates().unwrap();
 
         assert!(
-            daemon.dispatch_queue.is_empty(),
+            daemon.dispatch.queue.is_empty(),
             "task must remain undispatched while named engineer is unavailable"
         );
     }
@@ -2817,9 +2768,9 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
         assert_eq!(
-            daemon.dispatch_queue[0].task_id, 71,
+            daemon.dispatch.queue[0].task_id, 71,
             "task with `**Owner:** maya-lead` body must be filtered out \
              because maya-lead is a non-engineer member; only #71 should dispatch"
         );
@@ -2865,9 +2816,9 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 80);
-        assert_eq!(daemon.dispatch_queue[0].engineer, "priya-writer-1-1");
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 80);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "priya-writer-1-1");
     }
 
     #[test]
@@ -2934,10 +2885,10 @@ mod tests {
         daemon.enqueue_dispatch_candidates().unwrap();
 
         assert!(
-            daemon.dispatch_queue.is_empty(),
+            daemon.dispatch.queue.is_empty(),
             "task must remain undispatched while named body-owner engineer is busy; \
              got {:?}",
-            daemon.dispatch_queue
+            daemon.dispatch.queue
         );
     }
 
@@ -2991,10 +2942,10 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 91);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 91);
         assert_eq!(
-            daemon.dispatch_queue[0].engineer, "priya-writer-1-1",
+            daemon.dispatch.queue[0].engineer, "priya-writer-1-1",
             "body-owner `priya-writer` must win over idle peer kai-devrel-1-1"
         );
     }
@@ -3040,10 +2991,10 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 90);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 90);
         assert_eq!(
-            daemon.dispatch_queue[0].engineer, "kai-devrel-1-1",
+            daemon.dispatch.queue[0].engineer, "kai-devrel-1-1",
             "task tagged with a role_name must prefer the engineer whose role_name matches, \
              not fall back to the first alphabetical peer"
         );
@@ -3096,10 +3047,10 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 572);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 572);
         assert_eq!(
-            daemon.dispatch_queue[0].engineer, "sam-designer-1-1",
+            daemon.dispatch.queue[0].engineer, "sam-designer-1-1",
             "task tagged `design` must prefer sam-designer over alphabetical \
              alex-dev; role_name `sam-designer` seeds `designer` + `design` + \
              `designing` into domain_tags"
@@ -3191,10 +3142,10 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 91);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 91);
         assert_eq!(
-            daemon.dispatch_queue[0].engineer, "priya-writer-1-1",
+            daemon.dispatch.queue[0].engineer, "priya-writer-1-1",
             "task whose body says `Owner: priya-writer` must route to \
              priya-writer-1-1 even when frontmatter tags are thematic \
              (content/pillar-b/x/writing) and match no role_name"
@@ -3366,12 +3317,14 @@ mod tests {
             ])
             .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
             .build();
-        daemon.record_task_rescue(70);
+        daemon
+            .dispatch
+            .record_task_rescue(70, daemon.orphan_rescue_cooldown());
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
         assert!(
-            daemon.dispatch_queue.is_empty(),
+            daemon.dispatch.queue.is_empty(),
             "task under orphan-rescue cooldown must stay off the dispatch queue"
         );
     }
@@ -3398,12 +3351,14 @@ mod tests {
             .build();
         // Force cooldown to 0 so the task is immediately eligible.
         daemon.config.team_config.board.orphan_rescue_cooldown_secs = 0;
-        daemon.record_task_rescue(71);
+        daemon
+            .dispatch
+            .record_task_rescue(71, daemon.orphan_rescue_cooldown());
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 71);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 71);
     }
 
     #[test]
@@ -3420,17 +3375,23 @@ mod tests {
             ])
             .build();
 
-        daemon.record_task_rescue(99);
-        let first = daemon.recently_rescued_tasks[&99];
+        daemon
+            .dispatch
+            .record_task_rescue(99, daemon.orphan_rescue_cooldown());
+        let first = daemon.dispatch.recently_rescued_tasks[&99];
         assert_eq!(first.count, 1);
 
         // Rescue again while still active — count must grow.
-        daemon.record_task_rescue(99);
-        let second = daemon.recently_rescued_tasks[&99];
+        daemon
+            .dispatch
+            .record_task_rescue(99, daemon.orphan_rescue_cooldown());
+        let second = daemon.dispatch.recently_rescued_tasks[&99];
         assert_eq!(second.count, 2);
 
-        daemon.record_task_rescue(99);
-        let third = daemon.recently_rescued_tasks[&99];
+        daemon
+            .dispatch
+            .record_task_rescue(99, daemon.orphan_rescue_cooldown());
+        let third = daemon.dispatch.recently_rescued_tasks[&99];
         assert_eq!(third.count, 3);
 
         // Effective cooldown doubles each rescue up to the 16× cap.
@@ -3442,9 +3403,11 @@ mod tests {
 
         // Simulate many rescues — multiplier caps at 16×.
         for _ in 0..10 {
-            daemon.record_task_rescue(99);
+            daemon
+                .dispatch
+                .record_task_rescue(99, daemon.orphan_rescue_cooldown());
         }
-        let capped = daemon.recently_rescued_tasks[&99];
+        let capped = daemon.dispatch.recently_rescued_tasks[&99];
         assert_eq!(
             capped.effective_cooldown(base),
             std::time::Duration::from_secs(1600)
@@ -3471,28 +3434,36 @@ mod tests {
         // 100s base cooldown → count=1 effective_cooldown=100s, cascade_window=200s.
         daemon.config.team_config.board.orphan_rescue_cooldown_secs = 100;
 
-        daemon.record_task_rescue(42);
+        daemon
+            .dispatch
+            .record_task_rescue(42, daemon.orphan_rescue_cooldown());
         // Simulate 150s elapsed — past the 100s dispatch gate (so a
         // re-dispatch happens and the rescued engineer quickly releases)
         // but still inside the 200s cascade window.
-        let record = daemon.recently_rescued_tasks.get_mut(&42).unwrap();
+        let record = daemon.dispatch.recently_rescued_tasks.get_mut(&42).unwrap();
         record.last_rescued_at = std::time::Instant::now() - Duration::from_secs(150);
 
-        daemon.record_task_rescue(42);
-        let grown = daemon.recently_rescued_tasks[&42];
+        daemon
+            .dispatch
+            .record_task_rescue(42, daemon.orphan_rescue_cooldown());
+        let grown = daemon.dispatch.recently_rescued_tasks[&42];
         assert_eq!(
             grown.count, 2,
             "rescue after gate-open but inside cascade window must grow the counter"
         );
 
         // Same scenario but past the cascade window → counter resets.
-        daemon.record_task_rescue(77);
-        let record = daemon.recently_rescued_tasks.get_mut(&77).unwrap();
+        daemon
+            .dispatch
+            .record_task_rescue(77, daemon.orphan_rescue_cooldown());
+        let record = daemon.dispatch.recently_rescued_tasks.get_mut(&77).unwrap();
         // cascade_window at count=1 is 2× base = 200s; go well past it.
         record.last_rescued_at = std::time::Instant::now() - Duration::from_secs(500);
 
-        daemon.record_task_rescue(77);
-        let reset = daemon.recently_rescued_tasks[&77];
+        daemon
+            .dispatch
+            .record_task_rescue(77, daemon.orphan_rescue_cooldown());
+        let reset = daemon.dispatch.recently_rescued_tasks[&77];
         assert_eq!(
             reset.count, 1,
             "rescue past cascade window is a new cascade — counter resets"
@@ -3520,25 +3491,37 @@ mod tests {
             .board
             .dispatch_release_exclusion_secs = 300;
 
-        assert!(!daemon.is_release_excluded(42, "eng-1"));
-        daemon.record_task_release_by(42, "eng-1");
+        assert!(!daemon.dispatch.is_release_excluded(
+            42,
+            "eng-1",
+            daemon.release_exclusion_window()
+        ));
+        daemon
+            .dispatch
+            .record_task_release_by(42, "eng-1", daemon.release_exclusion_window());
         assert!(
-            daemon.is_release_excluded(42, "eng-1"),
+            daemon
+                .dispatch
+                .is_release_excluded(42, "eng-1", daemon.release_exclusion_window()),
             "engineer who just released task must be excluded"
         );
         // A different engineer should NOT be excluded.
         assert!(
-            !daemon.is_release_excluded(42, "eng-2"),
+            !daemon
+                .dispatch
+                .is_release_excluded(42, "eng-2", daemon.release_exclusion_window()),
             "exclusion is per-(task, engineer), not global"
         );
         // A different task must not be excluded for the same engineer.
         assert!(
-            !daemon.is_release_excluded(99, "eng-1"),
+            !daemon
+                .dispatch
+                .is_release_excluded(99, "eng-1", daemon.release_exclusion_window()),
             "exclusion must not leak to other tasks"
         );
 
         // Backdate the entry past the configured window — exclusion expires.
-        daemon.recently_released_by.insert(
+        daemon.dispatch.recently_released_by.insert(
             (42, "eng-1".to_string()),
             crate::team::daemon::ReleaseRecord {
                 last_released_at: std::time::Instant::now() - Duration::from_secs(400),
@@ -3546,7 +3529,9 @@ mod tests {
             },
         );
         assert!(
-            !daemon.is_release_excluded(42, "eng-1"),
+            !daemon
+                .dispatch
+                .is_release_excluded(42, "eng-1", daemon.release_exclusion_window()),
             "exclusion must expire after dispatch_release_exclusion_secs"
         );
     }
@@ -3574,44 +3559,54 @@ mod tests {
             .dispatch_release_exclusion_secs = 300;
 
         // First release — count=1, base window (300s).
-        daemon.record_task_release_by(555, "eng-1");
+        daemon
+            .dispatch
+            .record_task_release_by(555, "eng-1", daemon.release_exclusion_window());
         assert_eq!(
-            daemon.recently_released_by[&(555, "eng-1".to_string())].count,
+            daemon.dispatch.recently_released_by[&(555, "eng-1".to_string())].count,
             1
         );
 
         // Simulate a second release after the base window expires but still
         // inside the cascade-observation window (2×300s = 600s). Count grows.
-        daemon.recently_released_by.insert(
+        daemon.dispatch.recently_released_by.insert(
             (555, "eng-1".to_string()),
             crate::team::daemon::ReleaseRecord {
                 last_released_at: std::time::Instant::now() - Duration::from_secs(310),
                 count: 1,
             },
         );
-        daemon.record_task_release_by(555, "eng-1");
-        let after_second = daemon.recently_released_by[&(555, "eng-1".to_string())];
+        daemon
+            .dispatch
+            .record_task_release_by(555, "eng-1", daemon.release_exclusion_window());
+        let after_second = daemon.dispatch.recently_released_by[&(555, "eng-1".to_string())];
         assert_eq!(
             after_second.count, 2,
             "second release within cascade window must grow the counter"
         );
         // Effective window is now 2× base = 600s — exclusion still holds
         // at 0s elapsed.
-        assert!(daemon.is_release_excluded(555, "eng-1"));
+        assert!(daemon.dispatch.is_release_excluded(
+            555,
+            "eng-1",
+            daemon.release_exclusion_window()
+        ));
 
         // A release well past the cascade window resets the counter to 1.
         // At count=3 the effective window is 4× base (1200s) and the
         // cascade window is 2× that (2400s). 3000s elapsed is unambiguously
         // past the cascade window.
-        daemon.recently_released_by.insert(
+        daemon.dispatch.recently_released_by.insert(
             (555, "eng-1".to_string()),
             crate::team::daemon::ReleaseRecord {
                 last_released_at: std::time::Instant::now() - Duration::from_secs(3_000),
                 count: 3,
             },
         );
-        daemon.record_task_release_by(555, "eng-1");
-        let after_reset = daemon.recently_released_by[&(555, "eng-1".to_string())];
+        daemon
+            .dispatch
+            .record_task_release_by(555, "eng-1", daemon.release_exclusion_window());
+        let after_reset = daemon.dispatch.recently_released_by[&(555, "eng-1".to_string())];
         assert_eq!(
             after_reset.count, 1,
             "release past cascade window is a new cascade — counter resets"
@@ -3675,8 +3670,16 @@ mod tests {
             .build();
 
         // Alex just released task #101 — still inside the exclusion window.
-        daemon.record_task_release_by(101, "alex-dev-1-1");
-        assert!(daemon.is_release_excluded(101, "alex-dev-1-1"));
+        daemon.dispatch.record_task_release_by(
+            101,
+            "alex-dev-1-1",
+            daemon.release_exclusion_window(),
+        );
+        assert!(daemon.dispatch.is_release_excluded(
+            101,
+            "alex-dev-1-1",
+            daemon.release_exclusion_window()
+        ));
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
@@ -3684,12 +3687,12 @@ mod tests {
         // release-excluded) and #102 must still dispatch to priya. Before
         // the fix, the outer loop `break`'d on #101 and left priya idle.
         assert_eq!(
-            daemon.dispatch_queue.len(),
+            daemon.dispatch.queue.len(),
             1,
             "release-excluded top-priority task must not starve lower candidates"
         );
-        assert_eq!(daemon.dispatch_queue[0].task_id, 102);
-        assert_eq!(daemon.dispatch_queue[0].engineer, "priya-writer-1-1");
+        assert_eq!(daemon.dispatch.queue[0].task_id, 102);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "priya-writer-1-1");
     }
 
     #[test]
@@ -3734,8 +3737,8 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 12);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 12);
 
         let task = crate::task::Task::from_file(
             &tmp.path()
@@ -3790,7 +3793,7 @@ mod tests {
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert!(daemon.dispatch_queue.is_empty());
+        assert!(daemon.dispatch.queue.is_empty());
         let task = crate::task::Task::from_file(
             &tmp.path()
                 .join(".batty")
@@ -4100,8 +4103,8 @@ mod tests {
             .build();
 
         daemon.enqueue_dispatch_candidates().unwrap();
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 52);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 52);
     }
 
     #[test]
@@ -4124,9 +4127,9 @@ mod tests {
         crate::team::bench::bench_engineer(tmp.path(), "eng-1", Some("session end")).unwrap();
 
         daemon.enqueue_dispatch_candidates().unwrap();
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].engineer, "eng-2");
-        assert_eq!(daemon.dispatch_queue[0].task_id, 70);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
+        assert_eq!(daemon.dispatch.queue[0].task_id, 70);
     }
 
     /// #674 defect 2: dispatch selection must skip engineers whose backend
@@ -4159,16 +4162,17 @@ mod tests {
             .as_secs()
             + 32 * 3600;
         daemon
-            .backend_quota_retry_at
+            .health
+            .quota_retry_at
             .insert("eng-1".to_string(), future_deadline);
 
         daemon.enqueue_dispatch_candidates().unwrap();
-        assert_eq!(daemon.dispatch_queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
         assert_eq!(
-            daemon.dispatch_queue[0].engineer, "eng-2",
+            daemon.dispatch.queue[0].engineer, "eng-2",
             "quota-parked engineer must be skipped even if cached health is Healthy"
         );
-        assert_eq!(daemon.dispatch_queue[0].task_id, 674);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 674);
     }
 
     #[test]
@@ -4190,15 +4194,15 @@ mod tests {
 
         crate::team::bench::bench_engineer(tmp.path(), "eng-1", Some("pause")).unwrap();
         daemon.enqueue_dispatch_candidates().unwrap();
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].engineer, "eng-2");
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
 
         crate::team::bench::unbench_engineer(tmp.path(), "eng-1").unwrap();
-        daemon.dispatch_queue.clear();
+        daemon.dispatch.queue.clear();
         daemon.enqueue_dispatch_candidates().unwrap();
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].engineer, "eng-1");
-        assert_eq!(daemon.dispatch_queue[0].task_id, 71);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "eng-1");
+        assert_eq!(daemon.dispatch.queue[0].task_id, 71);
     }
 
     #[test]
@@ -4252,7 +4256,7 @@ mod tests {
             .build();
 
         daemon.enqueue_dispatch_candidates().unwrap();
-        assert!(daemon.dispatch_queue.is_empty());
+        assert!(daemon.dispatch.queue.is_empty());
         let task = crate::task::Task::from_file(
             &tmp.path()
                 .join(".batty")
@@ -4315,7 +4319,7 @@ mod tests {
             .build();
 
         daemon.enqueue_dispatch_candidates().unwrap();
-        assert!(daemon.dispatch_queue.is_empty());
+        assert!(daemon.dispatch.queue.is_empty());
 
         let waiting_task = crate::task::Task::from_file(
             &tmp.path()
@@ -4341,8 +4345,8 @@ mod tests {
         );
 
         daemon.enqueue_dispatch_candidates().unwrap();
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 61);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 61);
     }
     #[test]
     fn configured_tag_routes_and_on_demand_roles_bound_eligibility() {

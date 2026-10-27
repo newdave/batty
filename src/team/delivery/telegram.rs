@@ -32,17 +32,17 @@ impl TeamDaemon {
     }
 
     pub(in crate::team) fn telegram_channel_paused(&self, recipient: &str) -> bool {
-        self.intervention_cooldowns
-            .get(&Self::telegram_circuit_breaker_key(recipient))
-            .is_some_and(|opened_at| {
-                opened_at.elapsed() < TELEGRAM_DELIVERY_CIRCUIT_BREAKER_COOLDOWN
-            })
+        self.scheduler.cooldown_active(
+            &Self::telegram_circuit_breaker_key(recipient),
+            TELEGRAM_DELIVERY_CIRCUIT_BREAKER_COOLDOWN,
+        )
     }
 
     pub(in crate::team) fn clear_telegram_delivery_failures(&mut self, recipient: &str) {
         self.retry_counts
             .remove(&Self::telegram_failure_key(recipient));
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .remove(&Self::telegram_circuit_breaker_key(recipient));
     }
 
@@ -86,13 +86,15 @@ impl TeamDaemon {
         body: &str,
     ) -> Result<MessageDelivery> {
         let channel_type = self
+            .delivery
             .channels
             .get(recipient)
             .map(|channel| channel.channel_type().to_string())
             .unwrap_or_default();
 
         if !channel_type.starts_with("telegram") {
-            self.channels
+            self.delivery
+                .channels
                 .get(recipient)
                 .expect("channel presence checked by caller")
                 .send(body)?;
@@ -110,6 +112,7 @@ impl TeamDaemon {
 
         let send_result = {
             let channel = self
+                .delivery
                 .channels
                 .get(recipient)
                 .expect("channel presence checked by caller");
@@ -125,7 +128,7 @@ impl TeamDaemon {
             Err(error) => {
                 let failure_count = self.increment_telegram_delivery_failures(recipient);
                 if failure_count >= TELEGRAM_DELIVERY_CIRCUIT_BREAKER_THRESHOLD {
-                    self.intervention_cooldowns.insert(
+                    self.scheduler.intervention_cooldowns.insert(
                         Self::telegram_circuit_breaker_key(recipient),
                         Instant::now(),
                     );
@@ -219,7 +222,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = empty_legacy_daemon(&tmp);
         let attempts = Arc::new(Mutex::new(0));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(SequencedTelegramChannel {
                 results: Arc::new(Mutex::new(VecDeque::from([
@@ -266,7 +269,7 @@ mod tests {
         let mut daemon = empty_legacy_daemon(&tmp);
         daemon.config.members = vec![manager];
         let attempts = Arc::new(Mutex::new(0));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(SequencedTelegramChannel {
                 results: Arc::new(Mutex::new(VecDeque::from(
@@ -343,7 +346,7 @@ mod tests {
     fn telegram_channel_paused_when_breaker_open() {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = empty_legacy_daemon(&tmp);
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             TeamDaemon::telegram_circuit_breaker_key("human"),
             Instant::now(),
         );
@@ -354,7 +357,7 @@ mod tests {
     fn telegram_channel_not_paused_after_cooldown_expires() {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = empty_legacy_daemon(&tmp);
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             TeamDaemon::telegram_circuit_breaker_key("human"),
             Instant::now() - TELEGRAM_DELIVERY_CIRCUIT_BREAKER_COOLDOWN - Duration::from_secs(1),
         );
@@ -370,7 +373,7 @@ mod tests {
         daemon
             .retry_counts
             .insert(TeamDaemon::telegram_failure_key("human"), 3);
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             TeamDaemon::telegram_circuit_breaker_key("human"),
             Instant::now(),
         );
@@ -384,6 +387,7 @@ mod tests {
         );
         assert!(
             !daemon
+                .scheduler
                 .intervention_cooldowns
                 .contains_key(&TeamDaemon::telegram_circuit_breaker_key("human"))
         );
@@ -416,7 +420,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = empty_legacy_daemon(&tmp);
         let sent = Arc::new(Mutex::new(Vec::new()));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "user".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
@@ -437,6 +441,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = empty_legacy_daemon(&tmp);
         daemon
+            .delivery
             .channels
             .insert("user".to_string(), Box::new(FailingChannel));
 
@@ -451,14 +456,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = empty_legacy_daemon(&tmp);
         let sent = Arc::new(Mutex::new(Vec::new()));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "user".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
             }),
         );
         // Simulate telegram channel type by using SequencedTelegramChannel
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "tg-user".to_string(),
             Box::new(SequencedTelegramChannel {
                 results: Arc::new(Mutex::new(VecDeque::from([
@@ -472,7 +477,7 @@ mod tests {
             }),
         );
         // Open circuit breaker for tg-user
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             TeamDaemon::telegram_circuit_breaker_key("tg-user"),
             Instant::now(),
         );

@@ -50,25 +50,26 @@ impl TeamDaemon {
     }
 
     fn poll_discord(&mut self) -> Result<()> {
-        if self.discord_bot.is_none() {
+        if self.integrations.discord_bot.is_none() {
             return Ok(());
         }
 
         let messages = match self
+            .integrations
             .discord_bot
             .as_mut()
             .expect("checked discord bot presence")
             .poll_commands()
         {
             Ok(messages) => {
-                if let Some(transition) = self.discord_health.record_success() {
+                if let Some(transition) = self.integrations.discord_health.record_success() {
                     self.report_integration_health("discord", transition, "");
                 }
                 messages
             }
             Err(error) => {
                 warn!(error = %error, "discord poll failed");
-                if let Some(transition) = self.discord_health.record_failure() {
+                if let Some(transition) = self.integrations.discord_health.record_failure() {
                     self.report_integration_health("discord", transition, &error.to_string());
                 }
                 return Ok(());
@@ -76,6 +77,7 @@ impl TeamDaemon {
         };
 
         if let Some(fault) = self
+            .integrations
             .discord_bot
             .as_mut()
             .and_then(|bot| bot.take_message_content_fault())
@@ -109,7 +111,7 @@ impl TeamDaemon {
             );
 
             if let Some(reply) = self.handle_discord_command(&msg.text) {
-                if let Some(bot) = self.discord_bot.as_ref() {
+                if let Some(bot) = self.integrations.discord_bot.as_ref() {
                     if let Err(error) = bot.send_command_reply(&reply) {
                         warn!(error = %error, "failed to send discord command reply");
                     }
@@ -150,7 +152,7 @@ impl TeamDaemon {
     }
 
     fn sync_discord_events(&mut self) -> Result<()> {
-        if self.discord_bot.is_none() {
+        if self.integrations.discord_bot.is_none() {
             return Ok(());
         }
 
@@ -158,18 +160,18 @@ impl TeamDaemon {
         let events = read_events(&event_path)
             .with_context(|| format!("failed to read event log {}", event_path.display()))?;
 
-        if events.len() < self.discord_event_cursor {
-            self.discord_event_cursor = 0;
+        if events.len() < self.integrations.discord_event_cursor {
+            self.integrations.discord_event_cursor = 0;
         }
 
-        if self.discord_event_cursor >= events.len() {
+        if self.integrations.discord_event_cursor >= events.len() {
             return Ok(());
         }
 
         // Rate limit: send at most 5 events per sync cycle to avoid Discord 429s.
         let batch_limit = 5;
         let mut sent = 0;
-        for event in events.iter().skip(self.discord_event_cursor) {
+        for event in events.iter().skip(self.integrations.discord_event_cursor) {
             if sent >= batch_limit {
                 break;
             }
@@ -183,12 +185,12 @@ impl TeamDaemon {
             }
             sent += 1;
         }
-        self.discord_event_cursor += sent;
+        self.integrations.discord_event_cursor += sent;
         Ok(())
     }
 
     fn send_discord_event(&mut self, event: &TeamEvent) -> Result<()> {
-        let Some(bot) = self.discord_bot.as_ref() else {
+        let Some(bot) = self.integrations.discord_bot.as_ref() else {
             return Ok(());
         };
         let Some(config) = discord_channel_config(&self.config.team_config) else {
@@ -210,7 +212,7 @@ impl TeamDaemon {
     }
 
     fn sync_discord_board(&mut self) {
-        let Some(bot) = self.discord_bot.as_ref() else {
+        let Some(bot) = self.integrations.discord_bot.as_ref() else {
             return;
         };
         let Some(config) = discord_channel_config(&self.config.team_config) else {
@@ -220,9 +222,8 @@ impl TeamDaemon {
             return;
         };
         if self
-            .intervention_cooldowns
-            .get(DISCORD_BOARD_SYNC_KEY)
-            .is_some_and(|last| last.elapsed() < DISCORD_BOARD_SYNC_INTERVAL)
+            .scheduler
+            .cooldown_active(DISCORD_BOARD_SYNC_KEY, DISCORD_BOARD_SYNC_INTERVAL)
         {
             return;
         }
@@ -231,12 +232,13 @@ impl TeamDaemon {
             &self.config.project_root,
             &self.config.members,
             &self.states,
-            &self.backend_health,
+            &self.health.backend,
         ) {
             Ok(body) => body,
             Err(error) => {
                 warn!(error = %error, "failed to build Discord board payload");
-                self.intervention_cooldowns
+                self.scheduler
+                    .intervention_cooldowns
                     .insert(DISCORD_BOARD_SYNC_KEY.to_string(), Instant::now());
                 return;
             }
@@ -282,7 +284,8 @@ impl TeamDaemon {
             },
         }
 
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(DISCORD_BOARD_SYNC_KEY.to_string(), Instant::now());
     }
 }

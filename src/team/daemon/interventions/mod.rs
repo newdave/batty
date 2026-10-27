@@ -61,49 +61,6 @@ impl TeamDaemon {
         }
     }
 
-    pub(super) fn update_nudge_for_state(&mut self, member_name: &str, new_state: MemberState) {
-        if let Some(schedule) = self.nudges.get_mut(member_name) {
-            match new_state {
-                MemberState::Idle => {
-                    if schedule.paused || schedule.idle_since.is_none() {
-                        schedule.idle_since = Some(Instant::now());
-                        schedule.fired_this_idle = false;
-                    }
-                    schedule.paused = false;
-                }
-                MemberState::Working => {
-                    schedule.idle_since = None;
-                    schedule.fired_this_idle = false;
-                    schedule.paused = true;
-                }
-            }
-        }
-    }
-
-    pub(super) fn update_triage_intervention_for_state(
-        &mut self,
-        member_name: &str,
-        new_state: MemberState,
-    ) {
-        match new_state {
-            MemberState::Working => {
-                self.triage_idle_epochs
-                    .entry(member_name.to_string())
-                    .or_insert(0);
-            }
-            MemberState::Idle => {
-                let had_epoch = self.triage_idle_epochs.contains_key(member_name);
-                let epoch = self
-                    .triage_idle_epochs
-                    .entry(member_name.to_string())
-                    .or_insert(0);
-                if had_epoch {
-                    *epoch += 1;
-                }
-            }
-        }
-    }
-
     pub(super) fn automation_idle_grace_duration(&self) -> Duration {
         Duration::from_secs(
             self.config
@@ -175,9 +132,7 @@ impl TeamDaemon {
                 .automation
                 .intervention_cooldown_secs,
         );
-        self.intervention_cooldowns
-            .get(key)
-            .is_some_and(|fired_at| fired_at.elapsed() < cooldown)
+        self.scheduler.cooldown_active(key, cooldown)
     }
 
     fn utilization_intervention_on_cooldown(&self, key: &str) -> bool {
@@ -187,9 +142,7 @@ impl TeamDaemon {
                 .automation
                 .utilization_recovery_interval_secs,
         );
-        self.intervention_cooldowns
-            .get(key)
-            .is_some_and(|fired_at| fired_at.elapsed() < cooldown)
+        self.scheduler.cooldown_active(key, cooldown)
     }
 
     fn is_member_idle(&self, member_name: &str) -> bool {

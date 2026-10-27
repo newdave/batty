@@ -8,7 +8,7 @@ use super::{MessageDelivery, PendingMessage};
 use crate::team::append_shim_event_log;
 use crate::team::completion;
 use crate::team::config::RoleType;
-use crate::team::daemon::{PendingAckInboxMessage, PendingShimAck, TeamDaemon};
+use crate::team::daemon::{PendingAckInboxMessage, TeamDaemon};
 use crate::team::errors::DeliveryError;
 use crate::team::events::TeamEvent;
 use crate::team::inbox;
@@ -804,7 +804,7 @@ impl TeamDaemon {
             .get(member_name)
             .copied()
             .unwrap_or(MemberState::Idle);
-        let nudge_status = status::format_nudge_status(self.nudges.get(member_name));
+        let nudge_status = status::format_nudge_status(self.interventions.nudges.get(member_name));
         let standup_status = crate::team::standup::standup_interval_for_member_name(
             &self.config.team_config,
             &self.config.members,
@@ -812,9 +812,9 @@ impl TeamDaemon {
         )
         .map(|interval| {
             status::format_standup_status(
-                self.last_standup.get(member_name).copied(),
+                self.scheduler.last_standup.get(member_name).copied(),
                 interval,
-                self.paused_standups.contains(member_name),
+                self.scheduler.paused_standups.contains(member_name),
             )
         })
         .unwrap_or_default();
@@ -881,11 +881,16 @@ impl TeamDaemon {
             "stale-done-task-notice:{}:{}:{}",
             recipient, notice.task_id, notice.proof_ref
         );
-        if self.intervention_cooldowns.contains_key(&cooldown_key) {
+        if self
+            .scheduler
+            .intervention_cooldowns
+            .contains_key(&cooldown_key)
+        {
             return;
         }
 
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(cooldown_key, Instant::now());
         let task = notice.task_id.to_string();
         self.emit_event(TeamEvent::state_reconciliation(
@@ -899,50 +904,15 @@ impl TeamDaemon {
         ));
     }
 
-    fn pending_ack_contains_inbox_id(&self, inbox_id: &str) -> bool {
-        self.pending_shim_acks.values().any(|pending| {
-            pending
-                .inbox_messages
-                .iter()
-                .any(|message| message.id == inbox_id)
-        })
-    }
-
-    fn pending_ack_contains_any_inbox_id(&self, messages: &[inbox::InboxMessage]) -> bool {
-        messages
-            .iter()
-            .any(|message| self.pending_ack_contains_inbox_id(&message.id))
-    }
-
     fn manager_digest_backpressure_key(member_name: &str) -> String {
         format!("manager-digest-backpressure::{member_name}")
     }
 
     fn manager_digest_backpressure_on_cooldown(&self, member_name: &str) -> bool {
-        self.intervention_cooldowns
-            .get(&Self::manager_digest_backpressure_key(member_name))
-            .is_some_and(|sent_at| {
-                sent_at.elapsed() < Duration::from_secs(MANAGER_DIGEST_BACKPRESSURE_COOLDOWN_SECS)
-            })
-    }
-
-    fn enqueue_pending_shim_ack(
-        &mut self,
-        message_id: String,
-        recipient: &str,
-        from: &str,
-        body: &str,
-        inbox_messages: Vec<PendingAckInboxMessage>,
-    ) {
-        self.pending_shim_acks.insert(
-            message_id,
-            PendingShimAck {
-                recipient: recipient.to_string(),
-                from: from.to_string(),
-                body: body.to_string(),
-                inbox_messages,
-            },
-        );
+        self.scheduler.cooldown_active(
+            &Self::manager_digest_backpressure_key(member_name),
+            Duration::from_secs(MANAGER_DIGEST_BACKPRESSURE_COOLDOWN_SECS),
+        )
     }
 
     fn send_live_shim_message(
@@ -963,7 +933,13 @@ impl TeamDaemon {
         match result {
             Ok(()) => {
                 let ack_tracks_inbox = !inbox_messages.is_empty();
-                self.enqueue_pending_shim_ack(message_id, recipient, from, body, inbox_messages);
+                self.delivery.enqueue_pending_shim_ack(
+                    message_id,
+                    recipient,
+                    from,
+                    body,
+                    inbox_messages,
+                );
                 let _ = append_shim_event_log(
                     &self.config.project_root,
                     recipient,
@@ -985,7 +961,8 @@ impl TeamDaemon {
     /// Called from `poll_watchers()` when `ready_confirmed` transitions to true.
     pub(in crate::team) fn drain_pending_queue(&mut self, recipient: &str) -> Result<()> {
         let messages = self
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .remove(recipient)
             .unwrap_or_default();
         if messages.is_empty() {
@@ -1009,7 +986,8 @@ impl TeamDaemon {
                 let mut requeue = vec![msg];
                 requeue.extend(messages);
                 let queued = self
-                    .pending_delivery_queue
+                    .delivery
+                    .pending_queue
                     .entry(recipient.to_string())
                     .or_default();
                 requeue.append(queued);
@@ -1031,117 +1009,10 @@ impl TeamDaemon {
         if max_age_secs == 0 {
             return Ok(());
         }
-        let max_age = Duration::from_secs(max_age_secs);
-
-        let recipients: Vec<String> = self.pending_delivery_queue.keys().cloned().collect();
         let inbox_root = inbox::inboxes_root(&self.config.project_root);
         let tiered = self.config.team_config.workflow_policy.tiered_inboxes;
-
-        for recipient in recipients {
-            let Some(messages) = self.pending_delivery_queue.get_mut(&recipient) else {
-                continue;
-            };
-
-            let mut expired: Vec<super::PendingMessage> = Vec::new();
-            let mut kept = Vec::new();
-            for msg in messages.drain(..) {
-                if msg.queued_at.elapsed() >= max_age {
-                    expired.push(msg);
-                } else {
-                    kept.push(msg);
-                }
-            }
-
-            if !expired.is_empty() {
-                let total_expired = expired.len();
-                warn!(
-                    recipient = recipient.as_str(),
-                    count = total_expired,
-                    max_age_secs,
-                    "expiring stale pending messages to inbox fallback"
-                );
-
-                // Group expired messages by sender and deliver digests
-                // to avoid flooding the recipient with hundreds of individual messages.
-                const DIGEST_THRESHOLD: usize = 3;
-                let mut by_sender: std::collections::HashMap<String, Vec<&super::PendingMessage>> =
-                    std::collections::HashMap::new();
-                for msg in &expired {
-                    by_sender.entry(msg.from.clone()).or_default().push(msg);
-                }
-
-                for (sender, sender_msgs) in &by_sender {
-                    if sender_msgs.len() <= DIGEST_THRESHOLD {
-                        // Few messages — deliver individually
-                        for msg in sender_msgs {
-                            let inbox_msg =
-                                inbox::InboxMessage::new_send(&msg.from, &recipient, &msg.body);
-                            if let Err(error) = crate::team::inbox_tiered::deliver_flag_aware(
-                                &inbox_root,
-                                &inbox_msg,
-                                tiered,
-                            ) {
-                                warn!(
-                                    from = msg.from.as_str(),
-                                    to = recipient.as_str(),
-                                    error = %error,
-                                    "failed to deliver expired pending message to inbox"
-                                );
-                            }
-                        }
-                    } else {
-                        // Many messages — collapse into a single digest
-                        let oldest_age_secs = sender_msgs
-                            .iter()
-                            .map(|m| m.queued_at.elapsed().as_secs())
-                            .max()
-                            .unwrap_or(0);
-                        let newest = sender_msgs.last().unwrap();
-                        let newest_preview: String = newest
-                            .body
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(200)
-                            .collect();
-                        let digest = format!(
-                            "[digest] {} messages from {} expired after {}s (oldest: {}s ago). Most recent:\n{}",
-                            sender_msgs.len(),
-                            sender,
-                            max_age_secs,
-                            oldest_age_secs,
-                            newest_preview,
-                        );
-                        let inbox_msg = inbox::InboxMessage::new_send(sender, &recipient, &digest);
-                        if let Err(error) = crate::team::inbox_tiered::deliver_flag_aware(
-                            &inbox_root,
-                            &inbox_msg,
-                            tiered,
-                        ) {
-                            warn!(
-                                from = sender.as_str(),
-                                to = recipient.as_str(),
-                                error = %error,
-                                "failed to deliver digest message to inbox"
-                            );
-                        }
-                        info!(
-                            from = sender.as_str(),
-                            to = recipient.as_str(),
-                            count = sender_msgs.len(),
-                            "collapsed expired messages into digest"
-                        );
-                    }
-                }
-            }
-
-            if kept.is_empty() {
-                self.pending_delivery_queue.remove(&recipient);
-            } else {
-                *self.pending_delivery_queue.get_mut(&recipient).unwrap() = kept;
-            }
-        }
+        self.delivery
+            .expire_stale(max_age_secs, &inbox_root, tiered);
         Ok(())
     }
 
@@ -1166,7 +1037,8 @@ impl TeamDaemon {
     fn queue_pending_message_capped(&mut self, recipient: &str, pending: PendingMessage) {
         let key = pending_digest_key(&pending.from, &pending.body);
         let queue = self
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry(recipient.to_string())
             .or_default();
 
@@ -1234,7 +1106,7 @@ impl TeamDaemon {
             return Ok(MessageDelivery::OrchestratorLogged);
         }
 
-        if let Some(channel) = self.channels.get(recipient) {
+        if let Some(channel) = self.delivery.channels.get(recipient) {
             let _ = channel;
             return self.deliver_channel_message(from, recipient, body);
         }
@@ -1340,7 +1212,7 @@ impl TeamDaemon {
                 if is_user {
                     // A user role without a live channel cannot be reached
                     // now; fail so the command stays queued for a retry.
-                    if !self.channels.contains_key(to.as_str()) {
+                    if !self.delivery.channels.contains_key(to.as_str()) {
                         anyhow::bail!("no channel available for user role '{to}'");
                     }
                     let formatted = format!("[From {from}]\n{msg}");
@@ -1448,7 +1320,7 @@ impl TeamDaemon {
                 let digestible_messages: Vec<inbox::InboxMessage> = messages
                     .iter()
                     .filter(|msg| !suppressed_ids.contains(&msg.id))
-                    .filter(|msg| !self.pending_ack_contains_inbox_id(&msg.id))
+                    .filter(|msg| !self.delivery.pending_ack_contains_inbox_id(&msg.id))
                     .filter(|msg| matches!(msg.msg_type, inbox::MessageType::Send))
                     .filter(|msg| should_batch_manager_notice(classify_manager_notice(&msg.body)))
                     .cloned()
@@ -1492,7 +1364,7 @@ impl TeamDaemon {
                 if digested_ids.contains(&msg.id)
                     || suppressed_ids.contains(&msg.id)
                     || pending_manager_digest_ids.contains(&msg.id)
-                    || self.pending_ack_contains_inbox_id(&msg.id)
+                    || self.delivery.pending_ack_contains_inbox_id(&msg.id)
                 {
                     continue;
                 }
@@ -1531,9 +1403,9 @@ impl TeamDaemon {
                                             .automation
                                             .intervention_cooldown_secs,
                                     );
-                                    self.intervention_cooldowns
-                                        .get(&nudge.cooldown_key)
-                                        .is_none_or(|sent_at| sent_at.elapsed() >= cooldown)
+                                    !self
+                                        .scheduler
+                                        .cooldown_active(&nudge.cooldown_key, cooldown)
                                 });
                             let delivery_body = review_packet_nudge
                                 .as_ref()
@@ -1563,7 +1435,8 @@ impl TeamDaemon {
                                 if result.is_ok()
                                     && let Some(nudge) = review_packet_nudge
                                 {
-                                    self.intervention_cooldowns
+                                    self.scheduler
+                                        .intervention_cooldowns
                                         .insert(nudge.cooldown_key, Instant::now());
                                 }
                                 result
@@ -1654,7 +1527,8 @@ impl TeamDaemon {
                                 Ok(MessageDelivery::OrchestratorLogged)
                             } else {
                                 info!(to = %name, id = %msg.id, "delivering inbox assignment");
-                                self.manual_assign_cooldowns
+                                self.dispatch
+                                    .manual_assign_cooldowns
                                     .insert(name.to_string(), Instant::now());
                                 let task_id = extract_task_id_from_body(&msg.body);
                                 // Claim the task on the board BEFORE launching the
@@ -1709,7 +1583,7 @@ impl TeamDaemon {
                             // Shim delivery is authoritative once the command reaches the
                             // structured channel. Pane-marker verification is a legacy tmux
                             // heuristic and produces false negatives for Claude/Codex shims.
-                            self.clear_failed_delivery(name, &msg.from, &msg.body);
+                            self.delivery.clear_failed(name, &msg.from, &msg.body);
                         }
                     }
                     Err(error) => {
@@ -1856,7 +1730,7 @@ impl TeamDaemon {
         {
             return Ok(Vec::new());
         }
-        if self.pending_ack_contains_any_inbox_id(messages) {
+        if self.delivery.pending_ack_contains_any_inbox_id(messages) {
             debug!(
                 to = %member_name,
                 count = messages.len(),
@@ -1905,13 +1779,14 @@ impl TeamDaemon {
                 error = %error,
                 "failed to deliver manager supervisory digest"
             );
-            self.intervention_cooldowns.insert(
+            self.scheduler.intervention_cooldowns.insert(
                 Self::manager_digest_backpressure_key(member_name),
                 Instant::now(),
             );
             return Ok(Vec::new());
         }
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .remove(&Self::manager_digest_backpressure_key(member_name));
         let mut class_counts: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
@@ -2112,7 +1987,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = empty_legacy_daemon(&tmp);
         let sent = Arc::new(Mutex::new(Vec::new()));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
@@ -2136,7 +2011,7 @@ mod tests {
         );
 
         let sent = Arc::new(Mutex::new(Vec::new()));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
@@ -2183,7 +2058,7 @@ mod tests {
             ..RoleDef::test("human", RoleType::User)
         }];
         daemon.config.members = vec![engineer_member("eng-1", None, false)];
-        daemon.channels = HashMap::from([(
+        daemon.delivery.channels = HashMap::from([(
             "human".to_string(),
             Box::new(FailingChannel) as Box<dyn Channel>,
         )]);
@@ -2227,7 +2102,7 @@ mod tests {
             channel_config: Some(test_channel_config("123", "fake")),
             ..RoleDef::test("human", RoleType::User)
         }];
-        daemon.channels = HashMap::new();
+        daemon.delivery.channels = HashMap::new();
 
         daemon.drain_legacy_command_queue().unwrap();
 
@@ -3096,6 +2971,7 @@ mod tests {
 
         assert!(
             daemon
+                .scheduler
                 .intervention_cooldowns
                 .contains_key(&format!("review_packet_triage:manager:{id}"))
         );
@@ -3135,7 +3011,7 @@ mod tests {
             other => panic!("expected SendMessage, got {other:?}"),
         }
 
-        daemon.pending_shim_acks.clear();
+        daemon.delivery.pending_shim_acks.clear();
         daemon
             .shim_handles
             .get_mut("manager")
@@ -3618,7 +3494,7 @@ mod tests {
             MessageDelivery::DeferredPending,
             "message to starting agent must be deferred to pending queue"
         );
-        let queue = daemon.pending_delivery_queue.get("eng-1").unwrap();
+        let queue = daemon.delivery.pending_queue.get("eng-1").unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].from, "manager");
         assert_eq!(queue[0].body, "task assignment");
@@ -3654,7 +3530,7 @@ mod tests {
                 .unwrap();
         }
 
-        let queue = daemon.pending_delivery_queue.get("eng-1").unwrap();
+        let queue = daemon.delivery.pending_queue.get("eng-1").unwrap();
         assert_eq!(queue.len(), 1);
         assert!(queue[0].body.contains("[task-current digest]"));
         assert!(queue[0].body.contains("collapsed 3 stale same-task"));
@@ -3683,7 +3559,7 @@ mod tests {
                 .unwrap();
         }
 
-        let queue = daemon.pending_delivery_queue.get("eng-1").unwrap();
+        let queue = daemon.delivery.pending_queue.get("eng-1").unwrap();
         assert_eq!(queue.len(), 3);
         assert!(queue.iter().all(|message| !message.body.contains("digest")));
     }
@@ -3694,7 +3570,8 @@ mod tests {
         let mut daemon = failed_delivery_test_daemon(&tmp);
 
         daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("eng-1".to_string())
             .or_default()
             .push(PendingMessage {
@@ -3712,7 +3589,8 @@ mod tests {
 
         assert!(
             daemon
-                .pending_delivery_queue
+                .delivery
+                .pending_queue
                 .get("eng-1")
                 .map(|q| q.is_empty())
                 .unwrap_or(true),
@@ -3731,7 +3609,8 @@ mod tests {
         let mut daemon = failed_delivery_test_daemon(&tmp);
         for body in ["first", "second"] {
             daemon
-                .pending_delivery_queue
+                .delivery
+                .pending_queue
                 .entry("eng-1".to_string())
                 .or_default()
                 .push(PendingMessage {
@@ -3752,7 +3631,7 @@ mod tests {
 
         assert!(daemon.drain_pending_queue("eng-1").is_err());
 
-        let bodies: Vec<&str> = daemon.pending_delivery_queue["eng-1"]
+        let bodies: Vec<&str> = daemon.delivery.pending_queue["eng-1"]
             .iter()
             .map(|message| message.body.as_str())
             .collect();
@@ -3766,7 +3645,8 @@ mod tests {
         daemon.drain_pending_queue("eng-1").unwrap();
         assert!(
             daemon
-                .pending_delivery_queue
+                .delivery
+                .pending_queue
                 .get("eng-1")
                 .map(|q| q.is_empty())
                 .unwrap_or(true)
@@ -3801,7 +3681,7 @@ mod tests {
             assert_eq!(result, MessageDelivery::DeferredPending);
         }
 
-        let queue = daemon.pending_delivery_queue.get("eng-1").unwrap();
+        let queue = daemon.delivery.pending_queue.get("eng-1").unwrap();
         assert_eq!(queue.len(), 3);
         assert_eq!(queue[0].body, "msg-1");
         assert_eq!(queue[1].body, "msg-2");
@@ -3814,7 +3694,8 @@ mod tests {
 
         assert!(
             daemon
-                .pending_delivery_queue
+                .delivery
+                .pending_queue
                 .get("eng-1")
                 .map(|q| q.is_empty())
                 .unwrap_or(true)
@@ -3860,7 +3741,7 @@ mod tests {
             MessageDelivery::DeferredPending,
             "message to starting agent must be deferred"
         );
-        let queue = daemon.pending_delivery_queue.get("eng-1").unwrap();
+        let queue = daemon.delivery.pending_queue.get("eng-1").unwrap();
         assert_eq!(
             queue.len(),
             1,
@@ -3884,7 +3765,8 @@ mod tests {
 
         assert!(
             daemon
-                .pending_delivery_queue
+                .delivery
+                .pending_queue
                 .get("eng-1")
                 .map(|q| q.is_empty())
                 .unwrap_or(true),
@@ -3986,7 +3868,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), MessageDelivery::DeferredPending);
 
-        let queue = daemon.pending_delivery_queue.get("eng-1").unwrap();
+        let queue = daemon.delivery.pending_queue.get("eng-1").unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].body, "wait for me");
     }
@@ -4734,7 +4616,8 @@ mod tests {
         daemon.config.team_config.pending_queue_max_age_secs = 0;
 
         daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("eng-1".to_string())
             .or_default()
             .push(PendingMessage {
@@ -4747,7 +4630,7 @@ mod tests {
         daemon.expire_stale_pending_messages().unwrap();
 
         // Should still be in the queue since expiry is disabled
-        assert!(daemon.pending_delivery_queue.contains_key("eng-1"));
+        assert!(daemon.delivery.pending_queue.contains_key("eng-1"));
     }
 
     #[test]
@@ -4758,7 +4641,8 @@ mod tests {
         daemon.config.team_config.pending_queue_max_age_secs = 600;
 
         daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("eng-1".to_string())
             .or_default()
             .push(PendingMessage {
@@ -4771,7 +4655,7 @@ mod tests {
         daemon.expire_stale_pending_messages().unwrap();
 
         assert!(
-            daemon.pending_delivery_queue.contains_key("eng-1"),
+            daemon.delivery.pending_queue.contains_key("eng-1"),
             "fresh messages should remain in pending queue"
         );
     }
@@ -4787,7 +4671,8 @@ mod tests {
         daemon.config.team_config.pending_queue_max_age_secs = 60;
 
         daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("eng-1".to_string())
             .or_default()
             .push(PendingMessage {
@@ -4801,7 +4686,7 @@ mod tests {
 
         // Pending queue should be empty
         assert!(
-            !daemon.pending_delivery_queue.contains_key("eng-1"),
+            !daemon.delivery.pending_queue.contains_key("eng-1"),
             "expired message should be removed from pending queue"
         );
 
@@ -4823,7 +4708,8 @@ mod tests {
         daemon.config.team_config.pending_queue_max_age_secs = 60;
 
         let queue = daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("eng-1".to_string())
             .or_default();
         queue.push(PendingMessage {
@@ -4842,8 +4728,8 @@ mod tests {
         daemon.expire_stale_pending_messages().unwrap();
 
         // Only the fresh message should remain
-        assert!(daemon.pending_delivery_queue.contains_key("eng-1"));
-        let remaining = &daemon.pending_delivery_queue["eng-1"];
+        assert!(daemon.delivery.pending_queue.contains_key("eng-1"));
+        let remaining = &daemon.delivery.pending_queue["eng-1"];
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].body, "new message");
 
@@ -4864,7 +4750,8 @@ mod tests {
         daemon.config.team_config.pending_queue_max_age_secs = 60;
 
         let queue = daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("manager".to_string())
             .or_default();
         // 5 messages from architect (above digest threshold of 3)
@@ -4888,7 +4775,7 @@ mod tests {
 
         daemon.expire_stale_pending_messages().unwrap();
 
-        assert!(!daemon.pending_delivery_queue.contains_key("manager"));
+        assert!(!daemon.delivery.pending_queue.contains_key("manager"));
 
         let messages = crate::team::inbox::pending_messages(&inbox_root, "manager").unwrap();
         // Should get: 1 digest from architect + 2 individual from daemon = 3 messages

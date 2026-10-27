@@ -72,12 +72,13 @@ impl TeamDaemon {
 
         let interval = Duration::from_secs(config.check_interval_secs);
         if self
+            .health
             .last_disk_hygiene_check
             .is_some_and(|t| t.elapsed() < interval)
         {
             return Ok(());
         }
-        self.last_disk_hygiene_check = Some(Instant::now());
+        self.health.last_disk_hygiene_check = Some(Instant::now());
 
         let project_root = self.project_root().to_path_buf();
         let report = run_disk_hygiene(&project_root, config)?;

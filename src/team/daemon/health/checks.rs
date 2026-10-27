@@ -44,9 +44,8 @@ fn worktree_recovery_backoff_key(member: &str, repo_label: &str) -> String {
 
 impl TeamDaemon {
     fn worktree_recovery_backed_off(&self, key: &str) -> bool {
-        self.intervention_cooldowns
-            .get(key)
-            .is_some_and(|blocked_at| blocked_at.elapsed() < WORKTREE_RECOVERY_BACKOFF)
+        self.scheduler
+            .cooldown_active(key, WORKTREE_RECOVERY_BACKOFF)
     }
 }
 
@@ -236,7 +235,9 @@ impl TeamDaemon {
                 "github-verification: warning for task #{}: {}",
                 warning.task_id, warning.reason
             ));
-            self.intervention_cooldowns.insert(key, Instant::now());
+            self.scheduler
+                .intervention_cooldowns
+                .insert(key, Instant::now());
         }
 
         for feedback in snapshot.failed.values().chain(snapshot.passed.values()) {
@@ -268,7 +269,9 @@ impl TeamDaemon {
                 "github-verification: {}",
                 feedback.blocked_on_summary()
             ));
-            self.intervention_cooldowns.insert(key, Instant::now());
+            self.scheduler
+                .intervention_cooldowns
+                .insert(key, Instant::now());
         }
 
         Ok(())
@@ -276,12 +279,13 @@ impl TeamDaemon {
 
     pub(in super::super) fn maybe_cleanup_shared_cargo_target(&mut self) -> Result<()> {
         if self
+            .health
             .last_shared_target_cleanup
             .is_some_and(|t| t.elapsed() < SHARED_TARGET_CLEANUP_INTERVAL)
         {
             return Ok(());
         }
-        self.last_shared_target_cleanup = Some(Instant::now());
+        self.health.last_shared_target_cleanup = Some(Instant::now());
 
         let shared_target =
             crate::team::task_loop::shared_cargo_target_dir(&self.config.project_root);
@@ -425,7 +429,8 @@ impl TeamDaemon {
                         .as_ref()
                         .is_ok_and(|reason| reason.reset_performed())
                     {
-                        self.intervention_cooldowns
+                        self.scheduler
+                            .intervention_cooldowns
                             .insert(backoff_key, Instant::now());
                     }
                     match outcome {
@@ -580,7 +585,8 @@ impl TeamDaemon {
                             .as_ref()
                             .is_ok_and(|reason| reason.reset_performed())
                         {
-                            self.intervention_cooldowns
+                            self.scheduler
+                                .intervention_cooldowns
                                 .insert(backoff_key, Instant::now());
                         }
                         match outcome {
@@ -656,12 +662,13 @@ impl TeamDaemon {
                 .health_check_interval_secs,
         );
         if self
+            .health
             .last_health_check
             .is_some_and(|t| t.elapsed() < interval)
         {
             return Ok(());
         }
-        self.last_health_check = Some(Instant::now());
+        self.health.last_health_check = Some(Instant::now());
 
         // Collect (member_name, agent_name) pairs to avoid borrowing self.config during mutation.
         let checks: Vec<(String, String)> = self
@@ -689,7 +696,8 @@ impl TeamDaemon {
                 new_health = BackendHealth::Degraded;
             }
             let prev_health = self
-                .backend_health
+                .health
+                .backend
                 .get(member_name)
                 .copied()
                 .unwrap_or(BackendHealth::Healthy);
@@ -700,14 +708,15 @@ impl TeamDaemon {
                 .join(".batty/backend-configuration")
                 .join(format!("{member_name}.json"));
             if configuration_marker.exists() {
-                self.backend_health
+                self.health
+                    .backend
                     .insert(member_name.clone(), BackendHealth::ConfigurationRequired);
                 continue;
             }
             if prev_health == BackendHealth::ConfigurationRequired {
                 // Operator cleared the durable marker. Recreate only this
                 // member's shim so its local terminal-error latch is cleared.
-                self.backend_health.insert(member_name.clone(), new_health);
+                self.health.backend.insert(member_name.clone(), new_health);
                 if self.shim_handles.contains_key(member_name) {
                     self.handle_shim_cold_respawn(member_name, "backend configuration reset")?;
                 }
@@ -729,16 +738,17 @@ impl TeamDaemon {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let retry_at = self.backend_quota_retry_at.get(member_name).copied();
+                let retry_at = self.health.quota_retry_at.get(member_name).copied();
                 if retry_at.is_some_and(|deadline| deadline > now_epoch) {
                     // Deadline still in the future — hold QuotaExhausted.
-                    self.backend_health
+                    self.health
+                        .backend
                         .insert(member_name.clone(), BackendHealth::QuotaExhausted);
                     continue;
                 }
                 // Deadline elapsed (or never recorded) — allow the transition
                 // and clear any stale retry_at bookkeeping.
-                self.backend_quota_retry_at.remove(member_name);
+                self.health.quota_retry_at.remove(member_name);
             }
 
             if new_health != prev_health {
@@ -755,7 +765,7 @@ impl TeamDaemon {
                     member_name, transition, agent_name,
                 ));
             }
-            self.backend_health.insert(member_name.clone(), new_health);
+            self.health.backend.insert(member_name.clone(), new_health);
         }
 
         Ok(())
@@ -857,7 +867,7 @@ impl TeamDaemon {
                 .clear_warning(&format!("uncommitted_diff_failed:{name}"));
 
             if lines < threshold {
-                let had_warning_state = self.last_uncommitted_warn.remove(name).is_some();
+                let had_warning_state = self.health.last_uncommitted_warn.remove(name).is_some();
                 let cleared = clear_pending_commit_reminders(&self.config.project_root, name)
                     .unwrap_or_else(|error| {
                         warn!(
@@ -877,7 +887,7 @@ impl TeamDaemon {
 
             // Rate-limit only after measuring the current worktree so clean
             // verification can clear stale reminder state immediately.
-            if let Some(last) = self.last_uncommitted_warn.get(name) {
+            if let Some(last) = self.health.last_uncommitted_warn.get(name) {
                 if last.elapsed() < cooldown {
                     continue;
                 }
@@ -914,7 +924,8 @@ impl TeamDaemon {
             self.record_orchestrator_action(format!(
                 "uncommitted-warn: {name} has {lines} uncommitted lines (threshold {threshold})"
             ));
-            self.last_uncommitted_warn
+            self.health
+                .last_uncommitted_warn
                 .insert(name.clone(), Instant::now());
         }
 
@@ -1049,9 +1060,9 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
-        daemon.last_health_check = Some(Instant::now());
+        daemon.health.last_health_check = Some(Instant::now());
         daemon.check_backend_health().unwrap();
-        assert!(daemon.backend_health.is_empty());
+        assert!(daemon.health.backend.is_empty());
     }
 
     #[test]
@@ -1070,9 +1081,9 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
-        daemon.last_health_check = None;
+        daemon.health.last_health_check = None;
         daemon.check_backend_health().unwrap();
-        assert!(daemon.backend_health.contains_key("eng-health-run"));
+        assert!(daemon.health.backend.contains_key("eng-health-run"));
     }
 
     #[test]
@@ -1091,9 +1102,9 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![user]);
-        daemon.last_health_check = None;
+        daemon.health.last_health_check = None;
         daemon.check_backend_health().unwrap();
-        assert!(daemon.backend_health.is_empty());
+        assert!(daemon.health.backend.is_empty());
     }
 
     #[test]
@@ -1121,17 +1132,17 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
-        daemon.last_health_check = None;
+        daemon.health.last_health_check = None;
 
         // First check: no prior state → sets initial value.
         daemon.check_backend_health().unwrap();
-        let initial_health = *daemon.backend_health.get("eng-transition").unwrap();
+        let initial_health = *daemon.health.backend.get("eng-transition").unwrap();
         assert_eq!(initial_health, BackendHealth::Healthy);
 
         // Event emitted only on *transition*. First check from None→Healthy
         // may or may not emit depending on whether None counts. Let's just
         // verify the health entry exists.
-        assert!(daemon.backend_health.contains_key("eng-transition"));
+        assert!(daemon.health.backend.contains_key("eng-transition"));
     }
 
     #[test]
@@ -1159,9 +1170,10 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
-        daemon.last_health_check = None;
+        daemon.health.last_health_check = None;
         daemon
-            .backend_health
+            .health
+            .backend
             .insert("eng-stable".to_string(), BackendHealth::Healthy);
 
         daemon.check_backend_health().unwrap();
@@ -1194,12 +1206,12 @@ mod tests {
                 engineer_member("eng-1", Some("architect"), false),
             ])
             .build();
-        daemon.last_health_check = None;
+        daemon.health.last_health_check = None;
 
         daemon.check_backend_health().unwrap();
 
-        assert!(daemon.backend_health.contains_key("architect"));
-        assert!(daemon.backend_health.contains_key("eng-1"));
+        assert!(daemon.health.backend.contains_key("architect"));
+        assert!(daemon.health.backend.contains_key("eng-1"));
     }
 
     /// #674 defect 1: when a member has been marked QuotaExhausted with a
@@ -1215,9 +1227,10 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path())
             .members(vec![engineer_member("eng-parked", None, false)])
             .build();
-        daemon.last_health_check = None;
+        daemon.health.last_health_check = None;
         daemon
-            .backend_health
+            .health
+            .backend
             .insert("eng-parked".to_string(), BackendHealth::QuotaExhausted);
         let future_deadline = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1225,18 +1238,19 @@ mod tests {
             .as_secs()
             + 32 * 3600; // 32h from now
         daemon
-            .backend_quota_retry_at
+            .health
+            .quota_retry_at
             .insert("eng-parked".to_string(), future_deadline);
 
         daemon.check_backend_health().unwrap();
 
         assert_eq!(
-            daemon.backend_health.get("eng-parked").copied(),
+            daemon.health.backend.get("eng-parked").copied(),
             Some(BackendHealth::QuotaExhausted),
             "QuotaExhausted must be held while retry_at is in the future"
         );
         assert_eq!(
-            daemon.backend_quota_retry_at.get("eng-parked").copied(),
+            daemon.health.quota_retry_at.get("eng-parked").copied(),
             Some(future_deadline),
             "retry_at bookkeeping must not be cleared while deadline is still future"
         );
@@ -1266,9 +1280,10 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path())
             .members(vec![engineer_member("eng-recovered", None, false)])
             .build();
-        daemon.last_health_check = None;
+        daemon.health.last_health_check = None;
         daemon
-            .backend_health
+            .health
+            .backend
             .insert("eng-recovered".to_string(), BackendHealth::QuotaExhausted);
         // Deadline five seconds in the past.
         let past_deadline = std::time::SystemTime::now()
@@ -1277,7 +1292,8 @@ mod tests {
             .as_secs()
             .saturating_sub(5);
         daemon
-            .backend_quota_retry_at
+            .health
+            .quota_retry_at
             .insert("eng-recovered".to_string(), past_deadline);
 
         daemon.check_backend_health().unwrap();
@@ -1286,12 +1302,12 @@ mod tests {
         // Unreachable or Healthy — either way it must NOT be QuotaExhausted
         // and the retry_at bookkeeping must be cleared.
         assert_ne!(
-            daemon.backend_health.get("eng-recovered").copied(),
+            daemon.health.backend.get("eng-recovered").copied(),
             Some(BackendHealth::QuotaExhausted),
             "transition out of QuotaExhausted must be allowed once retry_at elapsed"
         );
         assert!(
-            !daemon.backend_quota_retry_at.contains_key("eng-recovered"),
+            !daemon.health.quota_retry_at.contains_key("eng-recovered"),
             "retry_at bookkeeping must be cleared after the deadline elapses"
         );
     }
@@ -1314,7 +1330,8 @@ mod tests {
 
         // Parked via cached health state.
         daemon
-            .backend_health
+            .health
+            .backend
             .insert("eng-quota".to_string(), BackendHealth::QuotaExhausted);
         // Parked via future retry_at even without cached state.
         let future = std::time::SystemTime::now()
@@ -1323,17 +1340,35 @@ mod tests {
             .as_secs()
             + 3600;
         daemon
-            .backend_quota_retry_at
+            .health
+            .quota_retry_at
             .insert("eng-retry".to_string(), future);
         // Third engineer: healthy with no retry_at.
         daemon
-            .backend_health
+            .health
+            .backend
             .insert("eng-healthy".to_string(), BackendHealth::Healthy);
 
-        assert!(daemon.member_backend_parked("eng-quota"));
-        assert!(daemon.member_backend_parked("eng-retry"));
-        assert!(!daemon.member_backend_parked("eng-healthy"));
-        assert!(!daemon.member_backend_parked("unknown-member"));
+        assert!(
+            daemon
+                .health
+                .member_backend_parked(&daemon.config.project_root, "eng-quota")
+        );
+        assert!(
+            daemon
+                .health
+                .member_backend_parked(&daemon.config.project_root, "eng-retry")
+        );
+        assert!(
+            !daemon
+                .health
+                .member_backend_parked(&daemon.config.project_root, "eng-healthy")
+        );
+        assert!(
+            !daemon
+                .health
+                .member_backend_parked(&daemon.config.project_root, "unknown-member")
+        );
     }
 
     #[test]
@@ -1346,10 +1381,10 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path())
             .members(vec![member])
             .build();
-        daemon.last_health_check = None;
+        daemon.health.last_health_check = None;
 
         daemon.check_backend_health().unwrap();
-        assert!(daemon.backend_health.contains_key("architect"));
+        assert!(daemon.health.backend.contains_key("architect"));
     }
 
     #[test]
@@ -2146,6 +2181,7 @@ mod tests {
         );
         inbox::deliver_to_inbox(&inbox_root, &stale).unwrap();
         daemon
+            .health
             .last_uncommitted_warn
             .insert("eng-clean".to_string(), Instant::now());
 
@@ -2157,7 +2193,10 @@ mod tests {
             "clean verification should clear stale pending commit reminders"
         );
         assert!(
-            !daemon.last_uncommitted_warn.contains_key("eng-clean"),
+            !daemon
+                .health
+                .last_uncommitted_warn
+                .contains_key("eng-clean"),
             "clean verification should clear the warning cooldown state"
         );
     }
@@ -2648,10 +2687,11 @@ mod tests {
         let key = worktree_recovery_backoff_key(eng_name, "root");
         assert!(!daemon.worktree_recovery_backed_off(&key));
         daemon
+            .scheduler
             .intervention_cooldowns
             .insert(key.clone(), Instant::now());
         assert!(daemon.worktree_recovery_backed_off(&key));
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             key.clone(),
             Instant::now() - WORKTREE_RECOVERY_BACKOFF - Duration::from_secs(1),
         );

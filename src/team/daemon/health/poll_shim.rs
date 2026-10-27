@@ -276,7 +276,7 @@ impl TeamDaemon {
             Event::Ready => {
                 let _ = append_shim_event_log(&self.config.project_root, member_name, "<- ready");
                 info!(member = member_name, "shim agent ready");
-                self.context_pressure_tracker.clear_member(member_name);
+                self.health.context_pressure.clear_member(member_name);
 
                 // Only preserve Working state if the *shim handle* was Working
                 // (meaning work was mid-flight when the SDK connection dropped).
@@ -309,7 +309,7 @@ impl TeamDaemon {
                 // the drain re-defers every message it just pulled out,
                 // and they rot until `expire_stale_pending_messages` fires
                 // (600s later) and kicks them to inbox fallback.
-                if self.pending_delivery_queue.contains_key(member_name) {
+                if self.delivery.pending_queue.contains_key(member_name) {
                     if let Err(error) = self.drain_pending_queue(member_name) {
                         warn!(
                             member = member_name,
@@ -343,7 +343,7 @@ impl TeamDaemon {
                 // was only done on Event::Ready and on force-idle timeout, so
                 // a shim that went Working→Idle naturally would leave its
                 // pending queue stuck until the 600s expiry fallback fired.
-                if to == ShimState::Idle && self.pending_delivery_queue.contains_key(member_name) {
+                if to == ShimState::Idle && self.delivery.pending_queue.contains_key(member_name) {
                     if let Err(error) = self.drain_pending_queue(member_name) {
                         warn!(
                             member = member_name,
@@ -368,15 +368,16 @@ impl TeamDaemon {
                     // Idle→Working transition does not get killed for
                     // lifetime-zero-output on a long-idle shim.
                     if member_state == MemberState::Working {
-                        self.working_since
+                        self.health
+                            .working_since
                             .entry(member_name.to_string())
                             .or_insert_with(Instant::now);
                     } else {
-                        self.working_since.remove(member_name);
+                        self.health.working_since.remove(member_name);
                     }
                 }
                 if member_state != MemberState::Working {
-                    self.context_pressure_tracker.mark_not_working(member_name);
+                    self.health.context_pressure.mark_not_working(member_name);
                 }
 
                 self.maybe_persist_member_session_id(member_name);
@@ -412,7 +413,7 @@ impl TeamDaemon {
                 if let Some(handle) = self.shim_handles.get_mut(member_name) {
                     handle.record_activity();
                 }
-                if let Some(pending) = self.pending_shim_acks.remove(&id) {
+                if let Some(pending) = self.delivery.pending_shim_acks.remove(&id) {
                     let inbox_root = inbox::inboxes_root(&self.config.project_root);
                     for message in pending.inbox_messages {
                         if let Err(error) =
@@ -486,7 +487,7 @@ impl TeamDaemon {
                     .iter()
                     .find(|member| member.name == member_name)
                     .is_some_and(|member| member.role_type == RoleType::Architect);
-                if is_architect && self.planning_cycle_active {
+                if is_architect && self.scheduler.planning_cycle_active {
                     if let Err(error) = self.handle_planning_response(&response) {
                         warn!(
                             member = member_name,
@@ -540,7 +541,10 @@ impl TeamDaemon {
                     member_name, exit_code, last_lines
                 ));
 
-                if self.member_backend_parked(member_name) {
+                if self
+                    .health
+                    .member_backend_parked(&self.config.project_root, member_name)
+                {
                     // Backend is parked (quota exhausted or auth required).
                     // Respawning the shim would just burn retries against the
                     // same non-recoverable condition, which is exactly the
@@ -757,7 +761,7 @@ impl TeamDaemon {
                         handle.apply_state_change(ShimState::Idle);
                     }
                 }
-                if let Some(pending) = self.pending_shim_acks.remove(&id) {
+                if let Some(pending) = self.delivery.pending_shim_acks.remove(&id) {
                     if pending.inbox_messages.is_empty() {
                         self.record_failed_delivery_with_id(
                             &pending.recipient,
@@ -804,7 +808,7 @@ impl TeamDaemon {
                         reason = reason.as_str(),
                         "backend quota exhausted — pausing agent"
                     );
-                    self.backend_health.insert(
+                    self.health.backend.insert(
                         member_name.to_string(),
                         crate::agent::BackendHealth::QuotaExhausted,
                     );
@@ -818,7 +822,7 @@ impl TeamDaemon {
                     return Ok(());
                 }
 
-                self.record_context_pressure_failure(member_name);
+                self.health.context_pressure.record_failure(member_name);
                 if self.should_cold_respawn_codex_member(member_name, &reason) {
                     self.record_member_crashed(member_name, true);
                     if let Err(error) =
@@ -851,7 +855,7 @@ impl TeamDaemon {
                     retry_at = label,
                     "backend quota blocked — pausing dispatch"
                 );
-                self.backend_health.insert(
+                self.health.backend.insert(
                     member_name.to_string(),
                     crate::agent::BackendHealth::QuotaExhausted,
                 );
@@ -860,7 +864,8 @@ impl TeamDaemon {
                 // parked until the quota window elapses (#674 defect 1).
                 // A successful poll_shim ping is NOT evidence of quota recovery.
                 if let Some(retry_at) = retry_at_epoch_secs {
-                    self.backend_quota_retry_at
+                    self.health
+                        .quota_retry_at
                         .insert(member_name.to_string(), retry_at);
                 }
                 self.record_orchestrator_action(format!(
@@ -873,7 +878,7 @@ impl TeamDaemon {
             }
 
             Event::ConfigurationRequired { message: _, code } => {
-                self.backend_health.insert(
+                self.health.backend.insert(
                     member_name.to_string(),
                     crate::agent::BackendHealth::ConfigurationRequired,
                 );
@@ -917,7 +922,7 @@ impl TeamDaemon {
                 // AuthRequired is non-recoverable without human action. Park
                 // the member and stop any respawn attempts until an operator
                 // resolves the credential and manually clears the state.
-                self.backend_health.insert(
+                self.health.backend.insert(
                     member_name.to_string(),
                     crate::agent::BackendHealth::AuthRequired,
                 );
@@ -1094,7 +1099,8 @@ impl TeamDaemon {
         }
 
         let queue = self
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry(member_name.to_string())
             .or_default();
         // Replay oldest first, ahead of anything already queued.
@@ -1287,11 +1293,11 @@ impl TeamDaemon {
             0
         };
         if branch_exists && commits_ahead > 0 {
-            self.clear_zero_diff_completion(task_id);
+            self.verification.clear_zero_diff_completion(task_id);
             return Ok(None);
         }
 
-        let count = self.note_zero_diff_completion(task_id);
+        let count = self.verification.note_zero_diff_completion(task_id);
         self.record_orchestrator_action(format!(
             "quality: {member_name} reported completion for task #{task_id} without an attributed engineer commit on {expected_branch} ahead of {base_branch} ({count}/{ZERO_DIFF_COMPLETION_RECOVERY_THRESHOLD})"
         ));
@@ -1308,7 +1314,7 @@ impl TeamDaemon {
             return Ok(());
         }
         if self.active_task_id(member_name) != Some(task_id) {
-            self.clear_zero_diff_completion(task_id);
+            self.verification.clear_zero_diff_completion(task_id);
             return Ok(());
         }
 
@@ -1352,7 +1358,7 @@ impl TeamDaemon {
         self.record_orchestrator_action(format!(
             "health: restarting {member_name} after {count} zero-attribution completions on task #{task_id}"
         ));
-        self.clear_zero_diff_completion(task_id);
+        self.verification.clear_zero_diff_completion(task_id);
         if self.shim_handles.contains_key(member_name) {
             self.handle_shim_cold_respawn(member_name, "zero_diff_completion_loop")?;
         }
@@ -1419,7 +1425,7 @@ impl TeamDaemon {
         // Clearing the working_since entry ensures the next legitimate
         // Idle→Working transition (re-delivered assignment) gets its
         // own fresh 10-minute zero-output grace window.
-        self.working_since.remove(member_name);
+        self.health.working_since.remove(member_name);
         self.emit_event(TeamEvent::pane_respawned(member_name));
         self.record_orchestrator_action(format!(
             "lifecycle: downgraded warm resume to {} for {} after {}",
@@ -1593,9 +1599,8 @@ impl TeamDaemon {
             if is_claude_agent_type(&agent_type) {
                 let cooldown_key = format!("stale-claude-respawn::{name}");
                 let on_cooldown = self
-                    .intervention_cooldowns
-                    .get(&cooldown_key)
-                    .is_some_and(|last| last.elapsed() < CONTEXT_RESTART_COOLDOWN);
+                    .scheduler
+                    .cooldown_active(&cooldown_key, CONTEXT_RESTART_COOLDOWN);
                 if on_cooldown {
                     continue;
                 }
@@ -1621,7 +1626,8 @@ impl TeamDaemon {
 
                 match self.handle_shim_cold_respawn(&name, "stale_claude_agent") {
                     Ok(()) => {
-                        self.intervention_cooldowns
+                        self.scheduler
+                            .intervention_cooldowns
                             .insert(cooldown_key, std::time::Instant::now());
                         continue;
                     }
@@ -1661,7 +1667,7 @@ impl TeamDaemon {
             self.update_automation_timers_for_state(&name, MemberState::Idle);
 
             // Drain any pending messages that were stuck waiting
-            if self.pending_delivery_queue.contains_key(&name) {
+            if self.delivery.pending_queue.contains_key(&name) {
                 if let Err(error) = self.drain_pending_queue(&name) {
                     warn!(
                         member = name.as_str(),
@@ -1694,9 +1700,8 @@ impl TeamDaemon {
         // time the daemon drops the old handle) — #634.
         let restart_cooldown_key = format!("stall-restart::{name}");
         if self
-            .intervention_cooldowns
-            .get(&restart_cooldown_key)
-            .is_some_and(|last| last.elapsed() < CONTEXT_RESTART_COOLDOWN)
+            .scheduler
+            .cooldown_active(&restart_cooldown_key, CONTEXT_RESTART_COOLDOWN)
         {
             debug!(
                 member = name,
@@ -1755,15 +1760,15 @@ impl TeamDaemon {
         if prior_restarts >= max_restarts && escalation_target.is_some() {
             let escalation_key = format!("stall-escalation::{name}");
             let on_cooldown = self
-                .intervention_cooldowns
-                .get(&escalation_key)
-                .is_some_and(|last| last.elapsed() < CONTEXT_RESTART_COOLDOWN);
+                .scheduler
+                .cooldown_active(&escalation_key, CONTEXT_RESTART_COOLDOWN);
             if on_cooldown {
                 return Ok(());
             }
 
             self.handle_shim_cold_respawn(name, &event_reason)?;
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(escalation_key, std::time::Instant::now());
 
             if let Some(manager) = escalation_target
@@ -1794,7 +1799,8 @@ impl TeamDaemon {
         }
 
         self.handle_shim_cold_respawn(name, &event_reason)?;
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(format!("stall-restart::{name}"), std::time::Instant::now());
         self.record_agent_restarted(name, supervisory_task, &event_reason, restart_count);
         Ok(())
@@ -1939,7 +1945,7 @@ mod tests {
         let inbox_msg = inbox::InboxMessage::new_send("manager", "eng-1", "test assignment");
         let inbox_id = inbox::deliver_to_inbox(&inbox_root, &inbox_msg).unwrap();
         let message_id = "shim-msg-1".to_string();
-        daemon.pending_shim_acks.insert(
+        daemon.delivery.pending_shim_acks.insert(
             message_id.clone(),
             crate::team::daemon::PendingShimAck {
                 recipient: "eng-1".to_string(),
@@ -1963,7 +1969,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!daemon.pending_shim_acks.contains_key(&message_id));
+        assert!(!daemon.delivery.pending_shim_acks.contains_key(&message_id));
         let pending = inbox::pending_messages(&inbox_root, "eng-1").unwrap();
         assert!(
             pending.is_empty(),
@@ -1988,7 +1994,7 @@ mod tests {
         let inbox_msg = inbox::InboxMessage::new_send("manager", "eng-1", "test assignment");
         let inbox_id = inbox::deliver_to_inbox(&inbox_root, &inbox_msg).unwrap();
         let message_id = "shim-msg-2".to_string();
-        daemon.pending_shim_acks.insert(
+        daemon.delivery.pending_shim_acks.insert(
             message_id.clone(),
             crate::team::daemon::PendingShimAck {
                 recipient: "eng-1".to_string(),
@@ -2024,7 +2030,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!daemon.pending_shim_acks.contains_key(&message_id));
+        assert!(!daemon.delivery.pending_shim_acks.contains_key(&message_id));
         let pending = inbox::pending_messages(&inbox_root, "eng-1").unwrap();
         assert_eq!(
             pending.len(),
@@ -2056,7 +2062,8 @@ mod tests {
             .apply_state_change(ShimState::Starting);
 
         daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("eng-1".to_string())
             .or_default()
             .push(crate::team::delivery::PendingMessage {
@@ -2073,7 +2080,8 @@ mod tests {
         assert!(daemon.shim_handles["eng-1"].is_ready());
         assert!(
             daemon
-                .pending_delivery_queue
+                .delivery
+                .pending_queue
                 .get("eng-1")
                 .map(|q| q.is_empty())
                 .unwrap_or(true),
@@ -2134,6 +2142,7 @@ mod tests {
         // Transitioned to Working ~8 seconds ago — way below the 600s
         // threshold.
         daemon
+            .health
             .working_since
             .insert("priya".into(), Instant::now() - Duration::from_secs(8));
 
@@ -2148,7 +2157,7 @@ mod tests {
             "fresh-Working agent must not be killed for lifetime zero output"
         );
         assert!(
-            daemon.working_since.contains_key("priya"),
+            daemon.health.working_since.contains_key("priya"),
             "working_since must be preserved on skip path"
         );
     }
@@ -2163,6 +2172,7 @@ mod tests {
         insert_mock_handle(&mut daemon, "priya");
         daemon.states.insert("priya".into(), MemberState::Working);
         daemon
+            .health
             .working_since
             .insert("priya".into(), Instant::now() - Duration::from_secs(601));
 
@@ -2190,7 +2200,7 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
         insert_mock_handle(&mut daemon, "eng-1");
 
-        assert!(!daemon.working_since.contains_key("eng-1"));
+        assert!(!daemon.health.working_since.contains_key("eng-1"));
 
         daemon
             .handle_shim_event(
@@ -2203,7 +2213,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            daemon.working_since.contains_key("eng-1"),
+            daemon.health.working_since.contains_key("eng-1"),
             "Idle→Working must seed working_since"
         );
 
@@ -2218,7 +2228,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !daemon.working_since.contains_key("eng-1"),
+            !daemon.health.working_since.contains_key("eng-1"),
             "Working→Idle must clear working_since"
         );
     }
@@ -2383,6 +2393,7 @@ mod tests {
 
         assert!(
             !daemon
+                .scheduler
                 .intervention_cooldowns
                 .contains_key(&TeamDaemon::context_restart_cooldown_key("eng-1")),
             "first proactive warning should not restart immediately"
@@ -2392,7 +2403,7 @@ mod tests {
             "warning path should not force the shim into a terminal state"
         );
 
-        let messages = daemon.pending_delivery_queue.get("eng-1").unwrap();
+        let messages = daemon.delivery.pending_queue.get("eng-1").unwrap();
         assert!(
             messages
                 .iter()
@@ -2427,6 +2438,7 @@ mod tests {
 
         assert!(
             !daemon
+                .scheduler
                 .intervention_cooldowns
                 .contains_key(&TeamDaemon::context_restart_cooldown_key("eng-1")),
             "legacy approaching path should not restart immediately"
@@ -2436,7 +2448,7 @@ mod tests {
             "legacy approaching path should not force the shim into a terminal state"
         );
 
-        let messages = daemon.pending_delivery_queue.get("eng-1").unwrap();
+        let messages = daemon.delivery.pending_queue.get("eng-1").unwrap();
         assert!(
             messages
                 .iter()
@@ -2525,7 +2537,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            daemon.context_pressure_tracker.shim_failure_count("eng-1"),
+            daemon.health.context_pressure.shim_failure_count("eng-1"),
             3
         );
     }
@@ -2658,6 +2670,7 @@ mod tests {
         assert_eq!(daemon.shim_handles["eng-1"].state, ShimState::Starting);
         assert!(
             daemon
+                .scheduler
                 .intervention_cooldowns
                 .contains_key("stale-claude-respawn::eng-1")
         );
@@ -2725,11 +2738,12 @@ mod tests {
             assert_eq!(daemon.shim_handles[member_name].state, ShimState::Starting);
             assert!(
                 daemon
+                    .scheduler
                     .intervention_cooldowns
                     .contains_key(&format!("stall-restart::{member_name}"))
             );
             assert!(
-                !daemon.pending_delivery_queue.contains_key(member_name),
+                !daemon.delivery.pending_queue.contains_key(member_name),
                 "supervisory recovery chatter should stay out of {member_name}'s pending PTY queue"
             );
             assert!(
@@ -2792,7 +2806,7 @@ mod tests {
             .unwrap();
 
         assert!(requeued);
-        let queue = daemon.pending_delivery_queue.get("manager").unwrap();
+        let queue = daemon.delivery.pending_queue.get("manager").unwrap();
         let bodies: Vec<_> = queue.iter().map(|m| m.body.as_str()).collect();
         assert_eq!(bodies, ["first", "second"]);
         assert!(previous.in_flight_messages.is_empty());
@@ -2843,7 +2857,8 @@ mod tests {
         daemon.check_working_state_timeouts().unwrap();
 
         let queue = daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .get("manager")
             .expect("supervisory in-flight message should be requeued");
         assert_eq!(queue.len(), 1);
@@ -2955,6 +2970,7 @@ mod tests {
         assert_eq!(daemon.shim_handles["manager"].state, ShimState::Starting);
         assert!(
             daemon
+                .scheduler
                 .intervention_cooldowns
                 .contains_key("stall-escalation::manager")
         );
@@ -3027,7 +3043,7 @@ mod tests {
 
         // Seed a recent stall-restart cooldown so the next stall
         // check should NOT escalate into another respawn.
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             "stall-restart::manager".to_string(),
             std::time::Instant::now(),
         );
@@ -3148,7 +3164,8 @@ mod tests {
 
         // Queue a pending message
         daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("eng-1".to_string())
             .or_default()
             .push(crate::team::delivery::PendingMessage {
@@ -3162,7 +3179,7 @@ mod tests {
 
         // Pending queue should have been drained
         assert!(
-            !daemon.pending_delivery_queue.contains_key("eng-1"),
+            !daemon.delivery.pending_queue.contains_key("eng-1"),
             "pending queue should be drained after working-state timeout"
         );
     }
@@ -3326,10 +3343,14 @@ mod tests {
         assert!(value.contains("backend configuration requires repair"));
         assert!(!value.contains("private provider detail"));
         assert_eq!(
-            daemon.backend_health.get("lead"),
+            daemon.health.backend.get("lead"),
             Some(&crate::agent::BackendHealth::ConfigurationRequired)
         );
-        assert!(daemon.member_backend_parked("lead"));
+        assert!(
+            daemon
+                .health
+                .member_backend_parked(&daemon.config.project_root, "lead")
+        );
         assert!(
             !crate::team::bench::benched_engineer_names(tmp.path())
                 .unwrap()

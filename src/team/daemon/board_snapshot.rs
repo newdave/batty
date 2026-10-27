@@ -2,9 +2,14 @@
 //!
 //! Parsing every task file is expensive and many automation steps need the
 //! same data in the same tick. `board_tasks` reuses one parse until something
-//! changes: either a daemon board write dropped it (`note_board_write`), or the
-//! tasks directory fingerprint (names, sizes, mtimes) differs. When in doubt
-//! it reloads.
+//! changes: either a board write bumped the directory's write generation
+//! (`note_board_write`), or the tasks directory fingerprint (names, sizes,
+//! mtimes) differs. When in doubt it reloads.
+//!
+//! The snapshot itself is owned by the daemon. Board writers that run outside
+//! the daemon (`board_write`, kanban-md wrappers) only know the tasks
+//! directory, so they bump a process-wide per-directory generation counter
+//! that the daemon compares against the generation recorded at load time.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,14 +21,24 @@ use anyhow::Result;
 use super::TeamDaemon;
 use crate::task::Task;
 
-/// Snapshots keyed by tasks dir, so `TeamDaemon` needs no extra field and
-/// concurrent daemons (tests) never share state.
-fn snapshots() -> std::sync::MutexGuard<'static, HashMap<PathBuf, BoardSnapshot>> {
-    static SNAPSHOTS: OnceLock<Mutex<HashMap<PathBuf, BoardSnapshot>>> = OnceLock::new();
-    SNAPSHOTS
+/// Board write generations keyed by (canonical, when possible) tasks dir.
+fn generations() -> std::sync::MutexGuard<'static, HashMap<PathBuf, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    GENERATIONS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+}
+
+fn generation_key(tasks_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(tasks_dir).unwrap_or_else(|_| tasks_dir.to_path_buf())
+}
+
+fn write_generation(tasks_dir: &Path) -> u64 {
+    generations()
+        .get(&generation_key(tasks_dir))
+        .copied()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -33,15 +48,13 @@ thread_local! {
 }
 
 /// Record that a board write happened under `tasks_dir` (or a subprocess
-/// that may have changed it ran): drops every cached snapshot for that board.
+/// that may have changed it ran): every daemon snapshot of that board is
+/// treated as stale on its next use.
 pub(crate) fn note_board_write(tasks_dir: &Path) {
-    let canonical = std::fs::canonicalize(tasks_dir).ok();
-    snapshots().retain(|key, _| {
-        key != tasks_dir
-            && !canonical.as_ref().is_some_and(|canonical| {
-                std::fs::canonicalize(key).ok().as_ref() == Some(canonical)
-            })
-    });
+    let key = generation_key(tasks_dir);
+    let mut generations = generations();
+    let generation = generations.entry(key).or_insert(0);
+    *generation = generation.wrapping_add(1);
 }
 
 type Fingerprint = (
@@ -62,41 +75,66 @@ fn fingerprint(dir: &Path) -> Option<Fingerprint> {
 }
 
 struct BoardSnapshot {
+    tasks_dir: PathBuf,
     tasks: Arc<Vec<Task>>,
     fingerprint: Option<Fingerprint>,
+    /// `write_generation(tasks_dir)` observed before the parse started.
+    generation: u64,
     #[allow(dead_code)]
     loaded_at: Instant,
+}
+
+/// The daemon's cached board parse; empty until the first `board_tasks` call.
+#[derive(Default)]
+pub(in crate::team) struct BoardSnapshotCache {
+    snapshot: Option<BoardSnapshot>,
+}
+
+impl BoardSnapshotCache {
+    /// Parsed tasks under `tasks_dir`, reusing the cached parse while the
+    /// directory fingerprint and write generation are unchanged.
+    fn tasks(&mut self, tasks_dir: PathBuf) -> Result<Arc<Vec<Task>>> {
+        let current = fingerprint(&tasks_dir);
+        let generation = write_generation(&tasks_dir);
+        if let Some(snapshot) = &self.snapshot
+            && snapshot.tasks_dir == tasks_dir
+            && snapshot.generation == generation
+            && current.is_some()
+            && snapshot.fingerprint == current
+        {
+            return Ok(Arc::clone(&snapshot.tasks));
+        }
+        self.snapshot = None;
+        #[cfg(test)]
+        SNAPSHOT_LOADS.with(|count| count.set(count.get() + 1));
+        let tasks = Arc::new(crate::task::load_tasks_from_dir(&tasks_dir)?);
+        // Fingerprint after loading so frontmatter repairs made during the
+        // parse do not invalidate the snapshot on the next call.
+        self.snapshot = Some(BoardSnapshot {
+            fingerprint: fingerprint(&tasks_dir),
+            tasks_dir,
+            tasks: Arc::clone(&tasks),
+            generation,
+            loaded_at: Instant::now(),
+        });
+        Ok(tasks)
+    }
+
+    /// Drop the cached snapshot; the next `tasks` call reparses.
+    fn invalidate(&mut self) {
+        self.snapshot = None;
+    }
 }
 
 impl TeamDaemon {
     /// Parsed board tasks, reusing the cached snapshot while it is valid.
     pub(super) fn board_tasks(&mut self) -> Result<Arc<Vec<Task>>> {
         let tasks_dir = self.board_dir().join("tasks");
-        let current = fingerprint(&tasks_dir);
-        if let Some(snapshot) = snapshots().get(&tasks_dir)
-            && current.is_some()
-            && snapshot.fingerprint == current
-        {
-            return Ok(Arc::clone(&snapshot.tasks));
-        }
-        snapshots().remove(&tasks_dir);
-        #[cfg(test)]
-        SNAPSHOT_LOADS.with(|count| count.set(count.get() + 1));
-        let tasks = Arc::new(crate::task::load_tasks_from_dir(&tasks_dir)?);
-        // Fingerprint after loading so frontmatter repairs made during the
-        // parse do not invalidate the snapshot on the next call.
-        let snapshot = BoardSnapshot {
-            tasks: Arc::clone(&tasks),
-            fingerprint: fingerprint(&tasks_dir),
-            loaded_at: Instant::now(),
-        };
-        snapshots().insert(tasks_dir, snapshot);
-        Ok(tasks)
+        self.board_snapshot.tasks(tasks_dir)
     }
 
     /// Drop the cached snapshot; the next `board_tasks` call reparses.
-    pub(super) fn invalidate_board_snapshot(&self) {
-        let tasks_dir = self.board_dir().join("tasks");
-        snapshots().remove(&tasks_dir);
+    pub(super) fn invalidate_board_snapshot(&mut self) {
+        self.board_snapshot.invalidate();
     }
 }

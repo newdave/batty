@@ -421,10 +421,10 @@ impl TeamDaemon {
                 watchers: &daemon.watchers,
                 states: &daemon.states,
                 pane_map: &daemon.config.pane_map,
-                telegram_bot: daemon.telegram_bot.as_ref(),
-                paused_standups: &daemon.paused_standups,
-                last_standup: &mut daemon.last_standup,
-                backend_health: &daemon.backend_health,
+                telegram_bot: daemon.integrations.telegram_bot.as_ref(),
+                paused_standups: &daemon.scheduler.paused_standups,
+                last_standup: &mut daemon.scheduler.last_standup,
+                backend_health: &daemon.health.backend,
             })?;
             for recipient in generated {
                 daemon.record_standup_generated(&recipient);
@@ -447,9 +447,9 @@ impl TeamDaemon {
             members: &self.config.members,
             pane_map: &self.config.pane_map,
             states: &self.states,
-            nudges: &self.nudges,
-            last_standup: &self.last_standup,
-            paused_standups: &self.paused_standups,
+            nudges: &self.interventions.nudges,
+            last_standup: &self.scheduler.last_standup,
+            paused_standups: &self.scheduler.paused_standups,
             standup_interval_for_member: |member_name| {
                 standup::standup_interval_for_member_name(
                     &self.config.team_config,

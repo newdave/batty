@@ -601,7 +601,12 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         return Ok(());
     };
 
-    if let Some(running) = daemon.background_tests.verification.get(engineer) {
+    if let Some(running) = daemon
+        .verification
+        .background_tests
+        .verification
+        .get(engineer)
+    {
         if running.task_id() == task_id {
             info!(
                 engineer,
@@ -616,7 +621,11 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
             "cancelling verification for a task the engineer no longer owns"
         );
         running.kill();
-        daemon.background_tests.verification.remove(engineer);
+        daemon
+            .verification
+            .background_tests
+            .verification
+            .remove(engineer);
     }
 
     if !daemon.member_uses_worktrees(engineer) {
@@ -634,8 +643,11 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
             "ignoring completion: task is already terminal; clearing stale assignment"
         );
         daemon.retry_counts.remove(engineer);
-        daemon.verification_states.remove(engineer);
-        daemon.narration_rejection_counts.remove(&task_id);
+        daemon.verification.engineers.remove(engineer);
+        daemon
+            .verification
+            .narration_rejection_counts
+            .remove(&task_id);
         daemon.clear_active_task(engineer);
         daemon.set_member_idle(engineer);
         return Ok(());
@@ -684,7 +696,8 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
             .clone()
     });
     let mut verification_state = daemon
-        .verification_states
+        .verification
+        .engineers
         .remove(engineer)
         .unwrap_or_else(|| VerificationState::new(verification_policy.max_iterations));
     verification_state.max_iterations =
@@ -894,6 +907,7 @@ fn start_verification_job(
         )
     });
     daemon
+        .verification
         .background_tests
         .verification
         .insert(engineer.to_string(), VerificationJob { ctx, job });
@@ -907,6 +921,7 @@ pub(crate) fn poll_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> {
         String,
         Result<crate::team::daemon::verification::VerificationRunResult>,
     )> = daemon
+        .verification
         .background_tests
         .verification
         .iter()
@@ -914,7 +929,12 @@ pub(crate) fn poll_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> {
         .collect();
     let mut first_error = None;
     for (engineer, result) in finished {
-        let Some(job) = daemon.background_tests.verification.remove(&engineer) else {
+        let Some(job) = daemon
+            .verification
+            .background_tests
+            .verification
+            .remove(&engineer)
+        else {
             continue;
         };
         if let Err(error) = apply_verification_result(daemon, &engineer, job, result) {
@@ -957,7 +977,8 @@ fn apply_verification_result(
             ctx.verification_state.iteration = ctx.verification_state.iteration.saturating_sub(1);
         }
         daemon
-            .verification_states
+            .verification
+            .engineers
             .insert(engineer.to_string(), ctx.verification_state);
         return handle_engineer_completion(daemon, engineer);
     }
@@ -1064,7 +1085,7 @@ fn finish_engineer_completion(
                 ),
             )?;
         }
-        daemon.verification_states.remove(engineer);
+        daemon.verification.engineers.remove(engineer);
         return Ok(());
     }
 
@@ -1100,6 +1121,7 @@ fn finish_engineer_completion(
         let narration_count = if is_narration_only {
             let count = {
                 let entry = daemon
+                    .verification
                     .narration_rejection_counts
                     .entry(task_id)
                     .or_insert(0);
@@ -1318,20 +1340,27 @@ fn finish_engineer_completion(
                 ),
             }
             daemon.retry_counts.remove(engineer);
-            daemon.verification_states.remove(engineer);
+            daemon.verification.engineers.remove(engineer);
             daemon.clear_active_task(engineer);
             daemon.set_member_idle(engineer);
-            daemon.narration_rejection_counts.remove(&task_id);
+            daemon
+                .verification
+                .narration_rejection_counts
+                .remove(&task_id);
             return Ok(());
         }
 
         daemon
-            .verification_states
+            .verification
+            .engineers
             .insert(engineer.to_string(), verification_state);
         return Ok(());
     }
 
-    daemon.narration_rejection_counts.remove(&task_id);
+    daemon
+        .verification
+        .narration_rejection_counts
+        .remove(&task_id);
     transition_verification_phase(
         daemon,
         engineer,
@@ -1347,7 +1376,7 @@ fn finish_engineer_completion(
         &verification_state,
         &verification_run,
     )?;
-    daemon.verification_states.remove(engineer);
+    daemon.verification.engineers.remove(engineer);
 
     let task_branch = if daemon.is_multi_repo {
         multi_repo_task_branch(&worktree_dir, &daemon.sub_repo_names, &trunk_branch)?
@@ -1380,7 +1409,9 @@ fn finish_engineer_completion(
 
         // --- Confidence scoring (always runs for observability) ---
         let policy = daemon.config.team_config.workflow_policy.auto_merge.clone();
-        let auto_merge_override = daemon.auto_merge_override(task_id);
+        let auto_merge_override = daemon
+            .merge
+            .auto_merge_override(&daemon.config.project_root, task_id);
 
         // Analyze diff and emit confidence score for every completed task
         let diff_analysis = analyze_completion_diff(
@@ -1790,8 +1821,9 @@ fn finish_engineer_completion(
     }
 
     let escalation_key = format!("tests_failed_{task_id}_{engineer}");
-    let suppress_duplicate_escalation =
-        daemon.suppress_recent_escalation(escalation_key, Duration::from_secs(600));
+    let suppress_duplicate_escalation = daemon
+        .scheduler
+        .suppress_recent_escalation(escalation_key, Duration::from_secs(600));
 
     if let Some(ref manager_name) = manager_name
         && !suppress_duplicate_escalation
@@ -2335,7 +2367,7 @@ pub(crate) fn wait_for_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> 
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         poll_verification_jobs(daemon)?;
-        if daemon.background_tests.verification.is_empty() {
+        if daemon.verification.background_tests.verification.is_empty() {
             return Ok(());
         }
         assert!(
@@ -2910,7 +2942,7 @@ mod tests {
             Some(MemberState::Working)
         );
 
-        let verification_state = daemon.verification_states.get("eng-1").unwrap();
+        let verification_state = daemon.verification.engineers.get("eng-1").unwrap();
         assert_eq!(verification_state.phase, VerificationPhase::Fixing);
         assert_eq!(verification_state.iteration, 1);
         assert!(!verification_state.last_test_passed);
@@ -3039,7 +3071,7 @@ mod tests {
         handle_engineer_completion_and_wait(&mut daemon, engineer).unwrap();
 
         assert_eq!(daemon.active_task_id(engineer), Some(task_id));
-        assert!(!daemon.verification_states.contains_key(engineer));
+        assert!(!daemon.verification.engineers.contains_key(engineer));
         assert_eq!(
             current_worktree_branch(&worktree_dir).unwrap(),
             "eng-1-3/736"
@@ -3204,7 +3236,7 @@ mod tests {
             daemon.member_state_for_test("eng-1"),
             Some(MemberState::Idle)
         );
-        assert!(!daemon.verification_states.contains_key("eng-1"));
+        assert!(!daemon.verification.engineers.contains_key("eng-1"));
 
         let engineer_messages =
             inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1").unwrap();
@@ -3381,7 +3413,7 @@ mod tests {
             "verification never escalated"
         );
         assert_eq!(escalations(&team_config_dir), 1);
-        assert!(!daemon.verification_states.contains_key("eng-1"));
+        assert!(!daemon.verification.engineers.contains_key("eng-1"));
         // Backlog -> blocked is illegal; escalation must route via todo.
         let task =
             crate::task::Task::from_file(&team_config_dir.join("board/tasks/042-backlog-loop.md"))
@@ -3673,7 +3705,7 @@ mod tests {
         // narration).
         handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
         assert_eq!(
-            daemon.narration_rejection_counts.get(&77),
+            daemon.verification.narration_rejection_counts.get(&77),
             None,
             "zero-commit rejection must not bump the narration counter"
         );
@@ -3687,7 +3719,7 @@ mod tests {
         );
         handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
         assert_eq!(
-            daemon.narration_rejection_counts.get(&77),
+            daemon.verification.narration_rejection_counts.get(&77),
             Some(&1),
             "first narration rejection should record count=1"
         );
@@ -3703,7 +3735,10 @@ mod tests {
         // After escalation, the counter must be cleared so a future
         // reassignment starts fresh.
         assert!(
-            !daemon.narration_rejection_counts.contains_key(&77),
+            !daemon
+                .verification
+                .narration_rejection_counts
+                .contains_key(&77),
             "escalation should clear the narration counter for the task"
         );
 
@@ -3741,14 +3776,25 @@ mod tests {
         let mut daemon = setup_completion_daemon(&repo, "eng-1");
         daemon.set_active_task_for_test("eng-1", 42);
         handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
-        assert_eq!(daemon.narration_rejection_counts.get(&42), Some(&1));
+        assert_eq!(
+            daemon.verification.narration_rejection_counts.get(&42),
+            Some(&1)
+        );
 
         daemon.clear_active_task("eng-1");
-        assert!(!daemon.narration_rejection_counts.contains_key(&42));
+        assert!(
+            !daemon
+                .verification
+                .narration_rejection_counts
+                .contains_key(&42)
+        );
 
         daemon.set_active_task_for_test("eng-1", 43);
         handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
-        assert_eq!(daemon.narration_rejection_counts.get(&43), Some(&1));
+        assert_eq!(
+            daemon.verification.narration_rejection_counts.get(&43),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -4234,6 +4280,7 @@ mod tests {
         daemon.set_active_task_for_test("eng-1", 42);
         daemon.set_member_state_for_test("eng-1", MemberState::Working);
         daemon
+            .scheduler
             .recent_escalations
             .insert("tests_failed_42_eng-1".to_string(), Instant::now());
 
@@ -4765,7 +4812,7 @@ mod tests {
             ..AutoMergePolicy::default()
         };
         let mut daemon = auto_merge_daemon(&repo, policy);
-        daemon.set_auto_merge_override(42, false); // Force manual review
+        daemon.merge.set_auto_merge_override(42, false); // Force manual review
 
         handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
 
@@ -4886,7 +4933,13 @@ mod tests {
         ));
 
         handle_engineer_completion(&mut daemon, "eng-1").unwrap();
-        assert!(daemon.background_tests.verification.contains_key("eng-1"));
+        assert!(
+            daemon
+                .verification
+                .background_tests
+                .verification
+                .contains_key("eng-1")
+        );
 
         // A poll while the command is blocked finds the job still running and
         // changes nothing.
@@ -4914,7 +4967,7 @@ mod tests {
         handle_engineer_completion(&mut daemon, "eng-1").unwrap();
         handle_engineer_completion(&mut daemon, "eng-1").unwrap();
         handle_engineer_completion(&mut daemon, "eng-1").unwrap();
-        assert_eq!(daemon.background_tests.verification.len(), 1);
+        assert_eq!(daemon.verification.background_tests.verification.len(), 1);
 
         wait_for_verification_jobs(&mut daemon).unwrap();
         let runs = std::fs::read_to_string(&counter).unwrap();
@@ -4945,9 +4998,15 @@ mod tests {
         let (_tmp, _repo, mut daemon) = setup_background_verification("sleep 30; exit 0");
 
         handle_engineer_completion(&mut daemon, "eng-1").unwrap();
-        assert!(daemon.background_tests.verification.contains_key("eng-1"));
+        assert!(
+            daemon
+                .verification
+                .background_tests
+                .verification
+                .contains_key("eng-1")
+        );
         daemon.clear_active_task("eng-1");
-        assert!(daemon.background_tests.verification.is_empty());
+        assert!(daemon.verification.background_tests.verification.is_empty());
     }
 
     #[test]
@@ -4963,14 +5022,18 @@ mod tests {
         // Give the worker time to spawn the command before killing it.
         std::thread::sleep(Duration::from_millis(300));
         daemon.stop_background_tests();
-        assert!(daemon.background_tests.verification.is_empty());
+        assert!(daemon.verification.background_tests.verification.is_empty());
         assert_eq!(
-            daemon.background_tests.retriggers.get("eng-1"),
+            daemon.verification.background_tests.retriggers.get("eng-1"),
             Some(&42),
             "interrupted verification must be remembered"
         );
         assert_eq!(
-            daemon.background_tests.pending_verifications().get("eng-1"),
+            daemon
+                .verification
+                .background_tests
+                .pending_verifications()
+                .get("eng-1"),
             Some(&42),
             "interrupted verification must be persisted"
         );
@@ -4982,8 +5045,14 @@ mod tests {
 
         // The next poll re-runs the interrupted verification.
         daemon.poll_background_tests().unwrap();
-        assert!(daemon.background_tests.retriggers.is_empty());
-        assert!(daemon.background_tests.verification.contains_key("eng-1"));
+        assert!(daemon.verification.background_tests.retriggers.is_empty());
+        assert!(
+            daemon
+                .verification
+                .background_tests
+                .verification
+                .contains_key("eng-1")
+        );
         wait_for_verification_jobs(&mut daemon).unwrap();
         assert!(marker.exists());
         assert!(verification_snapshot_path(&repo, 42, "eng-1", 1).exists());

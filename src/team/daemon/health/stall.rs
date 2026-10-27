@@ -582,11 +582,7 @@ impl TeamDaemon {
                 .automation
                 .intervention_cooldown_secs,
         );
-        if self
-            .intervention_cooldowns
-            .get(&cooldown_key)
-            .is_some_and(|last| last.elapsed() < cooldown)
-        {
+        if self.scheduler.cooldown_active(&cooldown_key, cooldown) {
             return;
         }
         let observed_stall_secs = self
@@ -619,7 +615,8 @@ impl TeamDaemon {
             "stall: detected {}",
             self.format_supervisory_stall_summary(member_name, observed_stall_secs, &signal)
         ));
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(cooldown_key, Instant::now());
     }
 
@@ -643,9 +640,8 @@ impl TeamDaemon {
 
         let stall_cooldown_key = format!("stall-restart::{member_name}");
         let on_cooldown = self
-            .intervention_cooldowns
-            .get(&stall_cooldown_key)
-            .is_some_and(|last| last.elapsed() < CONTEXT_RESTART_COOLDOWN);
+            .scheduler
+            .cooldown_active(&stall_cooldown_key, CONTEXT_RESTART_COOLDOWN);
         if on_cooldown {
             return Ok(());
         }
@@ -676,14 +672,14 @@ impl TeamDaemon {
             // Escalate to manager instead of restarting again.
             let escalation_key = format!("stall-escalation::{member_name}");
             let escalation_on_cooldown = self
-                .intervention_cooldowns
-                .get(&escalation_key)
-                .is_some_and(|last| last.elapsed() < CONTEXT_RESTART_COOLDOWN);
+                .scheduler
+                .cooldown_active(&escalation_key, CONTEXT_RESTART_COOLDOWN);
             if escalation_on_cooldown {
                 return Ok(());
             }
             self.escalate_stalled_agent(&member, &task, prior_restarts + 1)?;
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(escalation_key, Instant::now());
             return Ok(());
         }
@@ -720,7 +716,8 @@ impl TeamDaemon {
             "stall: relaunched {} on task #{} after {}s stall",
             member_name, task.id, stall_secs,
         ));
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(stall_cooldown_key, Instant::now());
         self.record_agent_restarted(member_name, task_id_str, "stalled", prior_restarts + 1);
         Ok(())
@@ -1368,6 +1365,7 @@ mod tests {
         write_owned_task_file(tmp.path(), 77, "cooldown-task", "in-progress", member_name);
 
         daemon
+            .scheduler
             .intervention_cooldowns
             .insert(format!("stall-restart::{member_name}"), Instant::now());
 
@@ -1424,6 +1422,7 @@ mod tests {
             .build();
         daemon.active_tasks.insert(member_name.to_string(), 42);
         daemon
+            .scheduler
             .intervention_cooldowns
             .insert(format!("stall-restart::{member_name}"), Instant::now());
 

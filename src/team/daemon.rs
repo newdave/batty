@@ -33,7 +33,7 @@ use super::comms::{self, Channel};
 #[cfg(test)]
 use super::config::OrchestratorPosition;
 use super::config::{RoleType, TeamConfig};
-use super::delivery::{FailedDelivery, PendingMessage};
+use super::delivery::PendingMessage;
 use super::events::EventSink;
 use super::events::TeamEvent;
 use super::failure_patterns::FailureTracker;
@@ -51,11 +51,11 @@ use super::task_loop::{
     branch_is_merged_into, current_worktree_branch, engineer_base_branch_name,
     setup_engineer_worktree_from_trunk,
 };
-use super::verification::VerificationState;
 use super::watcher::{SessionWatcher, WatcherState};
 use super::{AssignmentDeliveryResult, AssignmentResultStatus, now_unix, store_assignment_result};
 use crate::agent::{self, BackendHealth};
 use crate::tmux;
+#[cfg(test)]
 use dispatch::DispatchQueueEntry;
 
 const STALLED_MID_TURN_MARKER: &str = "stalled mid-turn";
@@ -80,24 +80,30 @@ mod board_snapshot_tests;
 mod config_reload;
 #[path = "daemon/deferred.rs"]
 mod deferred;
+mod delivery_state;
 #[path = "discord_bridge.rs"]
 mod discord_bridge;
 #[path = "dispatch/mod.rs"]
 pub(crate) mod dispatch;
+mod dispatch_state;
 #[path = "daemon/error_handling.rs"]
 mod error_handling;
 #[path = "daemon/health/mod.rs"]
 pub(crate) mod health;
+mod health_state;
 #[path = "daemon/helpers.rs"]
 mod helpers;
 #[path = "daemon/hot_reload.rs"]
 mod hot_reload;
+mod integrations;
+mod intervention_state;
 #[path = "daemon/interventions/mod.rs"]
 mod interventions;
 #[path = "launcher.rs"]
 mod launcher;
 #[path = "daemon/merge_queue.rs"]
 mod merge_queue;
+mod merge_state;
 #[path = "daemon/poll.rs"]
 mod poll;
 #[path = "daemon/reconcile.rs"]
@@ -105,6 +111,7 @@ mod reconcile;
 #[cfg(any(test, feature = "scenario-test"))]
 #[path = "daemon/scenario_api.rs"]
 pub mod scenario_api;
+mod scheduler;
 #[path = "daemon/shim_spawn.rs"]
 mod shim_spawn;
 #[path = "daemon/shim_state.rs"]
@@ -121,6 +128,7 @@ pub(crate) mod telemetry;
 pub mod tick_report;
 #[path = "daemon/verification.rs"]
 pub(crate) mod verification;
+mod verification_tracking;
 
 pub(crate) use self::discord_bridge::{
     build_shutdown_snapshot, send_discord_shutdown_notice, send_discord_shutdown_summary,
@@ -135,7 +143,6 @@ use self::hot_reload::{
     BinaryFingerprint, hot_reload_daemon_args, hot_reload_marker_path, write_hot_reload_marker,
 };
 pub(crate) use self::interventions::NudgeSchedule;
-use self::interventions::OwnedTaskInterventionState;
 use self::launcher::{
     duplicate_claude_session_ids, load_launch_state, member_session_tracker_config,
 };
@@ -311,37 +318,8 @@ pub struct TeamDaemon {
     pub(super) idle_started_at: HashMap<String, Instant>,
     pub(super) active_tasks: HashMap<String, u32>,
     pub(super) retry_counts: HashMap<String, u32>,
-    pub(super) dispatch_queue: Vec<DispatchQueueEntry>,
-    pub(super) triage_idle_epochs: HashMap<String, u64>,
-    pub(super) triage_interventions: HashMap<String, u64>,
-    pub(super) owned_task_interventions: HashMap<String, OwnedTaskInterventionState>,
-    pub(super) intervention_cooldowns: HashMap<String, Instant>,
-    pub(super) channels: HashMap<String, Box<dyn Channel>>,
-    pub(super) nudges: HashMap<String, NudgeSchedule>,
-    pub(super) discord_bot: Option<super::discord::DiscordBot>,
-    pub(super) discord_event_cursor: usize,
-    pub(super) telegram_bot: Option<super::telegram::TelegramBot>,
     pub(super) failure_tracker: FailureTracker,
     pub(super) event_sink: EventSink,
-    pub(super) paused_standups: HashSet<String>,
-    pub(super) last_standup: HashMap<String, Instant>,
-    pub(super) last_board_rotation: Instant,
-    pub(super) last_auto_archive: Instant,
-    pub(super) last_auto_dispatch: Instant,
-    pub(super) last_main_smoke_check: Instant,
-    pub(super) pipeline_starvation_fired: bool,
-    pub(super) pipeline_starvation_last_fired: Option<Instant>,
-    pub(super) planning_cycle_last_fired: Option<Instant>,
-    pub(super) planning_cycle_active: bool,
-    /// #681: Consecutive planning cycles that produced zero new tasks.
-    /// Used to exponentially back off the architect planning cadence so
-    /// that a stuck board (everything blocked, no dispatchable work) does
-    /// not burn orchestrator tokens with a ping storm of empty cycles.
-    pub(super) planning_cycle_consecutive_empty: u32,
-    pub(super) retro_generated: bool,
-    pub(super) failed_deliveries: Vec<FailedDelivery>,
-    pub(super) review_first_seen: HashMap<u32, u64>,
-    pub(super) review_nudge_sent: HashSet<u32>,
     pub(super) poll_cycle_count: u64,
     pub(super) poll_interval: Duration,
     /// Errors recorded during the current `tick()` call. Cleared at the
@@ -357,91 +335,28 @@ pub struct TeamDaemon {
     pub(super) sub_repo_names: Vec<String>,
     /// Consecutive error counts per recoverable subsystem name.
     pub(super) subsystem_error_counts: HashMap<String, u32>,
-    pub(super) auto_merge_overrides: HashMap<u32, bool>,
-    /// Tracks recent (task_id, engineer) dispatch pairs for deduplication.
-    pub(super) recent_dispatches: HashMap<(u32, String), Instant>,
-    /// #684 / #686: tasks the auto/runtime orphan rescue just moved back
-    /// to todo. Dispatch skips these for an exponentially-growing cooldown
-    /// window derived from `orphan_rescue_cooldown_secs` × 2^(count-1)
-    /// (capped at 16×) so repeated rescues of the same task widen the
-    /// quiet period instead of re-cascading every base window.
-    pub(super) recently_rescued_tasks: HashMap<u32, RescueRecord>,
-    /// #697: tasks recently released by a specific engineer. Populated
-    /// when state reconciliation detects an engineer cleared their claim
-    /// (reason `task no longer claimed by this engineer`). Dispatch
-    /// excludes that engineer from re-dispatch of the same task for
-    /// `dispatch_release_exclusion_secs` so they do not immediately
-    /// receive back a task they just parked. Other engineers remain
-    /// eligible once the task-level rescue cooldown expires.
-    pub(super) recently_released_by: HashMap<(u32, String), ReleaseRecord>,
-    /// Tracks recent escalation keys to suppress repeated alerts.
-    pub(super) recent_escalations: HashMap<String, Instant>,
-    /// Latest periodic main smoke-test outcome.
-    pub(super) main_smoke_state: Option<MainSmokeState>,
     /// SQLite telemetry database connection (None if open failed).
     pub(super) telemetry_db: Option<rusqlite::Connection>,
-    /// Timestamp of the last manual assignment per engineer (for cooldown).
-    pub(super) manual_assign_cooldowns: HashMap<String, Instant>,
-    /// Per-member agent backend health state.
-    pub(super) backend_health: HashMap<String, BackendHealth>,
-    /// Per-member quota retry-at deadline (epoch seconds). Populated when a
-    /// shim emits `Event::QuotaBlocked` with a retry_at. Consulted by the
-    /// backend-health transition, dispatch selection, and aging alerts to
-    /// keep an engineer marked as `quota_exhausted` (i.e. parked) until the
-    /// reset deadline passes. A successful poll_shim ping is NOT evidence
-    /// of quota recovery — only the deadline or operator intervention is.
-    pub(super) backend_quota_retry_at: HashMap<String, u64>,
-    /// Rolling capture history used to detect narration loops.
-    pub(super) narration_tracker: health::narration::NarrationTracker,
-    /// Per-session output tracking used for proactive context-pressure handling.
-    pub(super) context_pressure_tracker: health::context::ContextPressureTracker,
-    /// When the last periodic health check was run.
-    pub(super) last_health_check: Option<Instant>,
-    /// Rate-limiting: last time each engineer received an uncommitted-work warning.
-    pub(super) last_uncommitted_warn: HashMap<String, Instant>,
-    /// Last time the daemon checked for stale per-worktree cargo targets to prune.
-    pub(super) last_shared_target_cleanup: Option<Instant>,
-    /// Last time the daemon ran a full disk hygiene pass.
-    pub(super) last_disk_hygiene_check: Option<Instant>,
-    /// Per-engineer completion verification loop state.
-    pub(super) verification_states: HashMap<String, VerificationState>,
-    /// Test commands running off the poll loop (verification, main smoke,
-    /// chat merges).
-    pub(super) background_tests: background_tests::BackgroundTests,
-    /// Tracks consecutive narration-only rejections per task (commits exist
-    /// but the branch still has no file diff). After threshold, escalates.
-    pub(super) narration_rejection_counts: HashMap<u32, u32>,
-    /// Tracks consecutive shim completions whose worktree still has zero diff
-    /// against main, so the daemon can break completion loops proactively.
-    pub(super) zero_diff_completion_counts: HashMap<u32, u32>,
-    /// Messages deferred because the target agent was still starting.
-    /// Drained automatically when the agent transitions to ready.
-    pub(super) pending_delivery_queue: HashMap<String, Vec<PendingMessage>>,
-    /// Shim messages accepted by the daemon-side channel but not yet
-    /// acknowledged by a MessageDelivered/DeliveryFailed event.
-    pub(super) pending_shim_acks: HashMap<String, PendingShimAck>,
     /// Per-agent shim handles (only populated when `use_shim` is true).
     pub(super) shim_handles: HashMap<String, agent_handle::AgentHandle>,
-    /// #690: When each member most recently transitioned Idle→Working.
-    /// Cleared when they transition back to Idle. Consulted by the
-    /// zero-output restart check so an agent that JUST became Working
-    /// (e.g. an inbox message arrived 8s before the poll tick) is not
-    /// killed for lifetime-zero-output on a shim that has been Idle
-    /// for the preceding 18 minutes.
-    pub(super) working_since: HashMap<String, Instant>,
-    /// When the last shim health check (Ping) was sent.
-    pub(super) last_shim_health_check: Instant,
-    /// Serial daemon-owned merge queue for auto-merge execution.
-    pub(super) merge_queue: MergeQueue,
-    /// When the last binary freshness check ran (#675). Gated to at most once per hour.
-    pub(super) last_binary_freshness_check: Option<Instant>,
-    /// Consecutive-failure tracking for the Telegram / Discord pollers.
-    pub(super) telegram_health: crate::team::integration_health::PollHealth,
-    pub(super) discord_health: crate::team::integration_health::PollHealth,
-    /// Last daily telemetry retention pass.
-    pub(super) last_telemetry_retention: Instant,
-    /// When the last tiered inbox expiry sweep ran (#658). Gated to at most once per minute.
-    pub(super) last_tiered_inbox_sweep: Option<Instant>,
+    /// Pending, unacknowledged and failed message deliveries; user channels.
+    pub(super) delivery: delivery_state::DeliveryState,
+    /// Dispatch queue and the dedupe/rescue/release cooldown records.
+    pub(super) dispatch: dispatch_state::DispatchState,
+    /// Nudge schedules and triage/owned-task/review intervention tracking.
+    pub(super) interventions: intervention_state::InterventionState,
+    /// Completion verification loops, background tests and main smoke state.
+    pub(super) verification: verification_tracking::VerificationTracking,
+    /// Backend health, narration/context-pressure trackers and health timers.
+    pub(super) health: health_state::HealthState,
+    /// Discord / Telegram bots and their poll health.
+    pub(super) integrations: integrations::Integrations,
+    /// Periodic automation timers and keyed cooldown maps.
+    pub(super) scheduler: scheduler::Scheduler,
+    /// Merge queue (including the in-flight merge) and auto-merge overrides.
+    pub(super) merge: merge_state::MergeState,
+    /// Cached parse of the board's task files.
+    pub(super) board_snapshot: board_snapshot::BoardSnapshotCache,
     /// Work deferred off the poll tick (scheduled retries, pending removals, log throttles).
     pub(super) deferred: deferred::DeferredState,
 }
@@ -491,7 +406,10 @@ impl TeamDaemon {
             .map(|id| id.to_string())
             .unwrap_or_else(|| "-".to_string());
         let dedup_key = format!("preserve:{member_name}:{task_key}:{context}:{detail_digest}");
-        if self.suppress_recent_escalation(dedup_key, Duration::from_secs(600)) {
+        if self
+            .scheduler
+            .suppress_recent_escalation(dedup_key, Duration::from_secs(600))
+        {
             return;
         }
 
@@ -719,6 +637,13 @@ impl TeamDaemon {
             .workflow_policy
             .context_pressure_threshold_bytes;
 
+        // Skip backlog on startup — only send events that happen after boot.
+        // Reading the entire history on first start hammers Discord API with
+        // hundreds of events and triggers rate limits (429).
+        let discord_event_cursor = crate::team::events::read_events(event_sink.path())
+            .map(|events| events.len())
+            .unwrap_or(0);
+
         Ok(Self {
             config,
             watchers,
@@ -726,38 +651,8 @@ impl TeamDaemon {
             idle_started_at: HashMap::new(),
             active_tasks: HashMap::new(),
             retry_counts: HashMap::new(),
-            dispatch_queue: Vec::new(),
-            triage_idle_epochs: HashMap::new(),
-            triage_interventions: HashMap::new(),
-            owned_task_interventions: HashMap::new(),
-            intervention_cooldowns: HashMap::new(),
-            channels,
-            nudges,
-            discord_bot,
-            // Skip backlog on startup — only send events that happen after boot.
-            // Reading the entire history on first start hammers Discord API with
-            // hundreds of events and triggers rate limits (429).
-            discord_event_cursor: crate::team::events::read_events(event_sink.path())
-                .map(|events| events.len())
-                .unwrap_or(0),
-            telegram_bot,
             failure_tracker: FailureTracker::new(20),
             event_sink,
-            paused_standups: HashSet::new(),
-            last_standup: HashMap::new(),
-            last_board_rotation: Instant::now(),
-            last_auto_archive: Instant::now(),
-            last_auto_dispatch: Instant::now(),
-            last_main_smoke_check: Instant::now(),
-            pipeline_starvation_fired: false,
-            pipeline_starvation_last_fired: None,
-            planning_cycle_last_fired: None,
-            planning_cycle_active: false,
-            planning_cycle_consecutive_empty: 0,
-            retro_generated: false,
-            failed_deliveries: Vec::new(),
-            review_first_seen: HashMap::new(),
-            review_nudge_sent: HashSet::new(),
             poll_cycle_count: 0,
             current_tick_errors: Vec::new(),
             poll_interval: Duration::from_secs(5),
@@ -765,69 +660,32 @@ impl TeamDaemon {
             is_multi_repo,
             sub_repo_names,
             subsystem_error_counts: HashMap::new(),
-            auto_merge_overrides: HashMap::new(),
-            recent_dispatches: HashMap::new(),
-            recently_rescued_tasks: HashMap::new(),
-            recently_released_by: HashMap::new(),
-            recent_escalations: HashMap::new(),
-            main_smoke_state: None,
             telemetry_db,
-            manual_assign_cooldowns: HashMap::new(),
-            backend_health: HashMap::new(),
-            backend_quota_retry_at: HashMap::new(),
-            narration_tracker: health::narration::NarrationTracker::new(
-                narration_detection_enabled,
-                narration_threshold_polls,
-            ),
-            context_pressure_tracker: health::context::ContextPressureTracker::new(
-                context_pressure_threshold,
-                context_pressure_threshold_bytes,
-            ),
-            // Start far enough in the past to trigger an immediate check.
-            last_health_check: None,
-            last_uncommitted_warn: HashMap::new(),
-            last_shared_target_cleanup: None,
-            last_disk_hygiene_check: None,
-            verification_states: HashMap::new(),
-            background_tests: Default::default(),
-            narration_rejection_counts: HashMap::new(),
-            zero_diff_completion_counts: HashMap::new(),
-            pending_delivery_queue: HashMap::new(),
-            pending_shim_acks: HashMap::new(),
             shim_handles: HashMap::new(),
-            working_since: HashMap::new(),
-            last_shim_health_check: Instant::now(),
-            merge_queue: MergeQueue::default(),
-            // Start far enough in the past to trigger an immediate check at startup.
-            last_binary_freshness_check: None,
-            telegram_health: Default::default(),
-            discord_health: Default::default(),
-            // Run one retention pass shortly after startup.
-            last_telemetry_retention: Instant::now()
-                .checked_sub(Duration::from_secs(24 * 3600))
-                .unwrap_or_else(Instant::now),
-            // First sweep runs on the first tick after startup.
-            last_tiered_inbox_sweep: None,
+            delivery: delivery_state::DeliveryState::new(channels),
+            dispatch: dispatch_state::DispatchState::default(),
+            interventions: intervention_state::InterventionState::new(nudges),
+            verification: verification_tracking::VerificationTracking::new(),
+            health: health_state::HealthState::new(
+                health::narration::NarrationTracker::new(
+                    narration_detection_enabled,
+                    narration_threshold_polls,
+                ),
+                health::context::ContextPressureTracker::new(
+                    context_pressure_threshold,
+                    context_pressure_threshold_bytes,
+                ),
+            ),
+            integrations: integrations::Integrations::new(
+                discord_bot,
+                telegram_bot,
+                discord_event_cursor,
+            ),
+            scheduler: scheduler::Scheduler::new(),
+            merge: merge_state::MergeState::default(),
+            board_snapshot: board_snapshot::BoardSnapshotCache::default(),
             deferred: Default::default(),
         })
-    }
-
-    pub(crate) fn suppress_recent_escalation(
-        &mut self,
-        key: impl Into<String>,
-        window: Duration,
-    ) -> bool {
-        let now = Instant::now();
-        self.recent_escalations
-            .retain(|_, seen_at| now.duration_since(*seen_at) < window);
-
-        let key = key.into();
-        if self.recent_escalations.contains_key(&key) {
-            return true;
-        }
-
-        self.recent_escalations.insert(key, now);
-        false
     }
 
     pub(super) fn member_nudge_text(&self, member: &MemberInstance) -> Option<String> {
@@ -889,44 +747,6 @@ impl TeamDaemon {
 
     pub(super) fn active_task_id(&self, engineer: &str) -> Option<u32> {
         self.active_tasks.get(engineer).copied()
-    }
-
-    /// Returns true when the member's backend is parked due to a quota block.
-    /// A member is parked when either (a) cached health is `QuotaExhausted`
-    /// or (b) the tracked quota `retry_at` deadline is still in the future.
-    /// Dispatch selection, stall-timer reclaim, and aging-alert escalation
-    /// gate on this to avoid churn against an engineer that simply cannot
-    /// make progress until the quota window elapses (#674).
-    pub(in crate::team) fn member_backend_parked(&self, member_name: &str) -> bool {
-        if self
-            .config
-            .project_root
-            .join(".batty/backend-configuration")
-            .join(format!("{member_name}.json"))
-            .exists()
-        {
-            return true;
-        }
-        if matches!(
-            self.backend_health.get(member_name),
-            Some(
-                BackendHealth::QuotaExhausted
-                    | BackendHealth::AuthRequired
-                    | BackendHealth::ConfigurationRequired
-            )
-        ) {
-            return true;
-        }
-        if let Some(&retry_at) = self.backend_quota_retry_at.get(member_name) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d: std::time::Duration| d.as_secs())
-                .unwrap_or(0);
-            if retry_at > now {
-                return true;
-            }
-        }
-        false
     }
 
     pub(super) fn preserve_worktree_before_restart(
@@ -997,16 +817,10 @@ impl TeamDaemon {
         &self.config.project_root
     }
 
-    pub(super) fn dispatch_paused_by_main_smoke(&self) -> bool {
-        self.main_smoke_state
-            .as_ref()
-            .is_some_and(|state| state.broken && state.pause_dispatch)
-    }
-
     pub(super) fn maybe_run_main_smoke(&mut self) -> Result<()> {
         // A smoke command may still be running on its background thread;
         // apply its result once it finishes instead of starting another.
-        let finished = match self.background_tests.main_smoke.as_ref() {
+        let finished = match self.verification.background_tests.main_smoke.as_ref() {
             Some(smoke) => match smoke.job.try_take() {
                 Some(result) => Some(result),
                 None => return Ok(()),
@@ -1014,7 +828,7 @@ impl TeamDaemon {
             None => None,
         };
         if let Some(result) = finished {
-            if let Some(smoke) = self.background_tests.main_smoke.take() {
+            if let Some(smoke) = self.verification.background_tests.main_smoke.take() {
                 return self.apply_main_smoke_result(smoke, result);
             }
         }
@@ -1025,15 +839,15 @@ impl TeamDaemon {
         }
         // Post-merge verification runs on the root checkout; a concurrent
         // smoke run would test (and race) the same tree. Run once it is done.
-        if self.merge_queue.is_verifying() {
+        if self.merge.queue.is_verifying() {
             return Ok(());
         }
 
         let interval = Duration::from_secs(policy.interval_secs);
-        if self.last_main_smoke_check.elapsed() < interval {
+        if self.verification.last_main_smoke_check.elapsed() < interval {
             return Ok(());
         }
-        self.last_main_smoke_check = Instant::now();
+        self.verification.last_main_smoke_check = Instant::now();
 
         if !self.is_git_repo || self.is_multi_repo {
             return Ok(());
@@ -1071,7 +885,7 @@ impl TeamDaemon {
                 )
             })
         });
-        self.background_tests.main_smoke =
+        self.verification.background_tests.main_smoke =
             Some(background_tests::MainSmokeJob { command, head, job });
         Ok(())
     }
@@ -1110,10 +924,11 @@ impl TeamDaemon {
 
         if test_run.passed {
             let was_broken = self
+                .verification
                 .main_smoke_state
                 .as_ref()
                 .is_some_and(|state| state.broken);
-            self.main_smoke_state = Some(MainSmokeState {
+            self.verification.main_smoke_state = Some(MainSmokeState {
                 broken: false,
                 pause_dispatch: policy.pause_dispatch_on_failure,
                 last_run_at: now_unix(),
@@ -1134,16 +949,21 @@ impl TeamDaemon {
         let suspects =
             Self::recent_main_suspects(self.project_root(), DEFAULT_MAIN_SMOKE_SUSPECT_COMMITS)?;
         let summary = Self::summarize_smoke_output(&test_run.output);
-        let should_emit = self.main_smoke_state.as_ref().is_none_or(|state| {
-            state.broken_commit.as_deref() != Some(head.as_str())
-                || state.summary.as_deref() != Some(summary.as_str())
-        });
+        let should_emit = self
+            .verification
+            .main_smoke_state
+            .as_ref()
+            .is_none_or(|state| {
+                state.broken_commit.as_deref() != Some(head.as_str())
+                    || state.summary.as_deref() != Some(summary.as_str())
+            });
 
         let last_success_commit = self
+            .verification
             .main_smoke_state
             .as_ref()
             .and_then(|state| state.last_success_commit.clone());
-        self.main_smoke_state = Some(MainSmokeState {
+        self.verification.main_smoke_state = Some(MainSmokeState {
             broken: true,
             pause_dispatch: policy.pause_dispatch_on_failure,
             last_run_at: now_unix(),
@@ -1211,20 +1031,6 @@ impl TeamDaemon {
             ));
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_auto_merge_override(&mut self, task_id: u32, enabled: bool) {
-        self.auto_merge_overrides.insert(task_id, enabled);
-    }
-
-    pub(super) fn auto_merge_override(&self, task_id: u32) -> Option<bool> {
-        // In-memory overrides take priority, then check disk
-        if let Some(&value) = self.auto_merge_overrides.get(&task_id) {
-            return Some(value);
-        }
-        let disk_overrides = super::auto_merge::load_overrides(&self.config.project_root);
-        disk_overrides.get(&task_id).copied()
     }
 
     pub(super) fn worktree_dir(&self, engineer: &str) -> PathBuf {
@@ -1685,7 +1491,7 @@ impl TeamDaemon {
 
     #[cfg(test)]
     pub(crate) fn queued_merge_count_for_test(&self) -> usize {
-        self.merge_queue.queued_len()
+        self.merge.queue.queued_len()
     }
 
     #[cfg(test)]
@@ -1695,7 +1501,7 @@ impl TeamDaemon {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             self.process_merge_queue()?;
-            if !self.merge_queue.is_verifying() {
+            if !self.merge.queue.is_verifying() {
                 return Ok(());
             }
             anyhow::ensure!(
@@ -1840,12 +1646,21 @@ impl TeamDaemon {
     pub(super) fn clear_active_task(&mut self, engineer: &str) {
         self.deferred.stall_retries.remove(engineer);
         if let Some(task_id) = self.active_tasks.remove(engineer) {
-            self.narration_rejection_counts.remove(&task_id);
-            self.zero_diff_completion_counts.remove(&task_id);
+            self.verification
+                .narration_rejection_counts
+                .remove(&task_id);
+            self.verification
+                .zero_diff_completion_counts
+                .remove(&task_id);
         }
         self.retry_counts.remove(engineer);
-        self.verification_states.remove(engineer);
-        if let Some(job) = self.background_tests.verification.remove(engineer) {
+        self.verification.engineers.remove(engineer);
+        if let Some(job) = self
+            .verification
+            .background_tests
+            .verification
+            .remove(engineer)
+        {
             info!(
                 engineer,
                 task_id = job.task_id(),
@@ -1863,16 +1678,6 @@ impl TeamDaemon {
             .map(|member| self.member_work_dir(member))
             .unwrap_or_else(|| self.config.project_root.clone());
         super::checkpoint::remove_restart_context(&work_dir);
-    }
-
-    pub(super) fn note_zero_diff_completion(&mut self, task_id: u32) -> u32 {
-        let count = self.zero_diff_completion_counts.entry(task_id).or_insert(0);
-        *count += 1;
-        *count
-    }
-
-    pub(super) fn clear_zero_diff_completion(&mut self, task_id: u32) {
-        self.zero_diff_completion_counts.remove(&task_id);
     }
 
     /// Remove active_task entries for tasks that are done, archived, or no longer on the board.
@@ -1914,16 +1719,18 @@ impl TeamDaemon {
                 self.idle_started_at.remove(member_name);
             }
         }
-        self.update_nudge_for_state(member_name, new_state);
+        self.interventions
+            .update_nudge_for_state(member_name, new_state);
         standup::update_timer_for_state(
             &self.config.team_config,
             &self.config.members,
-            &mut self.paused_standups,
-            &mut self.last_standup,
+            &mut self.scheduler.paused_standups,
+            &mut self.scheduler.last_standup,
             member_name,
             new_state,
         );
-        self.update_triage_intervention_for_state(member_name, new_state);
+        self.interventions
+            .update_triage_intervention_for_state(member_name, new_state);
     }
 }
 

@@ -62,7 +62,7 @@ impl TeamDaemon {
         body: &str,
         message_id: Option<String>,
     ) {
-        if let Some(existing) = self.failed_deliveries.iter_mut().find(|delivery| {
+        if let Some(existing) = self.delivery.failed.iter_mut().find(|delivery| {
             delivery.recipient == recipient && delivery.from == from && delivery.body == body
         }) {
             existing.last_attempt = Instant::now();
@@ -70,7 +70,8 @@ impl TeamDaemon {
         }
 
         let message_id = message_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        self.failed_deliveries
+        self.delivery
+            .failed
             .push(FailedDelivery::new(recipient, from, body, message_id));
         self.record_delivery_failed_with_details(
             recipient,
@@ -78,17 +79,6 @@ impl TeamDaemon {
             "message delivery failed after retries",
             None,
         );
-    }
-
-    pub(in crate::team) fn clear_failed_delivery(
-        &mut self,
-        recipient: &str,
-        from: &str,
-        body: &str,
-    ) {
-        self.failed_deliveries.retain(|delivery| {
-            delivery.recipient != recipient || delivery.from != from || delivery.body != body
-        });
     }
 
     pub(in crate::team) fn failed_delivery_escalation_recipient(
@@ -157,20 +147,20 @@ impl TeamDaemon {
     }
 
     pub(in crate::team) fn retry_failed_deliveries(&mut self) -> Result<()> {
-        if self.failed_deliveries.is_empty() {
+        if self.delivery.failed.is_empty() {
             return Ok(());
         }
 
         let now = Instant::now();
-        let pending = std::mem::take(&mut self.failed_deliveries);
+        let pending = std::mem::take(&mut self.delivery.failed);
         for mut delivery in pending {
             if !delivery.is_ready_for_retry(now) {
-                self.failed_deliveries.push(delivery);
+                self.delivery.failed.push(delivery);
                 continue;
             }
 
             if !self.member_ready_for_delivery(&delivery.recipient) {
-                self.failed_deliveries.push(delivery);
+                self.delivery.failed.push(delivery);
                 continue;
             }
 
@@ -213,7 +203,7 @@ impl TeamDaemon {
             }
 
             if delivery.has_attempts_remaining() {
-                self.failed_deliveries.push(delivery);
+                self.delivery.failed.push(delivery);
             } else {
                 // Don't escalate if the agent is still starting — it hasn't
                 // had a chance to accept messages yet. Keep retrying.
@@ -226,7 +216,7 @@ impl TeamDaemon {
                         recipient = %delivery.recipient,
                         "agent still starting; suppressing escalation"
                     );
-                    self.failed_deliveries.push(delivery);
+                    self.delivery.failed.push(delivery);
                 } else {
                     self.escalate_failed_delivery(&delivery)?;
                 }
@@ -253,7 +243,7 @@ impl TeamDaemon {
             std::thread::sleep(Duration::from_secs(2));
 
             if self.verify_message_content_in_pane(&pane_id, &message_marker) {
-                self.clear_failed_delivery(recipient, from, body);
+                self.delivery.clear_failed(recipient, from, body);
                 debug!(
                     recipient,
                     attempt,
@@ -266,7 +256,7 @@ impl TeamDaemon {
             // If the agent is no longer at its ready prompt, it started working —
             // the marker was consumed and scrolled off the capture window.
             if self.agent_went_active_after_injection(&pane_id, recipient) {
-                self.clear_failed_delivery(recipient, from, body);
+                self.delivery.clear_failed(recipient, from, body);
                 info!(
                     recipient,
                     attempt,
@@ -319,7 +309,7 @@ impl TeamDaemon {
             std::thread::sleep(Duration::from_secs(2));
 
             if self.verify_message_content_in_pane_lines(&pane_id, &message_marker, capture_lines) {
-                self.clear_failed_delivery(recipient, from, body);
+                self.delivery.clear_failed(recipient, from, body);
                 debug!(
                     recipient,
                     attempt,
@@ -333,7 +323,7 @@ impl TeamDaemon {
             // If the agent is no longer at its ready prompt, it started working —
             // the marker was consumed and scrolled off the capture window.
             if self.agent_went_active_after_injection(&pane_id, recipient) {
-                self.clear_failed_delivery(recipient, from, body);
+                self.delivery.clear_failed(recipient, from, body);
                 info!(
                     recipient,
                     attempt,
@@ -506,12 +496,12 @@ mod tests {
             FailedDelivery::new("eng-1", "manager", "Please retry this.", "msg-1".into());
         delivery.attempts = 1;
         delivery.last_attempt = Instant::now() - FAILED_DELIVERY_RETRY_DELAY;
-        daemon.failed_deliveries.push(delivery);
+        daemon.delivery.failed.push(delivery);
 
         daemon.retry_failed_deliveries().unwrap();
 
-        assert_eq!(daemon.failed_deliveries.len(), 1);
-        assert_eq!(daemon.failed_deliveries[0].attempts, 2);
+        assert_eq!(daemon.delivery.failed.len(), 1);
+        assert_eq!(daemon.delivery.failed[0].attempts, 2);
         let messages =
             inbox::pending_messages(&inbox::inboxes_root(tmp.path()), "manager").unwrap();
         assert!(messages.is_empty());
@@ -525,11 +515,11 @@ mod tests {
             FailedDelivery::new("eng-1", "manager", "Please retry this.", "msg-1".into());
         delivery.attempts = FAILED_DELIVERY_MAX_ATTEMPTS - 1;
         delivery.last_attempt = Instant::now() - FAILED_DELIVERY_RETRY_DELAY;
-        daemon.failed_deliveries.push(delivery);
+        daemon.delivery.failed.push(delivery);
 
         daemon.retry_failed_deliveries().unwrap();
 
-        assert!(daemon.failed_deliveries.is_empty());
+        assert!(daemon.delivery.failed.is_empty());
         let messages =
             inbox::pending_messages(&inbox::inboxes_root(tmp.path()), "manager").unwrap();
         assert_eq!(messages.len(), 1);
@@ -617,7 +607,7 @@ mod tests {
         // Add a failed delivery that's ready for retry (old enough)
         let mut delivery = FailedDelivery::new("eng-1", "manager", "test message", "msg-1".into());
         delivery.last_attempt = Instant::now() - Duration::from_secs(60);
-        daemon.failed_deliveries.push(delivery);
+        daemon.delivery.failed.push(delivery);
 
         // Watcher is Active (not idle/ready) → retry should be skipped
         let mut watcher = crate::team::watcher::SessionWatcher::new("%9999999", "eng-1", 300, None);
@@ -627,7 +617,7 @@ mod tests {
         daemon.retry_failed_deliveries().unwrap();
 
         // Delivery should still be in the queue (not attempted)
-        assert_eq!(daemon.failed_deliveries.len(), 1);
+        assert_eq!(daemon.delivery.failed.len(), 1);
     }
 
     #[test]
@@ -638,7 +628,7 @@ mod tests {
         // Add a failed delivery that's ready for retry
         let mut delivery = FailedDelivery::new("eng-1", "manager", "test message", "msg-1".into());
         delivery.last_attempt = Instant::now() - Duration::from_secs(60);
-        daemon.failed_deliveries.push(delivery);
+        daemon.delivery.failed.push(delivery);
 
         // Watcher is Ready → retry should be attempted
         let mut watcher = crate::team::watcher::SessionWatcher::new("%9999999", "eng-1", 300, None);
@@ -651,7 +641,7 @@ mod tests {
         // It should either be removed (escalated) or have incremented attempt count.
         // With 1 initial attempt + 1 retry = 2, still under max of 3, so it stays.
         assert!(
-            daemon.failed_deliveries.len() <= 1,
+            daemon.delivery.failed.len() <= 1,
             "delivery should have been attempted"
         );
     }
@@ -664,14 +654,14 @@ mod tests {
         let mut daemon = failed_delivery_test_daemon(&tmp);
 
         daemon.record_failed_delivery("eng-1", "manager", "test msg");
-        let first_attempt_time = daemon.failed_deliveries[0].last_attempt;
+        let first_attempt_time = daemon.delivery.failed[0].last_attempt;
         std::thread::sleep(Duration::from_millis(10));
         daemon.record_failed_delivery("eng-1", "manager", "test msg");
 
         // Should still have only one entry
-        assert_eq!(daemon.failed_deliveries.len(), 1);
+        assert_eq!(daemon.delivery.failed.len(), 1);
         // But last_attempt should be updated
-        assert!(daemon.failed_deliveries[0].last_attempt >= first_attempt_time);
+        assert!(daemon.delivery.failed[0].last_attempt >= first_attempt_time);
     }
 
     #[test]
@@ -682,7 +672,7 @@ mod tests {
         daemon.record_failed_delivery("eng-1", "manager", "msg A");
         daemon.record_failed_delivery("eng-1", "manager", "msg B");
 
-        assert_eq!(daemon.failed_deliveries.len(), 2);
+        assert_eq!(daemon.delivery.failed.len(), 2);
     }
 
     #[test]
@@ -698,7 +688,7 @@ mod tests {
         daemon.record_failed_delivery("eng-1", "manager", "same msg");
         daemon.record_failed_delivery("eng-2", "manager", "same msg");
 
-        assert_eq!(daemon.failed_deliveries.len(), 2);
+        assert_eq!(daemon.delivery.failed.len(), 2);
     }
 
     // --- Clear failed delivery ---
@@ -707,39 +697,41 @@ mod tests {
     fn clear_failed_delivery_removes_matching_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = failed_delivery_test_daemon(&tmp);
-        daemon.failed_deliveries.push(FailedDelivery::new(
+        daemon.delivery.failed.push(FailedDelivery::new(
             "eng-1",
             "manager",
             "msg A",
             "msg-a".into(),
         ));
-        daemon.failed_deliveries.push(FailedDelivery::new(
+        daemon.delivery.failed.push(FailedDelivery::new(
             "eng-1",
             "manager",
             "msg B",
             "msg-b".into(),
         ));
 
-        daemon.clear_failed_delivery("eng-1", "manager", "msg A");
+        daemon.delivery.clear_failed("eng-1", "manager", "msg A");
 
-        assert_eq!(daemon.failed_deliveries.len(), 1);
-        assert_eq!(daemon.failed_deliveries[0].body, "msg B");
+        assert_eq!(daemon.delivery.failed.len(), 1);
+        assert_eq!(daemon.delivery.failed[0].body, "msg B");
     }
 
     #[test]
     fn clear_failed_delivery_no_op_when_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = failed_delivery_test_daemon(&tmp);
-        daemon.failed_deliveries.push(FailedDelivery::new(
+        daemon.delivery.failed.push(FailedDelivery::new(
             "eng-1",
             "manager",
             "msg A",
             "msg-a".into(),
         ));
 
-        daemon.clear_failed_delivery("eng-1", "manager", "nonexistent");
+        daemon
+            .delivery
+            .clear_failed("eng-1", "manager", "nonexistent");
 
-        assert_eq!(daemon.failed_deliveries.len(), 1);
+        assert_eq!(daemon.delivery.failed.len(), 1);
     }
 
     // --- Escalation recipient resolution ---
@@ -821,7 +813,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = failed_delivery_test_daemon(&tmp);
         daemon.retry_failed_deliveries().unwrap();
-        assert!(daemon.failed_deliveries.is_empty());
+        assert!(daemon.delivery.failed.is_empty());
     }
 
     #[test]
@@ -830,13 +822,13 @@ mod tests {
         let mut daemon = failed_delivery_test_daemon(&tmp);
         // Create a delivery that was just attempted (not ready for retry)
         let delivery = FailedDelivery::new("eng-1", "manager", "recent msg", "msg-1".into());
-        daemon.failed_deliveries.push(delivery);
+        daemon.delivery.failed.push(delivery);
 
         daemon.retry_failed_deliveries().unwrap();
 
         // Should still be in the queue, not attempted
-        assert_eq!(daemon.failed_deliveries.len(), 1);
-        assert_eq!(daemon.failed_deliveries[0].attempts, 1); // unchanged
+        assert_eq!(daemon.delivery.failed.len(), 1);
+        assert_eq!(daemon.delivery.failed[0].attempts, 1); // unchanged
     }
 
     #[test]
@@ -849,12 +841,12 @@ mod tests {
         delivery.attempts = FAILED_DELIVERY_MAX_ATTEMPTS - 1;
         delivery.last_attempt =
             Instant::now() - FAILED_DELIVERY_RETRY_DELAY - Duration::from_secs(1);
-        daemon.failed_deliveries.push(delivery);
+        daemon.delivery.failed.push(delivery);
 
         daemon.retry_failed_deliveries().unwrap();
 
         // Delivery should be removed (escalated)
-        assert!(daemon.failed_deliveries.is_empty());
+        assert!(daemon.delivery.failed.is_empty());
         // Escalation should have been sent to manager
         let root = inbox::inboxes_root(tmp.path());
         let messages = inbox::pending_messages(&root, "manager").unwrap();
@@ -899,7 +891,7 @@ mod tests {
         delivery.attempts = FAILED_DELIVERY_MAX_ATTEMPTS - 1;
         delivery.last_attempt =
             Instant::now() - FAILED_DELIVERY_RETRY_DELAY - Duration::from_secs(1);
-        daemon.failed_deliveries.push(delivery);
+        daemon.delivery.failed.push(delivery);
 
         daemon.retry_failed_deliveries().unwrap();
 
@@ -913,7 +905,7 @@ mod tests {
         );
         // Delivery should still be in the retry queue.
         assert_eq!(
-            daemon.failed_deliveries.len(),
+            daemon.delivery.failed.len(),
             1,
             "failed delivery must stay in queue for starting agent"
         );
@@ -934,7 +926,7 @@ mod tests {
         delivery.attempts = FAILED_DELIVERY_MAX_ATTEMPTS - 1;
         delivery.last_attempt =
             Instant::now() - FAILED_DELIVERY_RETRY_DELAY - Duration::from_secs(1);
-        daemon.failed_deliveries.push(delivery);
+        daemon.delivery.failed.push(delivery);
 
         daemon.retry_failed_deliveries().unwrap();
 
@@ -1003,15 +995,17 @@ mod tests {
         daemon.watchers.insert("eng-1".to_string(), watcher);
 
         // Seed a failed delivery.
-        daemon.failed_deliveries.push(FailedDelivery::new(
+        daemon.delivery.failed.push(FailedDelivery::new(
             "eng-1",
             "manager",
             "test message",
             "msg-1".into(),
         ));
-        assert_eq!(daemon.failed_deliveries.len(), 1);
+        assert_eq!(daemon.delivery.failed.len(), 1);
 
-        daemon.clear_failed_delivery("eng-1", "manager", "test message");
-        assert!(daemon.failed_deliveries.is_empty());
+        daemon
+            .delivery
+            .clear_failed("eng-1", "manager", "test message");
+        assert!(daemon.delivery.failed.is_empty());
     }
 }

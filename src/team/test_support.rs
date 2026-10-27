@@ -9,7 +9,6 @@ use crate::team::config::{
     StandupConfig, TeamConfig, WorkflowMode, WorkflowPolicy,
 };
 use crate::team::daemon::{DaemonConfig, NudgeSchedule, TeamDaemon};
-use crate::team::failure_patterns::FailureTracker;
 use crate::team::hierarchy::MemberInstance;
 use crate::team::standup::MemberState;
 use crate::team::watcher::SessionWatcher;
@@ -634,19 +633,7 @@ impl<'a> TestDaemonBuilder<'a> {
 
         let mut daemon = TeamDaemon::new(config).unwrap();
         daemon.states = self.states;
-        daemon.nudges = self.nudges;
-        daemon.failure_tracker = FailureTracker::new(20);
-        daemon.paused_standups = HashSet::new();
-        daemon.last_standup = HashMap::new();
-        daemon.last_board_rotation = Instant::now();
-        daemon.last_auto_dispatch = Instant::now();
-        daemon.pipeline_starvation_fired = false;
-        daemon.pipeline_starvation_last_fired = None;
-        daemon.planning_cycle_last_fired = None;
-        daemon.planning_cycle_active = false;
-        daemon.retro_generated = false;
-        daemon.failed_deliveries = Vec::new();
-        daemon.poll_interval = Duration::from_secs(5);
+        daemon.interventions.nudges = self.nudges;
         if let Some(watchers) = self.watchers {
             daemon.watchers = watchers;
         }
@@ -751,7 +738,7 @@ pub(crate) fn backdate_idle_grace(daemon: &mut TeamDaemon, member_name: &str) {
     daemon
         .idle_started_at
         .insert(member_name.to_string(), Instant::now() - grace);
-    if let Some(schedule) = daemon.nudges.get_mut(member_name) {
+    if let Some(schedule) = daemon.interventions.nudges.get_mut(member_name) {
         schedule.idle_since = Some(Instant::now() - schedule.interval.max(grace));
     }
 }
@@ -766,9 +753,9 @@ mod tests {
 
         let daemon = TestDaemonBuilder::new(tmp.path()).build();
 
-        assert!(daemon.discord_bot.is_none());
-        assert_eq!(daemon.discord_event_cursor, 0);
-        assert!(daemon.recent_escalations.is_empty());
+        assert!(daemon.integrations.discord_bot.is_none());
+        assert_eq!(daemon.integrations.discord_event_cursor, 0);
+        assert!(daemon.scheduler.recent_escalations.is_empty());
     }
 
     #[test]

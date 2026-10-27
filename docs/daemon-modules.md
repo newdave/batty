@@ -123,6 +123,24 @@ The extracted modules below keep that loop readable without changing the daemon'
 
 - These are the primary extracted subsystems that replaced large inline sections of the original monolithic daemon and now define the daemon's boundary with delivery, assignment, merge, status, and worktree management.
 
+## Daemon State Groups
+
+`TeamDaemon` keeps cross-cutting state (config, member states, watchers,
+shim handles, active tasks, event sink, telemetry) directly and groups the
+rest into owned sub-structs under `src/team/daemon/`, each with the methods
+that only need that group:
+
+- `delivery_state.rs` (`self.delivery`): pending queue, unacknowledged shim messages, failed deliveries, user channels.
+- `dispatch_state.rs` (`self.dispatch`): dispatch queue, dedupe, rescue/release cooldown records, manual-assign cooldowns.
+- `intervention_state.rs` (`self.interventions`): nudge schedules, triage/owned-task/review intervention tracking.
+- `verification_tracking.rs` (`self.verification`): verification loops, background tests, main smoke state, zero-diff/narration counters.
+- `health_state.rs` (`self.health`): backend health and quota parking, narration/context-pressure trackers, health-check timers.
+- `integrations.rs` (`self.integrations`): Discord/Telegram bots, event cursor, poll health.
+- `scheduler.rs` (`self.scheduler`): periodic automation timers, planning-cycle state, keyed cooldown maps.
+- `merge_state.rs` (`self.merge`): merge queue (including the in-flight merge) and auto-merge overrides.
+- `board_snapshot.rs` (`self.board_snapshot`): cached board parse, invalidated by fingerprint or by `note_board_write`.
+- `deferred.rs` (`self.deferred`): scheduled stall retries, pending removals, failure log throttles.
+
 ## What Still Lives in `daemon.rs`
 
 - `TeamDaemon` state ownership and lifecycle.

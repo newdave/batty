@@ -183,6 +183,7 @@ impl TeamDaemon {
                 &unassigned_open_tasks,
             );
             if self
+                .interventions
                 .owned_task_interventions
                 .get(&dispatch_key)
                 .is_some_and(|state| state.signature == signature)
@@ -221,8 +222,13 @@ impl TeamDaemon {
                         "recovery: dispatch fallback for {} assigned {} task(s) directly ({})",
                         name, fallback_count, reason
                     ));
-                    let idle_epoch = self.triage_idle_epochs.get(&name).copied().unwrap_or(0);
-                    self.owned_task_interventions.insert(
+                    let idle_epoch = self
+                        .interventions
+                        .triage_idle_epochs
+                        .get(&name)
+                        .copied()
+                        .unwrap_or(0);
+                    self.interventions.owned_task_interventions.insert(
                         dispatch_key.clone(),
                         OwnedTaskInterventionState {
                             idle_epoch,
@@ -231,7 +237,8 @@ impl TeamDaemon {
                             escalation_sent: false,
                         },
                     );
-                    self.intervention_cooldowns
+                    self.scheduler
+                        .intervention_cooldowns
                         .insert(dispatch_key, Instant::now());
                     continue;
                 }
@@ -265,8 +272,13 @@ impl TeamDaemon {
                 idle_unassigned_reports.len(),
                 unassigned_open_tasks.len()
             ));
-            let idle_epoch = self.triage_idle_epochs.get(&name).copied().unwrap_or(0);
-            self.owned_task_interventions.insert(
+            let idle_epoch = self
+                .interventions
+                .triage_idle_epochs
+                .get(&name)
+                .copied()
+                .unwrap_or(0);
+            self.interventions.owned_task_interventions.insert(
                 dispatch_key.clone(),
                 OwnedTaskInterventionState {
                     idle_epoch,
@@ -275,7 +287,8 @@ impl TeamDaemon {
                     escalation_sent: false,
                 },
             );
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(dispatch_key, Instant::now());
             if delivered_live {
                 self.mark_member_working(&name);
@@ -347,11 +360,7 @@ impl TeamDaemon {
                 .automation
                 .intervention_cooldown_secs,
         );
-        if self
-            .intervention_cooldowns
-            .get(&cooldown_key)
-            .is_some_and(|last| last.elapsed() < cooldown)
-        {
+        if self.scheduler.cooldown_active(&cooldown_key, cooldown) {
             return;
         }
 
@@ -375,7 +384,8 @@ impl TeamDaemon {
         self.record_orchestrator_action(format!(
             "stall: detected {member_name} manager dispatch gap ({short_label})"
         ));
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(cooldown_key, Instant::now());
     }
 

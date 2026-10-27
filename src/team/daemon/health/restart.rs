@@ -206,7 +206,8 @@ impl TeamDaemon {
             .map(|messages| messages.len())
             .unwrap_or(0);
         let delivery_queue = self
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .get(member_name)
             .map(Vec::len)
             .unwrap_or(0);
@@ -769,7 +770,8 @@ mod tests {
         )
         .unwrap();
         daemon
-            .pending_delivery_queue
+            .delivery
+            .pending_queue
             .entry("eng-1".to_string())
             .or_default()
             .push(crate::team::delivery::PendingMessage {

@@ -69,7 +69,7 @@ impl TeamDaemon {
             // any messages that were buffered while it was still starting.
             if new_state == WatcherState::Ready
                 && prev_watcher_state != WatcherState::Ready
-                && self.pending_delivery_queue.contains_key(name)
+                && self.delivery.pending_queue.contains_key(name)
             {
                 if let Err(error) = self.drain_pending_queue(name) {
                     warn!(

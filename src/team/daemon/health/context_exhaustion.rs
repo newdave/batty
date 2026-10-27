@@ -31,14 +31,12 @@ impl TeamDaemon {
         };
         let restart_cooldown_key = Self::context_restart_cooldown_key(member_name);
         let restart_on_cooldown = self
-            .intervention_cooldowns
-            .get(&restart_cooldown_key)
-            .is_some_and(|last| last.elapsed() < CONTEXT_RESTART_COOLDOWN);
+            .scheduler
+            .cooldown_active(&restart_cooldown_key, CONTEXT_RESTART_COOLDOWN);
         let escalation_cooldown_key = Self::context_escalation_cooldown_key(member_name);
         let escalation_on_cooldown = self
-            .intervention_cooldowns
-            .get(&escalation_cooldown_key)
-            .is_some_and(|last| last.elapsed() < CONTEXT_RESTART_COOLDOWN);
+            .scheduler
+            .cooldown_active(&escalation_cooldown_key, CONTEXT_RESTART_COOLDOWN);
 
         let prior_restarts = self.context_restart_count(task.id)?;
         if prior_restarts >= 1 {
@@ -51,7 +49,8 @@ impl TeamDaemon {
                 return Ok(());
             }
             self.escalate_context_exhaustion(&member, &task, prior_restarts + 1)?;
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(escalation_cooldown_key, Instant::now());
             return Ok(());
         }
@@ -80,7 +79,8 @@ impl TeamDaemon {
             None,
         );
         self.restart_member_with_task_context(member_name, "context_exhausted")?;
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(restart_cooldown_key, Instant::now());
         self.record_agent_restarted(
             member_name,
@@ -122,9 +122,8 @@ impl TeamDaemon {
 
         let restart_cooldown_key = Self::context_restart_cooldown_key(member_name);
         let restart_on_cooldown = self
-            .intervention_cooldowns
-            .get(&restart_cooldown_key)
-            .is_some_and(|last| last.elapsed() < CONTEXT_RESTART_COOLDOWN);
+            .scheduler
+            .cooldown_active(&restart_cooldown_key, CONTEXT_RESTART_COOLDOWN);
         if restart_on_cooldown {
             info!(
                 member = %member_name,
@@ -151,7 +150,8 @@ impl TeamDaemon {
             Some(output_bytes),
         );
         self.restart_member_with_task_context(member_name, "context_pressure")?;
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(restart_cooldown_key, Instant::now());
         if let Some(task_id) = task_id {
             self.record_agent_restarted(
@@ -647,7 +647,7 @@ mod tests {
         daemon.active_tasks.insert(member_name.to_string(), 42);
 
         // Set the cooldown so restart is suppressed.
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             TeamDaemon::context_restart_cooldown_key(member_name),
             Instant::now(),
         );
@@ -725,7 +725,7 @@ mod tests {
             .build();
         daemon.active_tasks.insert(member_name.to_string(), 42);
         // Set the escalation cooldown so it suppresses the escalation.
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             TeamDaemon::context_escalation_cooldown_key(member_name),
             Instant::now(),
         );
@@ -747,7 +747,7 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path())
             .members(vec![engineer_member(member_name, Some("manager"), false)])
             .build();
-        daemon.intervention_cooldowns.insert(
+        daemon.scheduler.intervention_cooldowns.insert(
             TeamDaemon::context_restart_cooldown_key(member_name),
             Instant::now(),
         );

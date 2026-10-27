@@ -39,9 +39,12 @@ impl TeamDaemon {
         // escalation→drop→re-queue→escalation message flood.
         let escalation_key = format!("dispatch-fail:{}:{}", entry.task_id, entry.engineer);
         let cooldown = std::time::Duration::from_secs(900); // 15 minutes
-        if self.suppress_recent_escalation(escalation_key, cooldown) {
+        if self
+            .scheduler
+            .suppress_recent_escalation(escalation_key, cooldown)
+        {
             // Still insert into recent_dispatches to prevent re-enqueueing
-            self.recent_dispatches.insert(
+            self.dispatch.recent_dispatches.insert(
                 (entry.task_id, entry.engineer.clone()),
                 std::time::Instant::now(),
             );
@@ -59,7 +62,7 @@ impl TeamDaemon {
         // cycle. The dedup window (default 60s) is short, but the escalation
         // suppression cooldown (900s) prevents message floods even if the
         // entry does get re-enqueued after the dedup window expires.
-        self.recent_dispatches.insert(
+        self.dispatch.recent_dispatches.insert(
             (entry.task_id, entry.engineer.clone()),
             std::time::Instant::now(),
         );

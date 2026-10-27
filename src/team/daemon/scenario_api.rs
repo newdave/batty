@@ -164,8 +164,9 @@ impl<'a> ScenarioHooks<'a> {
     /// Backdate the daemon's `last_shim_health_check` timestamp. Forces
     /// the next tick to run a shim health check immediately.
     pub fn backdate_last_shim_health_check(&mut self, by: Duration) {
-        self.daemon.last_shim_health_check = self
+        self.daemon.health.last_shim_health_check = self
             .daemon
+            .health
             .last_shim_health_check
             .checked_sub(by)
             .unwrap_or_else(|| Instant::now().checked_sub(by).unwrap_or(Instant::now()));
@@ -174,7 +175,7 @@ impl<'a> ScenarioHooks<'a> {
     /// Backdate the daemon's `last_disk_hygiene_check` timestamp. Forces
     /// the next tick to run disk hygiene.
     pub fn backdate_last_disk_hygiene(&mut self, by: Duration) {
-        self.daemon.last_disk_hygiene_check = Instant::now().checked_sub(by);
+        self.daemon.health.last_disk_hygiene_check = Instant::now().checked_sub(by);
     }
 
     /// Force a stall-state timeout for `member` by backdating its
@@ -228,17 +229,17 @@ impl<'a> ScenarioHooks<'a> {
         context: &str,
         detail: &str,
     ) -> bool {
-        let before = self.daemon.recent_escalations.len();
+        let before = self.daemon.scheduler.recent_escalations.len();
         self.daemon
             .report_preserve_failure(member, task_id, context, detail);
-        self.daemon.recent_escalations.len() > before
+        self.daemon.scheduler.recent_escalations.len() > before
     }
 
     /// Number of dedup entries currently tracked in
     /// `recent_escalations`. Used by `preserve_dedup` to verify the
     /// dedup window is actually storing keys.
     pub fn recent_escalations_count(&self) -> usize {
-        self.daemon.recent_escalations.len()
+        self.daemon.scheduler.recent_escalations.len()
     }
 
     /// Call `task::repair_task_frontmatter_compat` on a file without

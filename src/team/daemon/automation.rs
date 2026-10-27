@@ -441,14 +441,11 @@ impl TeamDaemon {
                 .intervention_cooldown_secs
                 .max(60),
         );
-        if self
-            .intervention_cooldowns
-            .get(&cooldown_key)
-            .is_some_and(|last| last.elapsed() < cooldown)
-        {
+        if self.scheduler.cooldown_active(&cooldown_key, cooldown) {
             return Ok(());
         }
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(cooldown_key, Instant::now());
 
         let reason_suffix = actionable_reason
@@ -544,7 +541,10 @@ impl TeamDaemon {
             // engineers cannot produce progress by definition — reclaiming
             // their tasks only rotates them to another quota-blocked
             // engineer and inflates board churn.
-            if self.member_backend_parked(engineer) {
+            if self
+                .health
+                .member_backend_parked(&self.config.project_root, engineer)
+            {
                 continue;
             }
             let Some(member) = self
@@ -594,10 +594,9 @@ impl TeamDaemon {
             }
 
             let progress_key = format!("{CLAIM_PROGRESS_AUDIT_KEY_PREFIX}{}", task.id);
-            let should_check_progress = self
-                .intervention_cooldowns
-                .get(&progress_key)
-                .is_none_or(|last| last.elapsed() >= progress_interval);
+            let should_check_progress = !self
+                .scheduler
+                .cooldown_active(&progress_key, progress_interval);
             let Some(expires_at) = task.claim_expires_at.as_deref().and_then(parse_rfc3339_utc)
             else {
                 continue;
@@ -612,7 +611,8 @@ impl TeamDaemon {
                 )
             {
                 if expires_at <= now && progress_type == "dirty_files" {
-                    self.intervention_cooldowns
+                    self.scheduler
+                        .intervention_cooldowns
                         .insert(progress_key.clone(), Instant::now());
                 } else {
                     let extensions = task.claim_extensions.unwrap_or(0).saturating_add(1).min(
@@ -640,13 +640,15 @@ impl TeamDaemon {
                         &task.id.to_string(),
                         &(now + chrono::Duration::seconds(ttl_secs as i64)).to_rfc3339(),
                     ));
-                    self.intervention_cooldowns
+                    self.scheduler
+                        .intervention_cooldowns
                         .insert(progress_key.clone(), Instant::now());
                     continue;
                 }
             }
 
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(progress_key, Instant::now());
 
             let expires_in_secs = expires_at.signed_duration_since(now).num_seconds().max(0) as u64;
@@ -764,7 +766,8 @@ impl TeamDaemon {
                 true,
                 time_held_secs,
             ));
-            self.recent_dispatches
+            self.dispatch
+                .recent_dispatches
                 .insert((task.id, engineer.to_string()), Instant::now());
             let manager = self.assignment_sender(engineer);
             let _ = self.queue_message(
@@ -1055,7 +1058,11 @@ impl TeamDaemon {
             // record an exclusion so the dispatcher does not immediately
             // re-dispatch the same task back to the engineer who parked it.
             if reason == "task no longer claimed by this engineer" {
-                self.record_task_release_by(task_id, &engineer);
+                self.dispatch.record_task_release_by(
+                    task_id,
+                    &engineer,
+                    self.release_exclusion_window(),
+                );
             }
             if !self
                 .config
@@ -1202,7 +1209,8 @@ impl TeamDaemon {
                 let _ = crate::team::task_cmd::unclaim_task(&board_dir, task.id);
                 // #684 / #686: same exponential-backoff dispatch-cooldown
                 // pattern as in-progress rescue.
-                self.record_task_rescue(task.id);
+                self.dispatch
+                    .record_task_rescue(task.id, self.orphan_rescue_cooldown());
             }
         }
 
@@ -1232,6 +1240,7 @@ impl TeamDaemon {
                 // any further dispatch. Tasks filed `blocked` are excluded
                 // from `available_dispatch_tasks`, halting the cascade.
                 let is_repeat_in_cascade = self
+                    .dispatch
                     .recently_rescued_tasks
                     .get(&task.id)
                     .is_some_and(|record| record.in_cascade_window(rescue_base_cooldown));
@@ -1298,7 +1307,8 @@ impl TeamDaemon {
                     }
                     // Still record the rescue so the cooldown grows if the
                     // manager unblocks it and the pattern repeats.
-                    self.record_task_rescue(task.id);
+                    self.dispatch
+                        .record_task_rescue(task.id, self.orphan_rescue_cooldown());
                     continue;
                 }
                 // #698: same block-preservation logic as review rescue above.
@@ -1333,7 +1343,8 @@ impl TeamDaemon {
                 // exponentially-growing cooldown on repeated rescues so the
                 // releasing engineer or manager has a widening window to
                 // reclaim/re-route before it auto-dispatches to a peer.
-                self.record_task_rescue(task.id);
+                self.dispatch
+                    .record_task_rescue(task.id, self.orphan_rescue_cooldown());
             }
         }
 
@@ -1354,13 +1365,14 @@ impl TeamDaemon {
                 .board
                 .state_reconciliation_interval_secs,
         );
-        self.intervention_cooldowns
-            .get(STATE_RECONCILIATION_AUDIT_KEY)
-            .is_none_or(|last| last.elapsed() >= interval)
+        !self
+            .scheduler
+            .cooldown_active(STATE_RECONCILIATION_AUDIT_KEY, interval)
     }
 
     fn mark_state_reconciliation_audit(&mut self) {
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .insert(STATE_RECONCILIATION_AUDIT_KEY.to_string(), Instant::now());
     }
 
@@ -1725,13 +1737,14 @@ impl TeamDaemon {
 
         // Prune tracking maps for tasks no longer in review and log the repair.
         let stale_review_first_seen: Vec<u32> = self
+            .interventions
             .review_first_seen
             .keys()
             .copied()
             .filter(|id| !review_task_ids.contains(id))
             .collect();
         for task_id in stale_review_first_seen {
-            self.review_first_seen.remove(&task_id);
+            self.interventions.review_first_seen.remove(&task_id);
             self.record_state_reconciliation(None, Some(task_id), "review_fix");
             self.record_orchestrator_action(format!(
                 "state reconciliation: cleared stale review tracking for task #{}",
@@ -1739,13 +1752,14 @@ impl TeamDaemon {
             ));
         }
         let stale_review_nudges: Vec<u32> = self
+            .interventions
             .review_nudge_sent
             .iter()
             .copied()
             .filter(|id| !review_task_ids.contains(id))
             .collect();
         for task_id in stale_review_nudges {
-            self.review_nudge_sent.remove(&task_id);
+            self.interventions.review_nudge_sent.remove(&task_id);
             self.record_state_reconciliation(None, Some(task_id), "review_fix");
             self.record_orchestrator_action(format!(
                 "state reconciliation: cleared stale review nudge state for task #{}",
@@ -1775,15 +1789,19 @@ impl TeamDaemon {
                 ));
             }
 
-            if !self.review_first_seen.contains_key(&task.id) {
+            if !self.interventions.review_first_seen.contains_key(&task.id) {
                 self.record_state_reconciliation(None, Some(task.id), "review_fix");
                 self.record_orchestrator_action(format!(
                     "state reconciliation: seeded missing review tracking for task #{}",
                     task.id
                 ));
-                self.review_first_seen.insert(task.id, now);
+                self.interventions.review_first_seen.insert(task.id, now);
             }
-            let first_seen = *self.review_first_seen.get(&task.id).unwrap_or(&now);
+            let first_seen = *self
+                .interventions
+                .review_first_seen
+                .get(&task.id)
+                .unwrap_or(&now);
             let age = now.saturating_sub(first_seen);
 
             // Resolve per-priority thresholds (falls back to global defaults)
@@ -1802,7 +1820,7 @@ impl TeamDaemon {
                         stale.reason
                     ));
                 }
-                if !self.review_nudge_sent.contains(&task.id) {
+                if !self.interventions.review_nudge_sent.contains(&task.id) {
                     let review_owner = task
                         .review_owner
                         .as_deref()
@@ -1824,7 +1842,7 @@ impl TeamDaemon {
                         );
                         let _ = self.deliver_automation_nudge(review_owner, &body);
                     }
-                    self.review_nudge_sent.insert(task.id);
+                    self.interventions.review_nudge_sent.insert(task.id);
                 }
                 continue;
             }
@@ -1876,13 +1894,13 @@ impl TeamDaemon {
                 );
 
                 // Remove from tracking since it's no longer in review
-                self.review_first_seen.remove(&task.id);
-                self.review_nudge_sent.remove(&task.id);
+                self.interventions.review_first_seen.remove(&task.id);
+                self.interventions.review_nudge_sent.remove(&task.id);
                 continue;
             }
 
             // Check nudge threshold
-            if age >= nudge_threshold && !self.review_nudge_sent.contains(&task.id) {
+            if age >= nudge_threshold && !self.interventions.review_nudge_sent.contains(&task.id) {
                 let reviewer = task.review_owner.as_deref().unwrap_or("manager");
                 let msg = format!(
                     "Review nudge: task #{} has been in review for {}s (nudge threshold: {}s). \
@@ -1897,7 +1915,7 @@ impl TeamDaemon {
 
                 self.emit_event(TeamEvent::review_nudge_sent(reviewer, &task.id.to_string()));
 
-                self.review_nudge_sent.insert(task.id);
+                self.interventions.review_nudge_sent.insert(task.id);
             }
         }
 
@@ -1975,7 +1993,8 @@ impl TeamDaemon {
                     .map(|task| aging_cooldown_key("review_stale", task.task_id)),
             )
             .collect();
-        self.intervention_cooldowns
+        self.scheduler
+            .intervention_cooldowns
             .retain(|key, _| !key.starts_with("aging::") || active_keys.contains(key));
 
         for task in &report.stale_in_progress {
@@ -1989,13 +2008,14 @@ impl TeamDaemon {
             // noisy telemetry during already-degraded windows. Also clear
             // the cooldown markers so that when the engineer recovers we
             // start aging bookkeeping from a clean slate.
-            if task
-                .claimed_by
-                .as_deref()
-                .is_some_and(|name| self.member_backend_parked(name))
-            {
-                self.intervention_cooldowns.remove(&stale_key);
-                self.intervention_cooldowns.remove(&checkpoint_key);
+            if task.claimed_by.as_deref().is_some_and(|name| {
+                self.health
+                    .member_backend_parked(&self.config.project_root, name)
+            }) {
+                self.scheduler.intervention_cooldowns.remove(&stale_key);
+                self.scheduler
+                    .intervention_cooldowns
+                    .remove(&checkpoint_key);
                 continue;
             }
             let liveness = tasks_by_id.get(&task.task_id).and_then(|board_task| {
@@ -2004,13 +2024,18 @@ impl TeamDaemon {
 
             if let Some(liveness) = liveness {
                 if liveness.has_live_progress() {
-                    self.intervention_cooldowns.remove(&stale_key);
-                    self.intervention_cooldowns.remove(&checkpoint_key);
+                    self.scheduler.intervention_cooldowns.remove(&stale_key);
+                    self.scheduler
+                        .intervention_cooldowns
+                        .remove(&checkpoint_key);
                     continue;
                 }
 
                 if liveness.dirty_worktree {
-                    let checkpoint_sent = self.intervention_cooldowns.contains_key(&checkpoint_key);
+                    let checkpoint_sent = self
+                        .scheduler
+                        .intervention_cooldowns
+                        .contains_key(&checkpoint_key);
                     if !checkpoint_sent {
                         let body = if project_is_git {
                             format!(
@@ -2028,16 +2053,19 @@ impl TeamDaemon {
                             "aging: requested checkpoint commit for task #{} ({owner})",
                             task.task_id
                         ));
-                        self.intervention_cooldowns
+                        self.scheduler
+                            .intervention_cooldowns
                             .insert(checkpoint_key, Instant::now());
-                        self.intervention_cooldowns.remove(&stale_key);
+                        self.scheduler.intervention_cooldowns.remove(&stale_key);
                         continue;
                     }
                     if self.aging_alert_on_cooldown(&checkpoint_key) {
                         continue;
                     }
                 } else {
-                    self.intervention_cooldowns.remove(&checkpoint_key);
+                    self.scheduler
+                        .intervention_cooldowns
+                        .remove(&checkpoint_key);
                 }
             }
 
@@ -2103,7 +2131,8 @@ impl TeamDaemon {
                 let _ = self.queue_daemon_message(&recipient, &body);
             }
 
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(stale_key, Instant::now());
         }
 
@@ -2115,7 +2144,9 @@ impl TeamDaemon {
 
             let reason = format!("todo task aged {}s without movement", task.age_secs);
             self.emit_event(TeamEvent::task_aged(&task.task_id.to_string(), &reason));
-            self.intervention_cooldowns.insert(key, Instant::now());
+            self.scheduler
+                .intervention_cooldowns
+                .insert(key, Instant::now());
         }
 
         for task in &active_stale_review {
@@ -2172,7 +2203,9 @@ impl TeamDaemon {
                 let _ = self.queue_daemon_message(&recipient, &body);
             }
 
-            self.intervention_cooldowns.insert(key, Instant::now());
+            self.scheduler
+                .intervention_cooldowns
+                .insert(key, Instant::now());
         }
 
         Ok(())
@@ -2372,9 +2405,7 @@ impl TeamDaemon {
                 .automation
                 .intervention_cooldown_secs,
         );
-        self.intervention_cooldowns
-            .get(key)
-            .is_some_and(|fired_at| fired_at.elapsed() < cooldown)
+        self.scheduler.cooldown_active(key, cooldown)
     }
 
     pub(super) fn maybe_detect_pipeline_starvation(&mut self) -> Result<()> {
@@ -2384,12 +2415,12 @@ impl TeamDaemon {
             .workflow_policy
             .pipeline_starvation_threshold
         else {
-            self.pipeline_starvation_fired = false;
+            self.scheduler.pipeline_starvation_fired = false;
             return Ok(());
         };
 
         // Already fired — stay suppressed until condition fully clears
-        if self.pipeline_starvation_fired {
+        if self.scheduler.pipeline_starvation_fired {
             // Only reset when enough unclaimed work exists for all idle engineers
             let all_tasks = self.board_tasks()?;
             let unclaimed_todo = all_tasks
@@ -2399,8 +2430,8 @@ impl TeamDaemon {
                 .count();
             let truly_idle = self.truly_idle_engineer_count(&all_tasks);
             if truly_idle == 0 || unclaimed_todo > truly_idle {
-                self.pipeline_starvation_fired = false;
-                self.pipeline_starvation_last_fired = None;
+                self.scheduler.pipeline_starvation_fired = false;
+                self.scheduler.pipeline_starvation_last_fired = None;
             } else {
                 return Ok(());
             }
@@ -2408,7 +2439,7 @@ impl TeamDaemon {
 
         // Hard cooldown: never fire more than once per 5 minutes
         const STARVATION_COOLDOWN: Duration = Duration::from_secs(300);
-        if let Some(last) = self.pipeline_starvation_last_fired {
+        if let Some(last) = self.scheduler.pipeline_starvation_last_fired {
             if last.elapsed() < STARVATION_COOLDOWN {
                 return Ok(());
             }
@@ -2474,8 +2505,8 @@ impl TeamDaemon {
         self.emit_event(TeamEvent::pipeline_starvation_detected(
             idle_count, todo_count,
         ));
-        self.pipeline_starvation_fired = true;
-        self.pipeline_starvation_last_fired = Some(Instant::now());
+        self.scheduler.pipeline_starvation_fired = true;
+        self.scheduler.pipeline_starvation_last_fired = Some(Instant::now());
         Ok(())
     }
 
@@ -2490,7 +2521,7 @@ impl TeamDaemon {
         // extend the cooldown linearly (1x → 6x) so a stuck board doesn't
         // burn orchestrator tokens with empty cycles every few minutes.
         // Resets to 1x as soon as a cycle creates any tasks.
-        let backoff_multiplier = 1 + self.planning_cycle_consecutive_empty.min(5);
+        let backoff_multiplier = 1 + self.scheduler.planning_cycle_consecutive_empty.min(5);
         let cooldown = base_cooldown * backoff_multiplier;
 
         let Some(architect) = self
@@ -2505,8 +2536,9 @@ impl TeamDaemon {
 
         // Cheap cooldown/active gates first: planning_cycle_ready would reject
         // these anyway, so skip parsing the board.
-        if self.planning_cycle_active
+        if self.scheduler.planning_cycle_active
             || self
+                .scheduler
                 .planning_cycle_last_fired
                 .is_some_and(|last| last.elapsed() < cooldown)
         {
@@ -2521,8 +2553,8 @@ impl TeamDaemon {
             return Ok(());
         }
         if !crate::team::tact::planning_cycle_ready(
-            self.planning_cycle_active,
-            self.planning_cycle_last_fired,
+            self.scheduler.planning_cycle_active,
+            self.scheduler.planning_cycle_last_fired,
             cooldown,
             idle_engineer_count,
             dispatchable_task_count,
@@ -2634,8 +2666,8 @@ impl TeamDaemon {
         self.record_message_routed(&sender, &architect);
         self.record_tact_cycle_triggered(&architect, idle_engineer_count as u32, &board_summary);
 
-        self.planning_cycle_last_fired = Some(Instant::now());
-        self.planning_cycle_active = true;
+        self.scheduler.planning_cycle_last_fired = Some(Instant::now());
+        self.scheduler.planning_cycle_active = true;
         // #687 followup: persist immediately so a daemon restart within the
         // heartbeat window (5 min) doesn't fire a duplicate planning cycle
         // at the architect. Without this, hot-reload or manual restart
@@ -2675,6 +2707,7 @@ impl TeamDaemon {
             .map(|member| member.name.clone())
             .unwrap_or_else(|| "architect".to_string());
         let latency_secs = self
+            .scheduler
             .planning_cycle_last_fired
             .map(|instant| instant.elapsed().as_secs())
             .unwrap_or(0);
@@ -2683,7 +2716,7 @@ impl TeamDaemon {
         let result = crate::team::tact::create_board_tasks(&specs, &board_dir)
             .map(|created: Vec<u32>| created.len());
 
-        self.planning_cycle_active = false;
+        self.scheduler.planning_cycle_active = false;
 
         match result {
             Ok(created) => {
@@ -2691,8 +2724,10 @@ impl TeamDaemon {
                 // back off the cadence when the architect keeps returning
                 // zero new tasks (blocked board, no dispatchable work).
                 if created == 0 {
-                    self.planning_cycle_consecutive_empty =
-                        self.planning_cycle_consecutive_empty.saturating_add(1);
+                    self.scheduler.planning_cycle_consecutive_empty = self
+                        .scheduler
+                        .planning_cycle_consecutive_empty
+                        .saturating_add(1);
                     // #688: when a cycle is empty, reset the cooldown anchor to
                     // "now" so the next cycle is gated on time-since-completion,
                     // not time-since-fire. Without this a slow (10-min) empty
@@ -2700,9 +2735,9 @@ impl TeamDaemon {
                     // it completes and a fresh cycle fires within the same tick.
                     // Productive cycles (created > 0) leave last_fired alone so
                     // the architect can keep planning as fast as the pipeline needs.
-                    self.planning_cycle_last_fired = Some(Instant::now());
+                    self.scheduler.planning_cycle_last_fired = Some(Instant::now());
                 } else {
-                    self.planning_cycle_consecutive_empty = 0;
+                    self.scheduler.planning_cycle_consecutive_empty = 0;
                 }
                 // #710: persist immediately so a non-clean daemon termination
                 // (SIGKILL from `batty stop` timeout, panic, OOM) doesn't
@@ -2729,7 +2764,7 @@ impl TeamDaemon {
                 );
                 info!(
                     created,
-                    consecutive_empty = self.planning_cycle_consecutive_empty,
+                    consecutive_empty = self.scheduler.planning_cycle_consecutive_empty,
                     "applied planning cycle response"
                 );
                 self.record_orchestrator_action(format!(
@@ -2985,11 +3020,11 @@ impl TeamDaemon {
     /// task is an individual file. Only rotates the legacy plain kanban.md.
     pub(super) fn maybe_rotate_board(&mut self) -> Result<()> {
         // Check every 10 minutes
-        if self.last_board_rotation.elapsed() < Duration::from_secs(600) {
+        if self.scheduler.last_board_rotation.elapsed() < Duration::from_secs(600) {
             return Ok(());
         }
 
-        self.last_board_rotation = Instant::now();
+        self.scheduler.last_board_rotation = Instant::now();
 
         let config_dir = self.config.project_root.join(".batty").join("team_config");
 
@@ -3028,10 +3063,10 @@ impl TeamDaemon {
     /// `auto_archive_done_after_secs` is `None` or `0`.
     pub(super) fn maybe_auto_archive(&mut self) -> Result<()> {
         // Rate-limit to once per minute
-        if self.last_auto_archive.elapsed() < Duration::from_secs(60) {
+        if self.scheduler.last_auto_archive.elapsed() < Duration::from_secs(60) {
             return Ok(());
         }
-        self.last_auto_archive = Instant::now();
+        self.scheduler.last_auto_archive = Instant::now();
 
         let threshold_secs = match self
             .config
@@ -3087,7 +3122,7 @@ impl TeamDaemon {
     }
 
     pub(super) fn maybe_generate_retrospective(&mut self) -> Result<()> {
-        if self.retro_generated || !self.board_dir().join("tasks").is_dir() {
+        if self.scheduler.retro_generated || !self.board_dir().join("tasks").is_dir() {
             return Ok(());
         }
         let tasks = self.board_tasks()?;
@@ -3102,7 +3137,7 @@ impl TeamDaemon {
 
         let report_path =
             super::super::retrospective::generate_retrospective(&self.config.project_root, &stats)?;
-        self.retro_generated = true;
+        self.scheduler.retro_generated = true;
         self.record_retro_generated();
         info!(path = %report_path.display(), "retrospective generated");
         Ok(())
@@ -3704,7 +3739,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         );
         assert!(messages[0].body.contains("Idle engineers available: 3"));
         assert!(messages[0].body.contains("Expected response format:"));
-        assert!(daemon.planning_cycle_active);
+        assert!(daemon.scheduler.planning_cycle_active);
     }
 
     #[test]
@@ -3761,7 +3796,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         daemon.maybe_trigger_planning_cycle().unwrap();
 
         assert!(planning_inbox_messages(&tmp).is_empty());
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
     }
 
     #[test]
@@ -3784,7 +3819,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         assert_eq!(messages.len(), 1);
         assert!(messages[0].body.contains("dispatchable_tasks=0"));
         assert!(messages[0].body.contains("Propose exactly 3 task(s)."));
-        assert!(daemon.planning_cycle_active);
+        assert!(daemon.scheduler.planning_cycle_active);
     }
 
     #[test]
@@ -3890,7 +3925,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         daemon.maybe_trigger_planning_cycle().unwrap();
 
         assert!(planning_inbox_messages(&tmp).is_empty());
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
     }
 
     #[test]
@@ -3944,7 +3979,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             .unwrap();
 
         assert_eq!(created, 3);
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
 
         let tasks = crate::task::load_tasks_from_dir(&daemon.board_dir().join("tasks")).unwrap();
         assert_eq!(tasks.len(), 3);
@@ -3993,11 +4028,11 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         let _path_guard = EnvVarGuard::set("PATH", &path);
 
         let mut daemon = planning_test_daemon(&tmp, 300);
-        daemon.planning_cycle_active = true;
+        daemon.scheduler.planning_cycle_active = true;
 
         let created = daemon.handle_planning_response(MIXED_RESPONSE).unwrap();
         assert_eq!(created, 2);
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
     }
 
     #[test]
@@ -4013,11 +4048,11 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         let _path_guard = EnvVarGuard::set("PATH", &path);
 
         let mut daemon = planning_test_daemon(&tmp, 300);
-        daemon.planning_cycle_active = true;
+        daemon.scheduler.planning_cycle_active = true;
 
         let created = daemon.handle_planning_response(RAW_LOG_RESPONSE).unwrap();
         assert_eq!(created, 1);
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
 
         let tasks = crate::task::load_tasks_from_dir(
             &tmp.path()
@@ -4035,11 +4070,11 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
     fn planning_response_empty_creates_zero_tasks_and_resets_cycle() {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = planning_test_daemon(&tmp, 300);
-        daemon.planning_cycle_active = true;
+        daemon.scheduler.planning_cycle_active = true;
 
         let created = daemon.handle_planning_response("").unwrap();
         assert_eq!(created, 0);
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
 
         let orchestrator_log =
             std::fs::read_to_string(crate::team::orchestrator_log_path(tmp.path()))
@@ -4061,11 +4096,11 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         // 12:42:49 UTC; this test locks in the persist-after-apply.
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = planning_test_daemon(&tmp, 300);
-        daemon.planning_cycle_active = true;
-        daemon.planning_cycle_consecutive_empty = 1;
+        daemon.scheduler.planning_cycle_active = true;
+        daemon.scheduler.planning_cycle_consecutive_empty = 1;
 
         daemon.handle_planning_response("").unwrap();
-        assert_eq!(daemon.planning_cycle_consecutive_empty, 2);
+        assert_eq!(daemon.scheduler.planning_cycle_consecutive_empty, 2);
 
         let persisted = super::super::state::load_daemon_state(tmp.path())
             .expect("daemon state should be persisted after empty planning response");
@@ -4090,13 +4125,13 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         let mut daemon = planning_test_daemon(&tmp, 300);
         std::fs::remove_dir_all(daemon.board_dir()).unwrap();
-        daemon.planning_cycle_active = true;
+        daemon.scheduler.planning_cycle_active = true;
 
         let error = daemon
             .handle_planning_response(SINGLE_TASK_RESPONSE)
             .unwrap_err();
         assert!(error.to_string().contains("board directory does not exist"));
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
     }
 
     #[test]
@@ -4113,7 +4148,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         let tmp = tempfile::tempdir().unwrap();
 
         let mut daemon = planning_test_daemon(&tmp, 300);
-        daemon.planning_cycle_active = true;
+        daemon.scheduler.planning_cycle_active = true;
 
         let error = daemon
             .handle_planning_response(SINGLE_TASK_RESPONSE)
@@ -4122,7 +4157,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         assert!(
             detail.contains("failed to create board task") || detail.contains("failed to execute")
         );
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
     }
 
     #[test]
@@ -4138,7 +4173,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         let _path_guard = EnvVarGuard::set("PATH", &path);
 
         let mut daemon = planning_test_daemon(&tmp, 300);
-        daemon.planning_cycle_active = true;
+        daemon.scheduler.planning_cycle_active = true;
 
         assert_eq!(
             daemon
@@ -4155,7 +4190,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         let tasks = crate::task::load_tasks_from_dir(&daemon.board_dir().join("tasks")).unwrap();
         assert_eq!(tasks.len(), 1);
-        assert!(!daemon.planning_cycle_active);
+        assert!(!daemon.scheduler.planning_cycle_active);
     }
 
     #[test]
@@ -4164,7 +4199,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         let mut daemon = planning_test_daemon(&tmp, 300);
 
         daemon.maybe_trigger_planning_cycle().unwrap();
-        daemon.planning_cycle_active = false;
+        daemon.scheduler.planning_cycle_active = false;
         daemon.maybe_trigger_planning_cycle().unwrap();
 
         assert_eq!(planning_inbox_messages(&tmp).len(), 1);
@@ -4176,8 +4211,9 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         let mut daemon = planning_test_daemon(&tmp, 300);
 
         daemon.maybe_trigger_planning_cycle().unwrap();
-        daemon.planning_cycle_active = false;
-        daemon.planning_cycle_last_fired = Some(Instant::now() - Duration::from_secs(301));
+        daemon.scheduler.planning_cycle_active = false;
+        daemon.scheduler.planning_cycle_last_fired =
+            Some(Instant::now() - Duration::from_secs(301));
         daemon.maybe_trigger_planning_cycle().unwrap();
 
         assert_eq!(planning_inbox_messages(&tmp).len(), 2);
@@ -4225,7 +4261,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             .team_config
             .board
             .dispatch_stabilization_delay_secs = 0;
-        daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+        daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
         for engineer in ["eng-1", "eng-2", "eng-3"] {
             daemon.idle_started_at.insert(
                 engineer.to_string(),
@@ -4234,7 +4270,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         }
 
         daemon.maybe_detect_pipeline_starvation().unwrap();
-        assert!(daemon.pipeline_starvation_fired);
+        assert!(daemon.scheduler.pipeline_starvation_fired);
 
         daemon.maybe_trigger_planning_cycle().unwrap();
 
@@ -4531,7 +4567,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         daemon.maybe_generate_retrospective().unwrap();
 
-        assert!(daemon.retro_generated);
+        assert!(daemon.scheduler.retro_generated);
         let retro_dir = tmp.path().join(".batty").join("retrospectives");
         let reports = std::fs::read_dir(&retro_dir).unwrap().count();
         assert_eq!(reports, 1);
@@ -5158,7 +5194,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         // Seed a recent rescue record for task #42 so this reconcile pass
         // counts as the 2nd rescue within the cascade window.
-        daemon.recently_rescued_tasks.insert(
+        daemon.dispatch.recently_rescued_tasks.insert(
             42,
             crate::team::daemon::RescueRecord {
                 last_rescued_at: Instant::now(),
@@ -5246,7 +5282,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         );
 
         assert!(
-            daemon.recently_rescued_tasks.contains_key(&99),
+            daemon.dispatch.recently_rescued_tasks.contains_key(&99),
             "first rescue must record cooldown so a repeat escalates correctly"
         );
     }
@@ -6562,8 +6598,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         assert!(pending_manager.is_empty(), "no nudge should fire at age 0");
 
         // Simulate the task having been first seen long enough ago for nudge
-        daemon.review_first_seen.insert(50, 0); // epoch = 0, so age will be huge
-        daemon.review_nudge_sent.clear();
+        daemon.interventions.review_first_seen.insert(50, 0); // epoch = 0, so age will be huge
+        daemon.interventions.review_nudge_sent.clear();
 
         daemon.maybe_escalate_stale_reviews().unwrap();
 
@@ -6631,7 +6667,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        daemon.review_first_seen.insert(60, now - 100);
+        daemon.interventions.review_first_seen.insert(60, now - 100);
 
         daemon.maybe_escalate_stale_reviews().unwrap();
 
@@ -6646,7 +6682,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             orchestrator_log.contains("Review nudge"),
             "review nudge should be recorded in orchestrator log"
         );
-        assert!(daemon.review_nudge_sent.contains(&60));
+        assert!(daemon.interventions.review_nudge_sent.contains(&60));
 
         let events = crate::team::events::read_events(&events_path).unwrap();
         assert!(events.iter().any(|e| e.event == "review_nudge_sent"));
@@ -6716,18 +6752,18 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             .build();
 
         // Pre-populate tracking with task IDs that are no longer in review
-        daemon.review_first_seen.insert(80, 1000);
-        daemon.review_first_seen.insert(81, 2000);
-        daemon.review_nudge_sent.insert(80);
+        daemon.interventions.review_first_seen.insert(80, 1000);
+        daemon.interventions.review_first_seen.insert(81, 2000);
+        daemon.interventions.review_nudge_sent.insert(80);
 
         // Only task 80 exists and it's done, 81 doesn't exist at all
         write_board_task_file(tmp.path(), 80, "done-task", "done", None, &[], None);
 
         daemon.maybe_escalate_stale_reviews().unwrap();
 
-        assert!(!daemon.review_first_seen.contains_key(&80));
-        assert!(!daemon.review_first_seen.contains_key(&81));
-        assert!(!daemon.review_nudge_sent.contains(&80));
+        assert!(!daemon.interventions.review_first_seen.contains_key(&80));
+        assert!(!daemon.interventions.review_first_seen.contains_key(&81));
+        assert!(!daemon.interventions.review_nudge_sent.contains(&80));
     }
 
     #[test]
@@ -6748,8 +6784,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         )
         .unwrap();
         daemon.event_sink = EventSink::new(&events_path).unwrap();
-        daemon.review_first_seen.insert(80, 1000);
-        daemon.review_nudge_sent.insert(80);
+        daemon.interventions.review_first_seen.insert(80, 1000);
+        daemon.interventions.review_nudge_sent.insert(80);
 
         daemon.maybe_escalate_stale_reviews().unwrap();
 
@@ -6825,7 +6861,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
         // Force last rotation far in the past to trigger the check
-        daemon.last_board_rotation =
+        daemon.scheduler.last_board_rotation =
             std::time::Instant::now() - std::time::Duration::from_secs(700);
 
         daemon.maybe_rotate_board().unwrap();
@@ -6905,7 +6941,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             .build();
 
         daemon.maybe_detect_pipeline_starvation().unwrap();
-        assert!(!daemon.pipeline_starvation_fired);
+        assert!(!daemon.scheduler.pipeline_starvation_fired);
     }
 
     #[test]
@@ -6949,7 +6985,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             .build();
 
         daemon.maybe_detect_pipeline_starvation().unwrap();
-        assert!(!daemon.pipeline_starvation_fired);
+        assert!(!daemon.scheduler.pipeline_starvation_fired);
     }
 
     #[test]
@@ -7007,7 +7043,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         // No todo tasks at all, 1 idle engineer → deficit = 1 >= threshold 1
         daemon.maybe_detect_pipeline_starvation().unwrap();
 
-        assert!(daemon.pipeline_starvation_fired);
+        assert!(daemon.scheduler.pipeline_starvation_fired);
         let pending = inbox::pending_messages(&inbox_root, "architect").unwrap();
         assert!(
             pending
@@ -7066,7 +7102,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         write_open_task_file(tmp.path(), 90, "available-task", "todo");
 
         daemon.maybe_detect_pipeline_starvation().unwrap();
-        assert!(!daemon.pipeline_starvation_fired);
+        assert!(!daemon.scheduler.pipeline_starvation_fired);
     }
 
     #[test]
@@ -7132,7 +7168,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         daemon.maybe_detect_pipeline_starvation().unwrap();
         assert!(
-            !daemon.pipeline_starvation_fired,
+            !daemon.scheduler.pipeline_starvation_fired,
             "should suppress when manager is working"
         );
     }
@@ -7196,7 +7232,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     /// Backdate the rate-limit timer so the archive check fires immediately.
     fn backdate_auto_archive(daemon: &mut TeamDaemon) {
-        daemon.last_auto_archive = Instant::now() - Duration::from_secs(120);
+        daemon.scheduler.last_auto_archive = Instant::now() - Duration::from_secs(120);
     }
 
     #[test]
@@ -7448,7 +7484,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         daemon.maybe_detect_pipeline_starvation().unwrap();
 
         assert!(
-            daemon.pipeline_starvation_fired,
+            daemon.scheduler.pipeline_starvation_fired,
             "starvation should fire when manager has been working for >10 minutes"
         );
     }
@@ -7535,7 +7571,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         daemon.maybe_detect_pipeline_starvation().unwrap();
 
         assert!(
-            !daemon.pipeline_starvation_fired,
+            !daemon.scheduler.pipeline_starvation_fired,
             "starvation should be suppressed when manager is recently working"
         );
     }
@@ -7850,11 +7886,12 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         assert!(
             daemon
+                .dispatch
                 .recent_dispatches
                 .contains_key(&(42, "eng-1".to_string()))
         );
 
-        daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+        daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
         daemon.idle_started_at.insert(
             "eng-1".to_string(),
             Instant::now() - Duration::from_secs(60),
@@ -7866,9 +7903,9 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         daemon.maybe_auto_dispatch().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 42);
-        assert_eq!(daemon.dispatch_queue[0].engineer, "eng-2");
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 42);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
     }
 
     #[test]
@@ -7917,7 +7954,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         );
         handle.apply_state_change(crate::shim::protocol::ShimState::Idle);
         daemon.shim_handles.insert("eng-2".to_string(), handle);
-        daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+        daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
         daemon.idle_started_at.insert(
             "eng-2".to_string(),
             Instant::now() - Duration::from_secs(60),
@@ -7925,13 +7962,13 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 42);
-        assert_eq!(daemon.dispatch_queue[0].engineer, "eng-2");
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 42);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
 
         daemon.process_dispatch_queue().unwrap();
 
-        assert!(daemon.dispatch_queue.is_empty());
+        assert!(daemon.dispatch.queue.is_empty());
         assert_eq!(daemon.active_tasks.get("eng-2"), Some(&42));
         let task = crate::task::Task::from_file(&board_task_path(&repo, 42)).unwrap();
         assert_eq!(task.claimed_by.as_deref(), Some("eng-2"));
@@ -7982,7 +8019,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             ]))
             .build();
         daemon.active_tasks.insert("eng-1".to_string(), 777);
-        daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+        daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
         daemon.idle_started_at.insert(
             "eng-2".to_string(),
             Instant::now() - Duration::from_secs(60),
@@ -7994,8 +8031,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
         daemon.enqueue_dispatch_candidates().unwrap();
 
-        assert_eq!(daemon.dispatch_queue.len(), 1);
-        assert_eq!(daemon.dispatch_queue[0].task_id, 50);
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].task_id, 50);
     }
 
     #[test]

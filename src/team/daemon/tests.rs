@@ -276,24 +276,34 @@ fn daemon_registers_per_role_nudge_intervals_from_prompt_sections() {
 
     assert_eq!(
         daemon
+            .interventions
             .nudges
             .get("lead")
             .map(|schedule| schedule.text.as_str()),
         Some("Manager follow-up.")
     );
     assert_eq!(
-        daemon.nudges.get("lead").map(|schedule| schedule.interval),
+        daemon
+            .interventions
+            .nudges
+            .get("lead")
+            .map(|schedule| schedule.interval),
         Some(Duration::from_secs(120))
     );
     assert_eq!(
         daemon
+            .interventions
             .nudges
             .get("eng-1")
             .map(|schedule| schedule.text.as_str()),
         Some("Engineer follow-up.")
     );
     assert_eq!(
-        daemon.nudges.get("eng-1").map(|schedule| schedule.interval),
+        daemon
+            .interventions
+            .nudges
+            .get("eng-1")
+            .map(|schedule| schedule.interval),
         Some(Duration::from_secs(300))
     );
 }
@@ -384,18 +394,19 @@ fn restore_runtime_state_preserves_planning_cycle_backoff_across_restart() {
 
     // Save: daemon that last fired 120s ago with 4 empty cycles stacked.
     let mut daemon = make_test_daemon(tmp.path(), vec![manager_member("manager", None)]);
-    daemon.planning_cycle_last_fired =
+    daemon.scheduler.planning_cycle_last_fired =
         Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
-    daemon.planning_cycle_consecutive_empty = 4;
+    daemon.scheduler.planning_cycle_consecutive_empty = 4;
     daemon.persist_runtime_state(true).unwrap();
 
     // Restore: fresh daemon picks up the backoff state instead of starting from zero.
     let mut restored = make_test_daemon(tmp.path(), vec![manager_member("manager", None)]);
-    assert!(restored.planning_cycle_last_fired.is_none());
-    assert_eq!(restored.planning_cycle_consecutive_empty, 0);
+    assert!(restored.scheduler.planning_cycle_last_fired.is_none());
+    assert_eq!(restored.scheduler.planning_cycle_consecutive_empty, 0);
     restored.restore_runtime_state();
-    assert_eq!(restored.planning_cycle_consecutive_empty, 4);
+    assert_eq!(restored.scheduler.planning_cycle_consecutive_empty, 4);
     let restored_elapsed = restored
+        .scheduler
         .planning_cycle_last_fired
         .expect("planning_cycle_last_fired should be restored from disk")
         .elapsed();
@@ -418,7 +429,7 @@ fn restore_runtime_state_preserves_recently_rescued_tasks_across_restart() {
     std::fs::create_dir_all(tmp.path().join(".batty").join("team_config")).unwrap();
 
     let mut daemon = make_test_daemon(tmp.path(), vec![manager_member("manager", None)]);
-    daemon.recently_rescued_tasks.insert(
+    daemon.dispatch.recently_rescued_tasks.insert(
         519,
         super::RescueRecord {
             last_rescued_at: std::time::Instant::now() - std::time::Duration::from_secs(180),
@@ -428,9 +439,10 @@ fn restore_runtime_state_preserves_recently_rescued_tasks_across_restart() {
     daemon.persist_runtime_state(true).unwrap();
 
     let mut restored = make_test_daemon(tmp.path(), vec![manager_member("manager", None)]);
-    assert!(restored.recently_rescued_tasks.is_empty());
+    assert!(restored.dispatch.recently_rescued_tasks.is_empty());
     restored.restore_runtime_state();
     let restored_record = restored
+        .dispatch
         .recently_rescued_tasks
         .get(&519)
         .copied()
@@ -454,7 +466,7 @@ fn restore_runtime_state_preserves_recently_released_by_across_restart() {
     std::fs::create_dir_all(tmp.path().join(".batty").join("team_config")).unwrap();
 
     let mut daemon = make_test_daemon(tmp.path(), vec![manager_member("manager", None)]);
-    daemon.recently_released_by.insert(
+    daemon.dispatch.recently_released_by.insert(
         (555, "kai-devrel-1-1".to_string()),
         super::ReleaseRecord {
             last_released_at: std::time::Instant::now() - std::time::Duration::from_secs(300),
@@ -464,9 +476,10 @@ fn restore_runtime_state_preserves_recently_released_by_across_restart() {
     daemon.persist_runtime_state(true).unwrap();
 
     let mut restored = make_test_daemon(tmp.path(), vec![manager_member("manager", None)]);
-    assert!(restored.recently_released_by.is_empty());
+    assert!(restored.dispatch.recently_released_by.is_empty());
     restored.restore_runtime_state();
     let restored_record = restored
+        .dispatch
         .recently_released_by
         .get(&(555, "kai-devrel-1-1".to_string()))
         .copied()
@@ -495,7 +508,7 @@ fn restore_runtime_state_drops_dispatch_queue_across_restart() {
     std::fs::create_dir_all(tmp.path().join(".batty").join("team_config")).unwrap();
 
     let mut daemon = make_test_daemon(tmp.path(), vec![manager_member("manager", None)]);
-    daemon.dispatch_queue.push(DispatchQueueEntry {
+    daemon.dispatch.queue.push(DispatchQueueEntry {
         engineer: "sam-designer-1-1".to_string(),
         task_id: 552,
         task_title: "stale routing decision".to_string(),
@@ -506,10 +519,10 @@ fn restore_runtime_state_drops_dispatch_queue_across_restart() {
     daemon.persist_runtime_state(true).unwrap();
 
     let mut restored = make_test_daemon(tmp.path(), vec![manager_member("manager", None)]);
-    assert!(restored.dispatch_queue.is_empty());
+    assert!(restored.dispatch.queue.is_empty());
     restored.restore_runtime_state();
     assert!(
-        restored.dispatch_queue.is_empty(),
+        restored.dispatch.queue.is_empty(),
         "dispatch_queue must not be restored across restart — stale routing \
          decisions must be re-ranked by enqueue_dispatch_candidates against \
          the current binary's routing logic"
@@ -694,9 +707,9 @@ fn test_maybe_auto_dispatch_respects_rate_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
 
-    let before = daemon.last_auto_dispatch;
+    let before = daemon.scheduler.last_auto_dispatch;
     daemon.maybe_auto_dispatch().unwrap();
-    assert_eq!(daemon.last_auto_dispatch, before);
+    assert_eq!(daemon.scheduler.last_auto_dispatch, before);
 }
 
 #[test]
@@ -708,18 +721,18 @@ fn test_maybe_auto_dispatch_skips_when_disabled() {
             ..BoardConfig::default()
         })
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
 
-    let before = daemon.last_auto_dispatch;
+    let before = daemon.scheduler.last_auto_dispatch;
     daemon.maybe_auto_dispatch().unwrap();
-    assert_eq!(daemon.last_auto_dispatch, before);
+    assert_eq!(daemon.scheduler.last_auto_dispatch, before);
 }
 
 #[test]
 fn test_maybe_auto_dispatch_skips_when_main_smoke_blocks_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
     let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
-    daemon.main_smoke_state = Some(MainSmokeState {
+    daemon.verification.main_smoke_state = Some(MainSmokeState {
         broken: true,
         pause_dispatch: true,
         last_run_at: 1,
@@ -728,11 +741,11 @@ fn test_maybe_auto_dispatch_skips_when_main_smoke_blocks_dispatch() {
         suspects: vec!["abc1234 break main".to_string()],
         summary: Some("could not compile `batty-cli`".to_string()),
     });
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
 
-    let before = daemon.last_auto_dispatch;
+    let before = daemon.scheduler.last_auto_dispatch;
     daemon.maybe_auto_dispatch().unwrap();
-    assert_eq!(daemon.last_auto_dispatch, before);
+    assert_eq!(daemon.scheduler.last_auto_dispatch, before);
 }
 
 /// Start a main smoke run and pump the poll step until its background
@@ -740,7 +753,7 @@ fn test_maybe_auto_dispatch_skips_when_main_smoke_blocks_dispatch() {
 fn run_main_smoke_and_wait(daemon: &mut TeamDaemon) {
     daemon.maybe_run_main_smoke().unwrap();
     let deadline = Instant::now() + Duration::from_secs(300);
-    while daemon.background_tests.main_smoke.is_some() {
+    while daemon.verification.background_tests.main_smoke.is_some() {
         assert!(Instant::now() < deadline, "main smoke did not finish");
         std::thread::sleep(Duration::from_millis(10));
         daemon.maybe_run_main_smoke().unwrap();
@@ -773,12 +786,16 @@ fn main_smoke_detects_broken_main_and_recovers() {
     git_ok(&repo, &["add", "src/lib.rs"]);
     git_ok(&repo, &["commit", "-m", "break main"]);
 
-    daemon.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
+    daemon.verification.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
     run_main_smoke_and_wait(&mut daemon);
 
     let broken_commit =
         crate::team::test_support::git_stdout(&repo, &["rev-parse", "--short", "HEAD"]);
-    let state = daemon.main_smoke_state.as_ref().expect("main smoke state");
+    let state = daemon
+        .verification
+        .main_smoke_state
+        .as_ref()
+        .expect("main smoke state");
     assert!(state.broken);
     assert_eq!(state.broken_commit.as_deref(), Some(broken_commit.as_str()));
     assert!(state.pause_dispatch);
@@ -792,15 +809,15 @@ fn main_smoke_detects_broken_main_and_recovers() {
         state.summary
     );
 
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
-    let before_dispatch = daemon.last_auto_dispatch;
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    let before_dispatch = daemon.scheduler.last_auto_dispatch;
     daemon.maybe_auto_dispatch().unwrap();
     assert_eq!(
         daemon.active_task_id("eng-1"),
         None,
         "dispatch should stay gated while main is broken"
     );
-    assert_eq!(daemon.last_auto_dispatch, before_dispatch);
+    assert_eq!(daemon.scheduler.last_auto_dispatch, before_dispatch);
 
     let events_path = repo.join(".batty").join("team_config").join("events.jsonl");
     let events = crate::team::events::read_events(&events_path).unwrap();
@@ -816,10 +833,14 @@ fn main_smoke_detects_broken_main_and_recovers() {
     git_ok(&repo, &["add", "src/lib.rs"]);
     git_ok(&repo, &["commit", "-m", "repair main"]);
 
-    daemon.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
+    daemon.verification.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
     run_main_smoke_and_wait(&mut daemon);
 
-    let recovered = daemon.main_smoke_state.as_ref().expect("main smoke state");
+    let recovered = daemon
+        .verification
+        .main_smoke_state
+        .as_ref()
+        .expect("main smoke state");
     assert!(
         !recovered.broken,
         "main smoke should clear once main is healthy"
@@ -1480,7 +1501,7 @@ fn maybe_fire_nudges_marks_member_working_after_live_delivery() {
         daemon.maybe_fire_nudges().unwrap();
 
         if daemon.states.get("scientist") == Some(&MemberState::Working) {
-            let schedule = daemon.nudges.get("scientist").unwrap();
+            let schedule = daemon.interventions.nudges.get("scientist").unwrap();
             assert!(schedule.paused);
             assert!(schedule.idle_since.is_none());
             assert!(!schedule.fired_this_idle);
@@ -1541,7 +1562,10 @@ fn maybe_intervene_triage_backlog_marks_member_working_after_live_delivery() {
     backdate_idle_grace(&mut daemon, "lead");
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&1));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&1)
+    );
     if daemon.states.get("lead") == Some(&MemberState::Working) {
         let pane = (0..50)
             .find_map(|_| {
@@ -1598,7 +1622,10 @@ fn maybe_intervene_triage_backlog_queues_when_live_delivery_falls_back_to_inbox(
     daemon.maybe_intervene_triage_backlog().unwrap();
 
     assert_eq!(daemon.states.get("lead"), Some(&MemberState::Idle));
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&1));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&1)
+    );
     let pending = inbox::pending_messages(&root, "lead").unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].from, "architect");
@@ -1633,7 +1660,12 @@ fn maybe_intervene_triage_backlog_does_not_fire_on_startup_idle() {
 
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert!(!daemon.triage_interventions.contains_key("lead"));
+    assert!(
+        !daemon
+            .interventions
+            .triage_interventions
+            .contains_key("lead")
+    );
     assert!(inbox::pending_messages(&root, "lead").unwrap().is_empty());
     assert_eq!(daemon.states.get("lead"), Some(&MemberState::Idle));
 }
@@ -1662,6 +1694,7 @@ fn maybe_intervene_owned_tasks_queues_when_idle_member_owns_unfinished_task() {
     assert_eq!(daemon.states.get("lead"), Some(&MemberState::Idle));
     assert_eq!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("lead")
             .map(|state| state.idle_epoch),
@@ -1718,7 +1751,11 @@ fn maybe_intervene_owned_tasks_engineer_message_captures_initial_state() {
     assert!(pending[0].body.contains("Task #191"));
     assert!(pending[0].body.contains("batty send lead"));
 
-    let state = daemon.owned_task_interventions.get("eng-1").unwrap();
+    let state = daemon
+        .interventions
+        .owned_task_interventions
+        .get("eng-1")
+        .unwrap();
     assert_eq!(state.idle_epoch, 1);
     assert_eq!(state.signature, "191:in-progress");
     assert!(!state.escalation_sent);
@@ -1794,6 +1831,7 @@ fn maybe_intervene_owned_tasks_fires_for_persistent_startup_idle_state() {
     assert!(pending[0].body.contains("Task #191"));
     assert_eq!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("lead")
             .map(|state| state.idle_epoch),
@@ -1846,7 +1884,10 @@ fn maybe_intervene_owned_tasks_skips_when_pending_inbox_exists() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].from, "architect");
     assert!(
-        !daemon.owned_task_interventions.contains_key("lead"),
+        !daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("lead"),
         "pending inbox should block new interventions"
     );
 }
@@ -1868,7 +1909,12 @@ fn maybe_intervene_owned_tasks_ignores_review_only_claims() {
     daemon.update_automation_timers_for_state("lead", MemberState::Idle);
     daemon.maybe_intervene_owned_tasks().unwrap();
 
-    assert!(!daemon.owned_task_interventions.contains_key("lead"));
+    assert!(
+        !daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("lead")
+    );
     assert!(inbox::pending_messages(&root, "lead").unwrap().is_empty());
 }
 
@@ -1903,6 +1949,7 @@ fn maybe_intervene_owned_tasks_dedupes_same_active_signature_across_idle_epochs(
     assert_eq!(pending.len(), 1);
     assert_eq!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("lead")
             .map(|state| state.idle_epoch),
@@ -1919,6 +1966,7 @@ fn backdate_intervention_cooldown(daemon: &mut TeamDaemon, key: &str) {
             .intervention_cooldown_secs,
     ) + Duration::from_secs(1);
     daemon
+        .scheduler
         .intervention_cooldowns
         .insert(key.to_string(), Instant::now() - cooldown);
 }
@@ -1944,7 +1992,11 @@ fn owned_task_intervention_updates_signature_when_board_state_changes() {
     backdate_idle_grace(&mut daemon, "eng-1");
     daemon.maybe_intervene_owned_tasks().unwrap();
 
-    let initial = daemon.owned_task_interventions.get("eng-1").unwrap();
+    let initial = daemon
+        .interventions
+        .owned_task_interventions
+        .get("eng-1")
+        .unwrap();
     assert_eq!(initial.signature, "191:in-progress");
 
     for message in inbox::pending_messages(&root, "eng-1").unwrap() {
@@ -1960,7 +2012,11 @@ fn owned_task_intervention_updates_signature_when_board_state_changes() {
     assert!(pending[0].body.contains("Task #191"));
     assert!(pending[0].body.contains("#192 (in-progress) second-task"));
 
-    let updated = daemon.owned_task_interventions.get("eng-1").unwrap();
+    let updated = daemon
+        .interventions
+        .owned_task_interventions
+        .get("eng-1")
+        .unwrap();
     assert_eq!(updated.signature, "191:in-progress|192:in-progress");
     assert!(!updated.escalation_sent);
 }
@@ -2016,7 +2072,7 @@ fn triage_intervention_respects_cooldown() {
         ]))
         .states(HashMap::from([("lead".to_string(), MemberState::Idle)]))
         .build();
-    daemon.triage_idle_epochs = HashMap::from([("lead".to_string(), 1)]);
+    daemon.interventions.triage_idle_epochs = HashMap::from([("lead".to_string(), 1)]);
 
     let root = inbox::inboxes_root(tmp.path());
     inbox::init_inbox(&root, "lead").unwrap();
@@ -2099,7 +2155,11 @@ fn maybe_intervene_owned_tasks_escalates_stuck_signature_to_parent() {
     backdate_idle_grace(&mut daemon, "eng-1");
     daemon.maybe_intervene_owned_tasks().unwrap();
 
-    let state = daemon.owned_task_interventions.get_mut("eng-1").unwrap();
+    let state = daemon
+        .interventions
+        .owned_task_interventions
+        .get_mut("eng-1")
+        .unwrap();
     state.detected_at = Instant::now() - Duration::from_secs(121);
 
     daemon.maybe_intervene_owned_tasks().unwrap();
@@ -2116,6 +2176,7 @@ fn maybe_intervene_owned_tasks_escalates_stuck_signature_to_parent() {
     assert!(lead_pending[0].body.contains("batty assign eng-1"));
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("eng-1")
             .is_some_and(|state| state.escalation_sent)
@@ -2160,7 +2221,11 @@ fn maybe_intervene_owned_tasks_only_escalates_stuck_signature_once() {
     backdate_idle_grace(&mut daemon, "eng-1");
     daemon.maybe_intervene_owned_tasks().unwrap();
 
-    let state = daemon.owned_task_interventions.get_mut("eng-1").unwrap();
+    let state = daemon
+        .interventions
+        .owned_task_interventions
+        .get_mut("eng-1")
+        .unwrap();
     state.detected_at = Instant::now() - Duration::from_secs(121);
 
     daemon.maybe_intervene_owned_tasks().unwrap();
@@ -2171,6 +2236,7 @@ fn maybe_intervene_owned_tasks_only_escalates_stuck_signature_once() {
     assert!(lead_pending[0].body.contains("Stuck task escalation"));
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("eng-1")
             .is_some_and(|state| state.escalation_sent)
@@ -2216,7 +2282,11 @@ fn maybe_intervene_owned_tasks_waits_for_escalation_threshold() {
     backdate_idle_grace(&mut daemon, "eng-1");
     daemon.maybe_intervene_owned_tasks().unwrap();
 
-    let state = daemon.owned_task_interventions.get_mut("eng-1").unwrap();
+    let state = daemon
+        .interventions
+        .owned_task_interventions
+        .get_mut("eng-1")
+        .unwrap();
     state.detected_at = Instant::now() - Duration::from_secs(119);
 
     daemon.maybe_intervene_owned_tasks().unwrap();
@@ -2224,6 +2294,7 @@ fn maybe_intervene_owned_tasks_waits_for_escalation_threshold() {
     assert!(inbox::pending_messages(&root, "lead").unwrap().is_empty());
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("eng-1")
             .is_some_and(|state| !state.escalation_sent)
@@ -2296,6 +2367,7 @@ fn maybe_intervene_review_backlog_queues_for_idle_manager_with_branch_and_worktr
     );
     assert_eq!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("review::lead")
             .map(|state| state.idle_epoch),
@@ -2502,7 +2574,12 @@ fn maybe_intervene_review_backlog_does_not_fire_on_startup_idle() {
     daemon.maybe_intervene_review_backlog().unwrap();
 
     assert!(inbox::pending_messages(&root, "lead").unwrap().is_empty());
-    assert!(!daemon.owned_task_interventions.contains_key("review::lead"));
+    assert!(
+        !daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("review::lead")
+    );
 }
 
 #[test]
@@ -2770,6 +2847,7 @@ fn maybe_intervene_manager_dispatch_gap_queues_for_idle_lead_with_idle_reports()
     assert!(pending[0].body.contains("batty send architect"));
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .contains_key("dispatch::lead")
     );
@@ -2826,6 +2904,7 @@ fn maybe_intervene_architect_utilization_queues_for_underloaded_idle_architect()
     assert!(pending[0].body.contains("Start Task #192 on eng-2"));
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .contains_key("utilization::architect")
     );
@@ -2863,7 +2942,7 @@ fn architect_utilization_suppresses_idle_active_until_owned_task_escalates() {
     write_owned_task_file(tmp.path(), 191, "active-task", "in-progress", "eng-1");
 
     // Simulate owned-task just nudging eng-1 in this tick; no escalation yet.
-    daemon.owned_task_interventions.insert(
+    daemon.interventions.owned_task_interventions.insert(
         "eng-1".to_string(),
         super::interventions::OwnedTaskInterventionState {
             idle_epoch: 0,
@@ -2884,6 +2963,7 @@ fn architect_utilization_suppresses_idle_active_until_owned_task_escalates() {
     );
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("utilization::architect"),
         "utilization intervention state must not be recorded when suppressed"
@@ -2892,6 +2972,7 @@ fn architect_utilization_suppresses_idle_active_until_owned_task_escalates() {
     // Once owned-task escalates, the suppression must lift so the architect
     // sees the sticking engineer.
     daemon
+        .interventions
         .owned_task_interventions
         .get_mut("eng-1")
         .unwrap()
@@ -2943,11 +3024,13 @@ fn zero_engineers_topology_skips_executor_interventions() {
     assert!(inbox::pending_messages(&root, "lead").unwrap().is_empty());
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("dispatch::lead")
     );
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("utilization::architect")
     );
@@ -2990,6 +3073,7 @@ fn single_role_topology_nudges_idle_member() {
     assert_eq!(daemon.states.get("solo"), Some(&MemberState::Idle));
     assert!(
         daemon
+            .interventions
             .nudges
             .get("solo")
             .is_some_and(|schedule| schedule.fired_this_idle)
@@ -3049,8 +3133,8 @@ fn all_members_working_suppresses_interventions() {
     assert!(inbox::pending_messages(&root, "lead").unwrap().is_empty());
     assert!(inbox::pending_messages(&root, "eng-1").unwrap().is_empty());
     assert!(inbox::pending_messages(&root, "eng-2").unwrap().is_empty());
-    assert!(daemon.triage_interventions.is_empty());
-    assert!(daemon.owned_task_interventions.is_empty());
+    assert!(daemon.interventions.triage_interventions.is_empty());
+    assert!(daemon.interventions.owned_task_interventions.is_empty());
 }
 
 #[test]
@@ -3089,6 +3173,7 @@ fn manager_dispatch_gap_skips_when_pending_inbox_exists() {
     assert_eq!(pending[0].from, "architect");
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("dispatch::lead")
     );
@@ -3116,7 +3201,7 @@ fn owned_task_intervention_refires_at_exact_cooldown_boundary() {
     );
 
     backdate_idle_grace(&mut daemon, "lead");
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         "lead".to_string(),
         Instant::now() - (cooldown - Duration::from_secs(1)),
     );
@@ -3124,6 +3209,7 @@ fn owned_task_intervention_refires_at_exact_cooldown_boundary() {
     assert!(inbox::pending_messages(&root, "lead").unwrap().is_empty());
 
     daemon
+        .scheduler
         .intervention_cooldowns
         .insert("lead".to_string(), Instant::now() - cooldown);
     daemon.maybe_intervene_owned_tasks().unwrap();
@@ -3135,7 +3221,12 @@ fn owned_task_intervention_refires_at_exact_cooldown_boundary() {
             .body
             .contains("Owned active task backlog detected")
     );
-    assert!(daemon.owned_task_interventions.contains_key("lead"));
+    assert!(
+        daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("lead")
+    );
 }
 
 #[test]
@@ -3189,8 +3280,8 @@ fn empty_board_skips_interventions() {
     );
     assert!(inbox::pending_messages(&root, "lead").unwrap().is_empty());
     assert!(inbox::pending_messages(&root, "eng-1").unwrap().is_empty());
-    assert!(daemon.triage_interventions.is_empty());
-    assert!(daemon.owned_task_interventions.is_empty());
+    assert!(daemon.interventions.triage_interventions.is_empty());
+    assert!(daemon.interventions.owned_task_interventions.is_empty());
 }
 
 #[test]
@@ -3210,7 +3301,7 @@ fn test_starvation_detected() {
         pending[0].body,
         "Pipeline running dry: 2 idle engineers, 1 todo tasks."
     );
-    assert!(daemon.pipeline_starvation_fired);
+    assert!(daemon.scheduler.pipeline_starvation_fired);
 }
 
 #[test]
@@ -3226,7 +3317,7 @@ fn test_debounce() {
 
     let pending = inbox::pending_messages(&root, "architect").unwrap();
     assert_eq!(pending.len(), 1);
-    assert!(daemon.pipeline_starvation_fired);
+    assert!(daemon.scheduler.pipeline_starvation_fired);
 }
 
 #[test]
@@ -3243,7 +3334,7 @@ fn test_threshold_config() {
             .unwrap()
             .is_empty()
     );
-    assert!(!daemon.pipeline_starvation_fired);
+    assert!(!daemon.scheduler.pipeline_starvation_fired);
 
     let disabled_tmp = tempfile::tempdir().unwrap();
     let mut disabled_daemon = starvation_test_daemon(&disabled_tmp, None);
@@ -3257,7 +3348,7 @@ fn test_threshold_config() {
             .unwrap()
             .is_empty()
     );
-    assert!(!disabled_daemon.pipeline_starvation_fired);
+    assert!(!disabled_daemon.scheduler.pipeline_starvation_fired);
 }
 
 #[test]
@@ -3269,17 +3360,17 @@ fn test_reset_when_work_added() {
     write_open_task_file(tmp.path(), 101, "queued-task", "todo");
 
     daemon.maybe_detect_pipeline_starvation().unwrap();
-    assert!(daemon.pipeline_starvation_fired);
+    assert!(daemon.scheduler.pipeline_starvation_fired);
 
     // Parity (2 tasks == 2 engineers) does NOT clear — need surplus to reset
     write_open_task_file(tmp.path(), 102, "queued-task-2", "backlog");
     daemon.maybe_detect_pipeline_starvation().unwrap();
-    assert!(daemon.pipeline_starvation_fired);
+    assert!(daemon.scheduler.pipeline_starvation_fired);
 
     // Surplus (3 tasks > 2 engineers) clears the flag
     write_open_task_file(tmp.path(), 103, "queued-task-3", "backlog");
     daemon.maybe_detect_pipeline_starvation().unwrap();
-    assert!(!daemon.pipeline_starvation_fired);
+    assert!(!daemon.scheduler.pipeline_starvation_fired);
 
     // Remove surplus — back to 1 task for 2 engineers, starvation re-fires after cooldown
     std::fs::remove_file(
@@ -3300,12 +3391,13 @@ fn test_reset_when_work_added() {
             .join("103-queued-task-3.md"),
     )
     .unwrap();
-    daemon.pipeline_starvation_last_fired = Some(Instant::now() - Duration::from_secs(301));
+    daemon.scheduler.pipeline_starvation_last_fired =
+        Some(Instant::now() - Duration::from_secs(301));
     daemon.maybe_detect_pipeline_starvation().unwrap();
 
     let pending = inbox::pending_messages(&root, "architect").unwrap();
     assert_eq!(pending.len(), 2);
-    assert!(daemon.pipeline_starvation_fired);
+    assert!(daemon.scheduler.pipeline_starvation_fired);
 }
 
 #[test]
@@ -3333,7 +3425,7 @@ fn starvation_suppressed_when_engineer_has_active_board_item() {
     // 1 idle engineer, 1 unclaimed todo task => no deficit => no alert
     let pending = inbox::pending_messages(&root, "architect").unwrap();
     assert!(pending.is_empty());
-    assert!(!daemon.pipeline_starvation_fired);
+    assert!(!daemon.scheduler.pipeline_starvation_fired);
 }
 
 #[test]
@@ -3401,7 +3493,10 @@ fn maybe_intervene_triage_backlog_does_not_refire_while_prior_intervention_remai
     backdate_idle_grace(&mut daemon, "lead");
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&1));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&1)
+    );
     let pending = inbox::pending_messages(&root, "lead").unwrap();
     assert_eq!(pending.len(), 1);
     assert!(pending.iter().all(|message| message.from == "architect"));
@@ -3437,7 +3532,7 @@ fn maybe_fire_nudges_keeps_member_idle_when_delivery_falls_back_to_inbox() {
     daemon.maybe_fire_nudges().unwrap();
 
     assert_eq!(daemon.states.get("scientist"), Some(&MemberState::Idle));
-    let schedule = daemon.nudges.get("scientist").unwrap();
+    let schedule = daemon.interventions.nudges.get("scientist").unwrap();
     assert!(!schedule.paused);
     assert!(schedule.fired_this_idle);
 
@@ -3486,7 +3581,7 @@ fn maybe_fire_nudges_skips_when_pending_inbox_exists() {
     let messages = inbox::pending_messages(&root, "scientist").unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].from, "architect");
-    let schedule = daemon.nudges.get("scientist").unwrap();
+    let schedule = daemon.interventions.nudges.get("scientist").unwrap();
     assert!(!schedule.fired_this_idle);
     assert_eq!(daemon.states.get("scientist"), Some(&MemberState::Idle));
 }
@@ -5243,7 +5338,7 @@ fn aging_dirty_lane_requests_checkpoint_before_escalating() {
             .is_empty()
     );
 
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         "aging::task_checkpoint::75".to_string(),
         Instant::now() - Duration::from_secs(61),
     );
@@ -5374,12 +5469,15 @@ fn stale_review_sends_nudge_at_threshold() {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    daemon.review_first_seen.insert(42, now - 1801);
+    daemon
+        .interventions
+        .review_first_seen
+        .insert(42, now - 1801);
 
     daemon.maybe_escalate_stale_reviews().unwrap();
 
     // Nudge should have been sent
-    assert!(daemon.review_nudge_sent.contains(&42));
+    assert!(daemon.interventions.review_nudge_sent.contains(&42));
 
     // Event should be emitted (check event sink wrote something)
     let events_path = tmp
@@ -5435,13 +5533,16 @@ fn stale_review_escalates_at_timeout() {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    daemon.review_first_seen.insert(42, now - 7201);
+    daemon
+        .interventions
+        .review_first_seen
+        .insert(42, now - 7201);
 
     daemon.maybe_escalate_stale_reviews().unwrap();
 
     // Task should no longer be tracked (it was escalated)
-    assert!(!daemon.review_first_seen.contains_key(&42));
-    assert!(!daemon.review_nudge_sent.contains(&42));
+    assert!(!daemon.interventions.review_first_seen.contains_key(&42));
+    assert!(!daemon.interventions.review_nudge_sent.contains(&42));
 
     // Task should be transitioned to blocked
     let tasks_dir = tmp
@@ -5478,11 +5579,14 @@ fn nudge_only_sent_once() {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    daemon.review_first_seen.insert(42, now - 1801);
+    daemon
+        .interventions
+        .review_first_seen
+        .insert(42, now - 1801);
 
     // First call: nudge sent
     daemon.maybe_escalate_stale_reviews().unwrap();
-    assert!(daemon.review_nudge_sent.contains(&42));
+    assert!(daemon.interventions.review_nudge_sent.contains(&42));
 
     // Count events
     let events_path = tmp
@@ -5557,12 +5661,12 @@ fn critical_task_nudges_at_priority_override_threshold() {
         .unwrap_or_default()
         .as_secs();
     // 301s > critical nudge threshold of 300s
-    daemon.review_first_seen.insert(50, now - 301);
+    daemon.interventions.review_first_seen.insert(50, now - 301);
 
     daemon.maybe_escalate_stale_reviews().unwrap();
 
     assert!(
-        daemon.review_nudge_sent.contains(&50),
+        daemon.interventions.review_nudge_sent.contains(&50),
         "critical task should be nudged at 300s override"
     );
 }
@@ -5578,12 +5682,12 @@ fn critical_task_not_nudged_below_override_threshold() {
         .unwrap_or_default()
         .as_secs();
     // 200s < critical nudge threshold of 300s
-    daemon.review_first_seen.insert(50, now - 200);
+    daemon.interventions.review_first_seen.insert(50, now - 200);
 
     daemon.maybe_escalate_stale_reviews().unwrap();
 
     assert!(
-        !daemon.review_nudge_sent.contains(&50),
+        !daemon.interventions.review_nudge_sent.contains(&50),
         "critical task should not be nudged before 300s"
     );
 }
@@ -5599,12 +5703,12 @@ fn critical_task_escalates_at_priority_override_threshold() {
         .unwrap_or_default()
         .as_secs();
     // 601s > critical escalation threshold of 600s
-    daemon.review_first_seen.insert(50, now - 601);
+    daemon.interventions.review_first_seen.insert(50, now - 601);
 
     daemon.maybe_escalate_stale_reviews().unwrap();
 
     // Task escalated — removed from tracking
-    assert!(!daemon.review_first_seen.contains_key(&50));
+    assert!(!daemon.interventions.review_first_seen.contains_key(&50));
 
     // Task should be blocked
     let tasks_dir = tmp
@@ -5629,12 +5733,15 @@ fn medium_task_uses_global_thresholds_when_no_override() {
         .unwrap_or_default()
         .as_secs();
     // 1000s > critical override (300s) but < global nudge (1800s)
-    daemon.review_first_seen.insert(51, now - 1000);
+    daemon
+        .interventions
+        .review_first_seen
+        .insert(51, now - 1000);
 
     daemon.maybe_escalate_stale_reviews().unwrap();
 
     assert!(
-        !daemon.review_nudge_sent.contains(&51),
+        !daemon.interventions.review_nudge_sent.contains(&51),
         "medium task should use global 1800s threshold, not critical 300s"
     );
 }
@@ -5651,17 +5758,17 @@ fn mixed_priority_tasks_get_different_thresholds() {
         .unwrap_or_default()
         .as_secs();
     // Both at 400s age: exceeds critical nudge (300s) but not medium nudge (1800s)
-    daemon.review_first_seen.insert(60, now - 400);
-    daemon.review_first_seen.insert(61, now - 400);
+    daemon.interventions.review_first_seen.insert(60, now - 400);
+    daemon.interventions.review_first_seen.insert(61, now - 400);
 
     daemon.maybe_escalate_stale_reviews().unwrap();
 
     assert!(
-        daemon.review_nudge_sent.contains(&60),
+        daemon.interventions.review_nudge_sent.contains(&60),
         "critical task should be nudged at 400s (threshold 300s)"
     );
     assert!(
-        !daemon.review_nudge_sent.contains(&61),
+        !daemon.interventions.review_nudge_sent.contains(&61),
         "medium task should NOT be nudged at 400s (threshold 1800s)"
     );
 }
@@ -5858,7 +5965,7 @@ fn restore_pending_verification_tasks_re_owns_only_tasks_still_claimed() {
     write_owned_task_file(tmp.path(), 42, "verifying", "review", "eng-1");
     write_owned_task_file(tmp.path(), 7, "already-done", "done", "eng-2");
     let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
-    daemon.background_tests.retriggers =
+    daemon.verification.background_tests.retriggers =
         HashMap::from([("eng-1".to_string(), 42), ("eng-2".to_string(), 7)]);
 
     daemon.restore_pending_verification_tasks();
@@ -5866,7 +5973,7 @@ fn restore_pending_verification_tasks_re_owns_only_tasks_still_claimed() {
     assert_eq!(daemon.active_task_id("eng-1"), Some(42));
     assert_eq!(daemon.active_task_id("eng-2"), None);
     assert_eq!(
-        daemon.background_tests.retriggers,
+        daemon.verification.background_tests.retriggers,
         HashMap::from([("eng-1".to_string(), 42)])
     );
 }
@@ -5876,6 +5983,7 @@ fn persisted_pending_verifications_are_restored_as_retriggers() {
     let tmp = tempfile::tempdir().unwrap();
     let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
     daemon
+        .verification
         .background_tests
         .retriggers
         .insert("eng-1".to_string(), 42);
@@ -5884,7 +5992,11 @@ fn persisted_pending_verifications_are_restored_as_retriggers() {
     let mut restarted = TestDaemonBuilder::new(tmp.path()).build();
     restarted.restore_runtime_state();
     assert_eq!(
-        restarted.background_tests.retriggers.get("eng-1"),
+        restarted
+            .verification
+            .background_tests
+            .retriggers
+            .get("eng-1"),
         Some(&42)
     );
 }
@@ -5903,7 +6015,7 @@ fn slow_main_smoke_runs_in_background() {
             ..WorkflowPolicy::default()
         })
         .build();
-    daemon.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
+    daemon.verification.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
 
     let started = Instant::now();
     daemon.maybe_run_main_smoke().unwrap();
@@ -5912,16 +6024,20 @@ fn slow_main_smoke_runs_in_background() {
         "main smoke blocked the poll for {:?}",
         started.elapsed()
     );
-    assert!(daemon.background_tests.main_smoke.is_some());
-    assert!(daemon.main_smoke_state.is_none());
+    assert!(daemon.verification.background_tests.main_smoke.is_some());
+    assert!(daemon.verification.main_smoke_state.is_none());
 
     // Polling while it runs neither blocks nor starts a second run.
-    daemon.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
+    daemon.verification.last_main_smoke_check = Instant::now() - Duration::from_secs(30);
     daemon.maybe_run_main_smoke().unwrap();
-    assert!(daemon.main_smoke_state.is_none());
+    assert!(daemon.verification.main_smoke_state.is_none());
 
     run_main_smoke_and_wait(&mut daemon);
-    let state = daemon.main_smoke_state.as_ref().expect("main smoke state");
+    let state = daemon
+        .verification
+        .main_smoke_state
+        .as_ref()
+        .expect("main smoke state");
     assert!(!state.broken);
 }
 
@@ -5931,9 +6047,9 @@ fn new_daemon_periodic_checks_are_due_without_backdating_instants() {
     // duration; "never ran" is represented as None and is always due.
     let tmp = tempfile::tempdir().unwrap();
     let daemon = crate::team::test_helpers::make_test_daemon(tmp.path(), Vec::new());
-    assert!(daemon.last_health_check.is_none());
-    assert!(daemon.last_shared_target_cleanup.is_none());
-    assert!(daemon.last_disk_hygiene_check.is_none());
-    assert!(daemon.last_binary_freshness_check.is_none());
-    assert!(daemon.last_tiered_inbox_sweep.is_none());
+    assert!(daemon.health.last_health_check.is_none());
+    assert!(daemon.health.last_shared_target_cleanup.is_none());
+    assert!(daemon.health.last_disk_hygiene_check.is_none());
+    assert!(daemon.scheduler.last_binary_freshness_check.is_none());
+    assert!(daemon.scheduler.last_tiered_inbox_sweep.is_none());
 }

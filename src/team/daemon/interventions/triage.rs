@@ -72,12 +72,22 @@ impl TeamDaemon {
                 continue;
             }
 
-            let idle_epoch = self.triage_idle_epochs.get(&name).copied().unwrap_or(0);
+            let idle_epoch = self
+                .interventions
+                .triage_idle_epochs
+                .get(&name)
+                .copied()
+                .unwrap_or(0);
             if idle_epoch == 0 {
                 continue;
             }
 
-            let already_notified_for = self.triage_interventions.get(&name).copied().unwrap_or(0);
+            let already_notified_for = self
+                .interventions
+                .triage_interventions
+                .get(&name)
+                .copied()
+                .unwrap_or(0);
             if already_notified_for >= idle_epoch {
                 continue;
             }
@@ -101,8 +111,11 @@ impl TeamDaemon {
                 "recovery: triage intervention for {} with {} pending direct-report result(s)",
                 name, triage_state.count
             ));
-            self.triage_interventions.insert(name.clone(), idle_epoch);
-            self.intervention_cooldowns
+            self.interventions
+                .triage_interventions
+                .insert(name.clone(), idle_epoch);
+            self.scheduler
+                .intervention_cooldowns
                 .insert(triage_cooldown_key, Instant::now());
             if delivered_live {
                 self.mark_member_working(&name);

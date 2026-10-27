@@ -394,7 +394,8 @@ impl TeamDaemon {
                     &format!("-> {sender}: {}", Self::shim_assignment_preview(task)),
                 );
             } else if !handle.is_terminal() {
-                self.pending_delivery_queue
+                self.delivery
+                    .pending_queue
                     .entry(engineer.to_string())
                     .or_default()
                     .push(PendingMessage {
@@ -763,12 +764,12 @@ impl TeamDaemon {
             return Ok(());
         }
         self.reconcile_active_tasks()?;
-        if self.dispatch_paused_by_main_smoke() {
+        if self.verification.dispatch_paused_by_main_smoke() {
             debug!("auto-dispatch skipped because main smoke has gated dispatch");
             return Ok(());
         }
 
-        let elapsed = self.last_auto_dispatch.elapsed();
+        let elapsed = self.scheduler.last_auto_dispatch.elapsed();
         if elapsed < Duration::from_secs(10) {
             return Ok(());
         }
@@ -783,7 +784,7 @@ impl TeamDaemon {
         if let Err(error) = self.process_dispatch_queue() {
             warn!(error = %error, "auto-dispatch failed");
         }
-        self.last_auto_dispatch = Instant::now();
+        self.scheduler.last_auto_dispatch = Instant::now();
         Ok(())
     }
 }

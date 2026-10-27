@@ -74,10 +74,10 @@ impl TeamDaemon {
     }
 
     fn retrigger_pending_verifications(&mut self) {
-        if self.background_tests.retriggers.is_empty() {
+        if self.verification.background_tests.retriggers.is_empty() {
             return;
         }
-        let pending = std::mem::take(&mut self.background_tests.retriggers);
+        let pending = std::mem::take(&mut self.verification.background_tests.retriggers);
         for (engineer, task_id) in pending {
             if self.active_task_id(&engineer) != Some(task_id) {
                 info!(
@@ -107,7 +107,7 @@ impl TeamDaemon {
     /// interrupted, so the re-run is not mistaken for orphaned work. Entries
     /// whose task changed on the board are dropped.
     pub(super) fn restore_pending_verification_tasks(&mut self) {
-        if self.background_tests.retriggers.is_empty() {
+        if self.verification.background_tests.retriggers.is_empty() {
             return;
         }
         let tasks_dir = self.board_dir().join("tasks");
@@ -118,7 +118,7 @@ impl TeamDaemon {
                 return;
             }
         };
-        let pending = std::mem::take(&mut self.background_tests.retriggers);
+        let pending = std::mem::take(&mut self.verification.background_tests.retriggers);
         for (engineer, task_id) in pending {
             let still_owned = tasks.iter().any(|task| {
                 task.id == task_id
@@ -134,7 +134,10 @@ impl TeamDaemon {
                 continue;
             }
             self.active_tasks.insert(engineer.clone(), task_id);
-            self.background_tests.retriggers.insert(engineer, task_id);
+            self.verification
+                .background_tests
+                .retriggers
+                .insert(engineer, task_id);
         }
     }
 
@@ -142,32 +145,33 @@ impl TeamDaemon {
     /// completion verifications are kept as re-triggers, so they are
     /// persisted and re-run instead of being lost.
     pub(crate) fn stop_background_tests(&mut self) {
-        for (engineer, job) in self.background_tests.verification.drain() {
+        for (engineer, job) in self.verification.background_tests.verification.drain() {
             info!(
                 engineer = %engineer,
                 task_id = job.task_id(),
                 "stopping background verification; it will re-run after restart"
             );
             job.kill();
-            self.background_tests
+            self.verification
+                .background_tests
                 .retriggers
                 .insert(engineer, job.task_id());
         }
         // A merge that already landed keeps its in-flight record (persisted
         // by the caller); its verification re-runs after restart.
-        if let Some(task_id) = self.merge_queue.suspend_in_flight() {
+        if let Some(task_id) = self.merge.queue.suspend_in_flight() {
             info!(
                 task_id,
                 "stopping post-merge verification; it will re-run after restart"
             );
         }
-        if let Some(smoke) = self.background_tests.main_smoke.take() {
+        if let Some(smoke) = self.verification.background_tests.main_smoke.take() {
             info!(command = %smoke.command, "stopping background main smoke check");
             smoke.job.kill();
         }
-        for chat in std::mem::take(&mut self.background_tests.chat_merges) {
+        for chat in std::mem::take(&mut self.verification.background_tests.chat_merges) {
             chat.job.kill();
-            self.send_chat_reply(
+            self.integrations.send_chat_reply(
                 &chat.reply_to,
                 &format!(
                     "Merge of Task #{} was interrupted by a daemon restart; send the merge command again.",

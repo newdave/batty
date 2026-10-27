@@ -113,7 +113,8 @@ impl TeamDaemon {
             // #684 / #686: same exponential-backoff dispatch-cooldown pattern
             // as runtime orphan rescue — repeated resets of the same task
             // stretch the quiet window instead of re-cascading every base window.
-            self.record_task_rescue(task.id);
+            self.dispatch
+                .record_task_rescue(task.id, self.orphan_rescue_cooldown());
             self.log_auto_doctor_action(
                 "orphaned_in_progress_reset",
                 Some(task.id),

@@ -27,25 +27,26 @@ impl TeamDaemon {
     }
 
     fn poll_telegram(&mut self) -> Result<()> {
-        if self.telegram_bot.is_none() {
+        if self.integrations.telegram_bot.is_none() {
             return Ok(());
         }
 
         let messages = match self
+            .integrations
             .telegram_bot
             .as_mut()
             .expect("checked telegram bot presence")
             .poll_updates()
         {
             Ok(msgs) => {
-                if let Some(transition) = self.telegram_health.record_success() {
+                if let Some(transition) = self.integrations.telegram_health.record_success() {
                     self.report_integration_health("telegram", transition, "");
                 }
                 msgs
             }
             Err(error) => {
                 debug!(error = %error, "telegram poll failed");
-                if let Some(transition) = self.telegram_health.record_failure() {
+                if let Some(transition) = self.integrations.telegram_health.record_failure() {
                     self.report_integration_health("telegram", transition, &error.to_string());
                 }
                 return Ok(());
@@ -74,7 +75,7 @@ impl TeamDaemon {
             );
 
             if let Some(reply) = self.handle_telegram_command(&msg) {
-                if let Some(bot) = self.telegram_bot.as_ref() {
+                if let Some(bot) = self.integrations.telegram_bot.as_ref() {
                     if let Err(error) = bot.send_message(&msg.chat_id.to_string(), &reply) {
                         warn!(chat_id = msg.chat_id, error = %error, "failed to send telegram reply");
                     }
@@ -350,6 +351,7 @@ impl TeamDaemon {
             bail!("Task #{task_id} is not in review.");
         }
         if self
+            .verification
             .background_tests
             .chat_merges
             .iter()
@@ -379,7 +381,8 @@ impl TeamDaemon {
                 )
             },
         );
-        self.background_tests
+        self.verification
+            .background_tests
             .chat_merges
             .push(background_tests::ChatMergeJob {
                 task_id,
@@ -395,12 +398,15 @@ impl TeamDaemon {
     /// Finish chat merges whose verification command has completed.
     pub(super) fn poll_chat_merge_jobs(&mut self) {
         let mut index = 0;
-        while index < self.background_tests.chat_merges.len() {
-            let Some(result) = self.background_tests.chat_merges[index].job.try_take() else {
+        while index < self.verification.background_tests.chat_merges.len() {
+            let Some(result) = self.verification.background_tests.chat_merges[index]
+                .job
+                .try_take()
+            else {
                 index += 1;
                 continue;
             };
-            let job = self.background_tests.chat_merges.remove(index);
+            let job = self.verification.background_tests.chat_merges.remove(index);
             let duration_ms = job.job.elapsed().as_millis() as u64;
             info!(
                 task_id = job.task_id,
@@ -412,7 +418,7 @@ impl TeamDaemon {
                 Ok(reply) => reply,
                 Err(error) => format!("Command failed: {error}"),
             };
-            self.send_chat_reply(&job.reply_to, &reply);
+            self.integrations.send_chat_reply(&job.reply_to, &reply);
         }
     }
 
@@ -465,28 +471,6 @@ impl TeamDaemon {
         Ok(format!(
             "Merged Task #{task_id} from {engineer}. Tests: {test_summary}"
         ))
-    }
-
-    pub(super) fn send_chat_reply(&self, target: &background_tests::ChatReplyTarget, reply: &str) {
-        match target {
-            background_tests::ChatReplyTarget::None => {
-                info!(reply = %reply, "background chat command finished");
-            }
-            background_tests::ChatReplyTarget::Telegram { chat_id } => {
-                if let Some(bot) = self.telegram_bot.as_ref()
-                    && let Err(error) = bot.send_message(&chat_id.to_string(), reply)
-                {
-                    warn!(chat_id, error = %error, "failed to send telegram reply");
-                }
-            }
-            background_tests::ChatReplyTarget::Discord => {
-                if let Some(bot) = self.discord_bot.as_ref()
-                    && let Err(error) = bot.send_command_reply(reply)
-                {
-                    warn!(error = %error, "failed to send discord command reply");
-                }
-            }
-        }
     }
 
     pub(super) fn execute_telegram_kick_command(&mut self, member: &str) -> Result<String> {
@@ -578,7 +562,7 @@ impl TeamDaemon {
                 debug!(from = %msg.from, to = %user_name, id = %msg.id, "delivering to user channel");
 
                 let formatted = format!("--- Message from {} ---\n{}", msg.from, msg.body);
-                let send_result = match self.channels.get(user_name) {
+                let send_result = match self.delivery.channels.get(user_name) {
                     Some(channel) => channel.send(&formatted),
                     None => {
                         debug!(user = %user_name, "no channel for user role");
@@ -1078,7 +1062,7 @@ mod tests {
         daemon
             .idle_started_at
             .insert(member_name.to_string(), Instant::now() - grace);
-        if let Some(schedule) = daemon.nudges.get_mut(member_name) {
+        if let Some(schedule) = daemon.interventions.nudges.get_mut(member_name) {
             schedule.idle_since = Some(Instant::now() - schedule.interval.max(grace));
         }
     }
@@ -1134,7 +1118,7 @@ mod tests {
             pane_map: HashMap::new(),
         })
         .unwrap();
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
@@ -1229,7 +1213,7 @@ mod tests {
             Some(&MemberState::Idle),
             "shim-managed agent state stays Idle; real state comes from shim events"
         );
-        let schedule = daemon.nudges.get("scientist").unwrap();
+        let schedule = daemon.interventions.nudges.get("scientist").unwrap();
         // Nudge is NOT paused because mark_member_working is a no-op for shim agents
         assert!(!schedule.paused);
         // idle_since is still set (not cleared) for the same reason
@@ -1299,7 +1283,10 @@ mod tests {
         backdate_idle_grace(&mut daemon, "lead");
         daemon.maybe_intervene_triage_backlog().unwrap();
 
-        assert_eq!(daemon.triage_interventions.get("lead"), Some(&1));
+        assert_eq!(
+            daemon.interventions.triage_interventions.get("lead"),
+            Some(&1)
+        );
         if daemon.states.get("lead") == Some(&MemberState::Working) {
             let pane = (0..100)
                 .find_map(|_| {
@@ -1398,7 +1385,7 @@ mod tests {
 
         let config = daemon_config_with_roles(tmp.path(), roles);
         let daemon = TeamDaemon::new(config).unwrap();
-        assert!(daemon.telegram_bot.is_some());
+        assert!(daemon.integrations.telegram_bot.is_some());
     }
 
     #[test]
@@ -1411,7 +1398,7 @@ mod tests {
 
         let config = daemon_config_with_roles(tmp.path(), roles);
         let daemon = TeamDaemon::new(config).unwrap();
-        assert!(daemon.telegram_bot.is_none());
+        assert!(daemon.integrations.telegram_bot.is_none());
     }
 
     // --- New tests for #255 ---
@@ -1458,7 +1445,7 @@ mod tests {
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
@@ -1479,7 +1466,7 @@ mod tests {
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
@@ -1562,7 +1549,7 @@ mod tests {
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
         let attempts = Arc::new(Mutex::new(0));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(FailingCountingChannel {
                 attempts: Arc::clone(&attempts),
@@ -1678,7 +1665,7 @@ mod tests {
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
@@ -1709,7 +1696,7 @@ mod tests {
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),
@@ -1748,13 +1735,13 @@ mod tests {
         ];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "alice".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent_alice),
             }),
         );
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "bob".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent_bob),
@@ -2179,18 +2166,18 @@ mod tests {
             .execute_telegram_command(TelegramCommand::Merge { task_id: 41 })
             .unwrap();
         assert!(reply.contains("Running verification"), "{reply}");
-        assert_eq!(daemon.background_tests.chat_merges.len(), 1);
+        assert_eq!(daemon.verification.background_tests.chat_merges.len(), 1);
 
         let again = daemon
             .execute_telegram_command(TelegramCommand::Merge { task_id: 41 })
             .unwrap();
         assert!(again.contains("already being verified"), "{again}");
-        assert_eq!(daemon.background_tests.chat_merges.len(), 1);
+        assert_eq!(daemon.verification.background_tests.chat_merges.len(), 1);
 
         // The engineer worktree does not exist, so verification fails and the
         // job is drained without merging.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !daemon.background_tests.chat_merges.is_empty() {
+        while !daemon.verification.background_tests.chat_merges.is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "chat merge never finished"

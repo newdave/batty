@@ -288,19 +288,19 @@ impl TeamDaemon {
         // Phase 5: Clean up daemon state maps
         self.watchers.remove(name);
         self.states.remove(name);
-        self.working_since.remove(name);
+        self.health.working_since.remove(name);
         self.idle_started_at.remove(name);
         self.active_tasks.remove(name);
         self.retry_counts.remove(name);
-        self.triage_idle_epochs.remove(name);
-        self.triage_interventions.remove(name);
-        self.owned_task_interventions.remove(name);
-        self.intervention_cooldowns.remove(name);
-        self.nudges.remove(name);
-        self.last_standup.remove(name);
-        self.backend_health.remove(name);
-        self.last_uncommitted_warn.remove(name);
-        self.pending_delivery_queue.remove(name);
+        self.interventions.triage_idle_epochs.remove(name);
+        self.interventions.triage_interventions.remove(name);
+        self.interventions.owned_task_interventions.remove(name);
+        self.scheduler.intervention_cooldowns.remove(name);
+        self.interventions.nudges.remove(name);
+        self.scheduler.last_standup.remove(name);
+        self.health.backend.remove(name);
+        self.health.last_uncommitted_warn.remove(name);
+        self.delivery.pending_queue.remove(name);
 
         if let Err(error) = self.cleanup_removed_member_worktree(name) {
             warn!(
@@ -473,7 +473,7 @@ impl TeamDaemon {
     ) {
         let key = removed_member_cleanup_refusal_key(reason, name, worktree_dir, branch);
         // Log each distinct refusal once; repeating it every cycle is noise.
-        if self.intervention_cooldowns.contains_key(&key) {
+        if self.scheduler.intervention_cooldowns.contains_key(&key) {
             return;
         }
 
@@ -490,7 +490,9 @@ impl TeamDaemon {
                 "{message}"
             ),
         }
-        self.intervention_cooldowns.insert(key, Instant::now());
+        self.scheduler
+            .intervention_cooldowns
+            .insert(key, Instant::now());
     }
 
     fn requeue_removed_member_tasks(&mut self, name: &str) -> Result<()> {
@@ -1017,10 +1019,10 @@ mod tests {
         let dir = tmp.path().join("wt");
         daemon.warn_removed_member_cleanup_refusal("r", "eng-1", &dir, None, "m");
         let key = super::removed_member_cleanup_refusal_key("r", "eng-1", &dir, None);
-        let first = daemon.intervention_cooldowns[&key];
+        let first = daemon.scheduler.intervention_cooldowns[&key];
         std::thread::sleep(std::time::Duration::from_millis(5));
         daemon.warn_removed_member_cleanup_refusal("r", "eng-1", &dir, None, "m");
-        assert_eq!(daemon.intervention_cooldowns[&key], first);
+        assert_eq!(daemon.scheduler.intervention_cooldowns[&key], first);
     }
 
     #[test]
@@ -1151,6 +1153,7 @@ mod tests {
         );
         assert!(
             daemon
+                .scheduler
                 .intervention_cooldowns
                 .keys()
                 .any(|key| key.starts_with("removed-member-worktree-cleanup::dirty-worktree::")),
@@ -1191,6 +1194,7 @@ mod tests {
             "outside-namespace worktree should not be removed"
         );
         let refusal_keys = daemon
+            .scheduler
             .intervention_cooldowns
             .keys()
             .filter(|key| key.starts_with("removed-member-worktree-cleanup::outside-namespace::"))

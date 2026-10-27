@@ -75,7 +75,8 @@ impl TeamDaemon {
         // Suppress when all engineers have active tasks — transient idle is not starvation.
         if super::all_engineers_have_active_tasks(&engineer_names, &tasks) {
             tracing::debug!("suppressing board replenishment: all engineers have active tasks");
-            self.clear_board_replenishment_streaks(&replenishment_keys);
+            self.interventions
+                .clear_owned_task_streaks(&replenishment_keys);
             return Ok(());
         }
 
@@ -91,7 +92,8 @@ impl TeamDaemon {
             .cloned()
             .collect();
         if idle_unassigned_engineers.is_empty() {
-            self.clear_board_replenishment_streaks(&replenishment_keys);
+            self.interventions
+                .clear_owned_task_streaks(&replenishment_keys);
             return Ok(());
         }
 
@@ -101,12 +103,14 @@ impl TeamDaemon {
             .collect();
 
         if idle_unassigned_engineers.len() <= unblocked_todo_tasks.len() {
-            self.clear_board_replenishment_streaks(&replenishment_keys);
+            self.interventions
+                .clear_owned_task_streaks(&replenishment_keys);
             return Ok(());
         }
 
         if self.maybe_emit_review_drain_before_planning(&tasks)? {
-            self.clear_board_replenishment_streaks(&replenishment_keys);
+            self.interventions
+                .clear_owned_task_streaks(&replenishment_keys);
             return Ok(());
         }
 
@@ -149,13 +153,14 @@ impl TeamDaemon {
                 done_count,
             );
             let prior_streak = self
+                .interventions
                 .owned_task_interventions
                 .get(&replenishment_key)
                 .filter(|state| state.signature == signature)
                 .map(|state| state.idle_epoch)
                 .unwrap_or(0);
             let streak = prior_streak.saturating_add(1);
-            self.owned_task_interventions.insert(
+            self.interventions.owned_task_interventions.insert(
                 replenishment_key.clone(),
                 OwnedTaskInterventionState {
                     idle_epoch: streak,
@@ -205,7 +210,7 @@ impl TeamDaemon {
                 in_progress_count,
                 todo_count,
             ));
-            self.owned_task_interventions.insert(
+            self.interventions.owned_task_interventions.insert(
                 replenishment_key.clone(),
                 OwnedTaskInterventionState {
                     idle_epoch: streak,
@@ -214,7 +219,8 @@ impl TeamDaemon {
                     escalation_sent: true,
                 },
             );
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(replenishment_key, Instant::now());
             if delivered_live {
                 self.mark_member_working(&architect.name);
@@ -278,15 +284,7 @@ impl TeamDaemon {
 
     fn board_replenishment_on_cooldown(&self, key: &str) -> bool {
         let cooldown = Duration::from_secs(BOARD_REPLENISHMENT_REQUEST_INTERVAL_SECS);
-        self.intervention_cooldowns
-            .get(key)
-            .is_some_and(|fired_at| fired_at.elapsed() < cooldown)
-    }
-
-    fn clear_board_replenishment_streaks(&mut self, keys: &[String]) {
-        for key in keys {
-            self.owned_task_interventions.remove(key);
-        }
+        self.scheduler.cooldown_active(key, cooldown)
     }
 }
 

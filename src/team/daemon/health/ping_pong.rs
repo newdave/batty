@@ -19,10 +19,10 @@ impl TeamDaemon {
         let timeout_secs = self.config.team_config.shim_health_timeout_secs;
 
         // Only run at the configured interval
-        if self.last_shim_health_check.elapsed().as_secs() < interval_secs {
+        if self.health.last_shim_health_check.elapsed().as_secs() < interval_secs {
             return Ok(());
         }
-        self.last_shim_health_check = Instant::now();
+        self.health.last_shim_health_check = Instant::now();
 
         let names: Vec<String> = self.shim_handles.keys().cloned().collect();
 
@@ -177,7 +177,7 @@ mod tests {
             .apply_state_change(ShimState::Idle);
 
         // Backdate the last check so it fires
-        daemon.last_shim_health_check = Instant::now() - Duration::from_secs(120);
+        daemon.health.last_shim_health_check = Instant::now() - Duration::from_secs(120);
 
         daemon.shim_health_check().unwrap();
 
@@ -216,7 +216,7 @@ mod tests {
             .get_mut("eng-1")
             .unwrap()
             .apply_state_change(ShimState::Dead);
-        daemon.last_shim_health_check = Instant::now() - Duration::from_secs(120);
+        daemon.health.last_shim_health_check = Instant::now() - Duration::from_secs(120);
 
         // Should not panic or try to send to a dead handle
         daemon.shim_health_check().unwrap();
@@ -237,7 +237,7 @@ mod tests {
             .unwrap()
             .apply_state_change(ShimState::Idle);
 
-        daemon.last_shim_health_check = Instant::now() - Duration::from_secs(120);
+        daemon.health.last_shim_health_check = Instant::now() - Duration::from_secs(120);
 
         // Should log warning about stale handle but not panic
         daemon.shim_health_check().unwrap();
@@ -262,7 +262,7 @@ mod tests {
             .unwrap()
             .apply_state_change(ShimState::Working);
 
-        daemon.last_shim_health_check = Instant::now() - Duration::from_secs(120);
+        daemon.health.last_shim_health_check = Instant::now() - Duration::from_secs(120);
         daemon.shim_health_check().unwrap();
 
         let cmd: Command = child.recv().unwrap().unwrap();

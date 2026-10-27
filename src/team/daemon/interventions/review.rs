@@ -56,12 +56,18 @@ impl TeamDaemon {
                 })
                 .collect();
             if review_tasks.is_empty() {
-                self.owned_task_interventions
+                self.interventions
+                    .owned_task_interventions
                     .remove(&review_intervention_key(&name));
                 continue;
             }
 
-            let idle_epoch = self.triage_idle_epochs.get(&name).copied().unwrap_or(0);
+            let idle_epoch = self
+                .interventions
+                .triage_idle_epochs
+                .get(&name)
+                .copied()
+                .unwrap_or(0);
             // Use epoch 1 as fallback so review interventions fire even before
             // the triage system has seen the manager go idle (e.g. after restart).
             let effective_epoch = if idle_epoch == 0 { 1 } else { idle_epoch };
@@ -69,6 +75,7 @@ impl TeamDaemon {
             let signature = review_task_intervention_signature(&review_tasks);
             let review_key = review_intervention_key(&name);
             if self
+                .interventions
                 .owned_task_interventions
                 .get(&review_key)
                 .is_some_and(|state| {
@@ -100,7 +107,7 @@ impl TeamDaemon {
                 name,
                 review_tasks.len()
             ));
-            self.owned_task_interventions.insert(
+            self.interventions.owned_task_interventions.insert(
                 review_key.clone(),
                 OwnedTaskInterventionState {
                     idle_epoch: effective_epoch,
@@ -109,7 +116,8 @@ impl TeamDaemon {
                     escalation_sent: false,
                 },
             );
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(review_key, Instant::now());
             if delivered_live {
                 self.mark_member_working(&name);

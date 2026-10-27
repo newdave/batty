@@ -122,7 +122,7 @@ impl TeamDaemon {
 
         for member_name in member_names {
             if self.states.get(&member_name) != Some(&MemberState::Working) {
-                self.narration_tracker.clear_member(&member_name);
+                self.health.narration.clear_member(&member_name);
                 continue;
             }
 
@@ -135,29 +135,31 @@ impl TeamDaemon {
             };
 
             let agent_type = self.member_agent_type(&member_name);
-            self.narration_tracker
+            self.health
+                .narration
                 .record_sample(&member_name, &capture, agent_type);
 
-            if !self.narration_tracker.has_samples(&member_name) {
+            if !self.health.narration.has_samples(&member_name) {
                 continue;
             }
 
-            let is_narrating = self.narration_tracker.is_narrating(&member_name);
+            let is_narrating = self.health.narration.is_narrating(&member_name);
             let breaker_state = self
-                .narration_tracker
+                .health
+                .narration
                 .note_breach(&member_name, is_narrating);
             if !is_narrating {
                 continue;
             }
 
             let task_id = self.active_task_id(&member_name);
-            let ratio = self.narration_tracker.narration_ratio(&member_name);
-            if breaker_state.narration_polls == self.narration_tracker.threshold_polls {
+            let ratio = self.health.narration.narration_ratio(&member_name);
+            if breaker_state.narration_polls == self.health.narration.threshold_polls {
                 warn!(member = %member_name, task_id, ratio, "detected narration loop");
                 self.emit_event(TeamEvent::narration_detected(&member_name, task_id));
             }
 
-            if self.narration_tracker.should_nudge(&member_name) {
+            if self.health.narration.should_nudge(&member_name) {
                 if let Some(member) = self
                     .config
                     .members
@@ -179,15 +181,14 @@ impl TeamDaemon {
                     "health: nudged {} after narration detection {:.2}",
                     member_name, ratio
                 ));
-                self.narration_tracker.note_nudge(&member_name);
+                self.health.narration.note_nudge(&member_name);
             }
 
-            if self.narration_tracker.should_restart(&member_name) {
+            if self.health.narration.should_restart(&member_name) {
                 let restart_key = Self::narration_restart_cooldown_key(&member_name);
                 let on_cooldown = self
-                    .intervention_cooldowns
-                    .get(&restart_key)
-                    .is_some_and(|last| last.elapsed() < super::CONTEXT_RESTART_COOLDOWN);
+                    .scheduler
+                    .cooldown_active(&restart_key, super::CONTEXT_RESTART_COOLDOWN);
                 if on_cooldown {
                     continue;
                 }
@@ -198,9 +199,10 @@ impl TeamDaemon {
                     self.restart_member(&member_name)?;
                 }
                 self.emit_event(TeamEvent::narration_restart(&member_name, task_id));
-                self.intervention_cooldowns
+                self.scheduler
+                    .intervention_cooldowns
                     .insert(restart_key, Instant::now());
-                self.narration_tracker.clear_member(&member_name);
+                self.health.narration.clear_member(&member_name);
             }
         }
 

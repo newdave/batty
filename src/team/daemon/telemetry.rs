@@ -67,10 +67,10 @@ impl TeamDaemon {
 
     /// Prune old telemetry rows and checkpoint the WAL, at most once per 24h.
     pub(super) fn maybe_run_telemetry_retention(&mut self) {
-        if self.last_telemetry_retention.elapsed() < TELEMETRY_RETENTION_INTERVAL {
+        if self.scheduler.last_telemetry_retention.elapsed() < TELEMETRY_RETENTION_INTERVAL {
             return;
         }
-        self.last_telemetry_retention = std::time::Instant::now();
+        self.scheduler.last_telemetry_retention = std::time::Instant::now();
         let Some(conn) = &self.telemetry_db else {
             return;
         };
@@ -96,6 +96,7 @@ impl TeamDaemon {
     /// of the batty source tree (#675). Gated to run at most once per hour.
     pub(super) fn maybe_check_binary_freshness(&mut self) {
         if self
+            .scheduler
             .last_binary_freshness_check
             .is_some_and(|t| t.elapsed() < BINARY_FRESHNESS_INTERVAL)
         {
@@ -111,7 +112,7 @@ impl TeamDaemon {
     fn check_binary_freshness(&mut self, trigger: BinaryFreshnessTrigger) {
         use std::time::Instant;
 
-        self.last_binary_freshness_check = Some(Instant::now());
+        self.scheduler.last_binary_freshness_check = Some(Instant::now());
 
         let binary_path = match std::env::current_exe() {
             Ok(path) => path,
@@ -228,12 +229,13 @@ impl TeamDaemon {
         }
         const TIERED_INBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
         if self
+            .scheduler
             .last_tiered_inbox_sweep
             .is_some_and(|t| t.elapsed() < TIERED_INBOX_SWEEP_INTERVAL)
         {
             return;
         }
-        self.last_tiered_inbox_sweep = Some(Instant::now());
+        self.scheduler.last_tiered_inbox_sweep = Some(Instant::now());
 
         let inboxes_root = crate::team::inbox::inboxes_root(&self.config.project_root);
         let ttls = crate::team::inbox_tiered::TieredTtlConfig::default();
@@ -468,7 +470,10 @@ impl TeamDaemon {
             "task_escalated:{role}:{task}:{reason}",
             reason = reason.unwrap_or("-")
         );
-        if self.suppress_recent_escalation(dedup_key, std::time::Duration::from_secs(600)) {
+        if self
+            .scheduler
+            .suppress_recent_escalation(dedup_key, std::time::Duration::from_secs(600))
+        {
             return;
         }
         self.emit_event(TeamEvent::task_escalated(role, &task, reason));
@@ -1357,7 +1362,7 @@ mod tests {
         );
 
         let sent = Arc::new(Mutex::new(Vec::new()));
-        daemon.channels.insert(
+        daemon.delivery.channels.insert(
             "human".to_string(),
             Box::new(RecordingChannel {
                 messages: Arc::clone(&sent),

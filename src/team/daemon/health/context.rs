@@ -237,6 +237,7 @@ impl TeamDaemon {
             // killed at 04:50:02 after transitioning Working at
             // 04:49:54 following an 18-minute Idle window.
             let been_working_long_enough = self
+                .health
                 .working_since
                 .get(member_name)
                 .map(|since| since.elapsed().as_secs() >= ZERO_OUTPUT_THRESHOLD_SECS)
@@ -255,7 +256,7 @@ impl TeamDaemon {
                     member_name, uptime_secs
                 ));
                 self.handle_shim_cold_respawn(member_name, "zero output")?;
-                self.context_pressure_tracker.clear_member(member_name);
+                self.health.context_pressure.clear_member(member_name);
             }
             return Ok(());
         }
@@ -298,7 +299,7 @@ impl TeamDaemon {
             uptime_secs,
             proactive_usage_pct,
         );
-        let (score, actions) = self.context_pressure_tracker.observe_at(
+        let (score, actions) = self.health.context_pressure.observe_at(
             member_name,
             &inputs,
             is_working,
@@ -372,7 +373,7 @@ impl TeamDaemon {
                             "health: restarted {} after sustained context pressure (score={}/{})",
                             member_name, score, threshold
                         ));
-                        self.context_pressure_tracker.clear_member(member_name);
+                        self.health.context_pressure.clear_member(member_name);
                     }
                 }
             }
@@ -395,23 +396,17 @@ impl TeamDaemon {
             output_bytes,
             session_uptime_secs: uptime_secs,
             proactive_context_usage_pct: proactive_usage_pct.map(u64::from),
-            narration_detected: self.narration_tracker.is_narrating(member_name),
-            meta_conversation_detected: self.narration_tracker.is_narrating(member_name),
+            narration_detected: self.health.narration.is_narrating(member_name),
+            meta_conversation_detected: self.health.narration.is_narrating(member_name),
             assistant_message_count: quality.assistant_message_count,
             tool_call_count: quality.tool_call_count,
             unique_tool_names: quality.unique_tool_names.len(),
             shrinking_responses: quality.shrinking_responses,
             repeated_identical_outputs: quality.repeated_identical_outputs,
             tool_failure_message: quality.tool_failure_message,
-            shim_failure_count: self
-                .context_pressure_tracker
-                .shim_failure_count(member_name),
+            shim_failure_count: self.health.context_pressure.shim_failure_count(member_name),
             secs_since_last_commit: self.secs_since_last_commit(member_name),
         }
-    }
-
-    pub(super) fn record_context_pressure_failure(&mut self, member_name: &str) {
-        self.context_pressure_tracker.record_failure(member_name);
     }
 
     fn current_codex_quality_signals(&mut self, member_name: &str) -> Option<CodexQualitySignals> {

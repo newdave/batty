@@ -108,7 +108,12 @@ impl TeamDaemon {
 
     pub(super) fn optional_subsystem_ready(&mut self, subsystem: &str) -> bool {
         let disable_key = optional_subsystem_disable_key(subsystem);
-        let Some(disabled_until) = self.intervention_cooldowns.get(&disable_key).copied() else {
+        let Some(disabled_until) = self
+            .scheduler
+            .intervention_cooldowns
+            .get(&disable_key)
+            .copied()
+        else {
             return true;
         };
 
@@ -116,7 +121,7 @@ impl TeamDaemon {
             return false;
         }
 
-        self.intervention_cooldowns.remove(&disable_key);
+        self.scheduler.intervention_cooldowns.remove(&disable_key);
         tracing::info!(subsystem, "optional subsystem re-enabled after backoff");
         self.record_orchestrator_action(format!(
             "health: re-enabled optional subsystem {subsystem} after backoff"
@@ -138,7 +143,11 @@ impl TeamDaemon {
         }
 
         let disable_key = optional_subsystem_disable_key(subsystem);
-        if self.intervention_cooldowns.contains_key(&disable_key) {
+        if self
+            .scheduler
+            .intervention_cooldowns
+            .contains_key(&disable_key)
+        {
             return;
         }
 
@@ -150,7 +159,7 @@ impl TeamDaemon {
             .unwrap_or(0)
             .min((OPTIONAL_SUBSYSTEM_BACKOFF_SECS.len() - 1) as u32);
         let backoff_secs = OPTIONAL_SUBSYSTEM_BACKOFF_SECS[backoff_index as usize];
-        self.intervention_cooldowns.insert(
+        self.scheduler.intervention_cooldowns.insert(
             disable_key,
             Instant::now() + Duration::from_secs(backoff_secs),
         );
@@ -190,7 +199,8 @@ impl TeamDaemon {
         optional_subsystem_names()
             .iter()
             .filter_map(|subsystem| {
-                self.intervention_cooldowns
+                self.scheduler
+                    .intervention_cooldowns
                     .get(&optional_subsystem_disable_key(subsystem))
                     .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
                     .map(|remaining| ((*subsystem).to_string(), remaining.as_secs()))
@@ -208,7 +218,7 @@ impl TeamDaemon {
                 .insert(optional_subsystem_backoff_key(subsystem), *value);
         }
         for (subsystem, remaining_secs) in disabled_remaining_secs {
-            self.intervention_cooldowns.insert(
+            self.scheduler.intervention_cooldowns.insert(
                 optional_subsystem_disable_key(subsystem),
                 Instant::now() + Duration::from_secs(*remaining_secs),
             );
@@ -681,7 +691,10 @@ mod tests {
 
         let disable_key = optional_subsystem_disable_key("telegram");
         assert!(
-            daemon.intervention_cooldowns.contains_key(&disable_key),
+            daemon
+                .scheduler
+                .intervention_cooldowns
+                .contains_key(&disable_key),
             "telegram should be disabled after exceeding the error budget"
         );
 
@@ -693,6 +706,7 @@ mod tests {
         assert!(!ran_while_disabled, "disabled subsystem should be skipped");
 
         daemon
+            .scheduler
             .intervention_cooldowns
             .insert(disable_key, Instant::now() - Duration::from_secs(1));
 

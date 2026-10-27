@@ -52,17 +52,22 @@ impl TeamDaemon {
                 .filter(|task| task_needs_owned_intervention(task.status.as_str()))
                 .collect();
             if owned_tasks.is_empty() {
-                self.owned_task_interventions.remove(&name);
+                self.interventions.owned_task_interventions.remove(&name);
                 continue;
             }
             if self.member_has_local_task_progress(&name, &owned_tasks) {
-                self.owned_task_interventions.remove(&name);
+                self.interventions.owned_task_interventions.remove(&name);
                 continue;
             }
 
-            let idle_epoch = self.triage_idle_epochs.get(&name).copied().unwrap_or(0);
+            let idle_epoch = self
+                .interventions
+                .triage_idle_epochs
+                .get(&name)
+                .copied()
+                .unwrap_or(0);
             let signature = owned_task_intervention_signature(&owned_tasks);
-            if let Some(existing) = self.owned_task_interventions.get(&name) {
+            if let Some(existing) = self.interventions.owned_task_interventions.get(&name) {
                 if existing.signature == signature {
                     let stuck_age_secs = existing.detected_at.elapsed().as_secs();
                     let should_escalate = !existing.escalation_sent
@@ -70,7 +75,8 @@ impl TeamDaemon {
                             &self.config.team_config.workflow_policy,
                             stuck_age_secs,
                         );
-                    if let Some(state) = self.owned_task_interventions.get_mut(&name) {
+                    if let Some(state) = self.interventions.owned_task_interventions.get_mut(&name)
+                    {
                         state.idle_epoch = idle_epoch;
                         if !should_escalate {
                             continue;
@@ -78,7 +84,9 @@ impl TeamDaemon {
                     }
 
                     let Some(parent) = member.reports_to.clone() else {
-                        if let Some(state) = self.owned_task_interventions.get_mut(&name) {
+                        if let Some(state) =
+                            self.interventions.owned_task_interventions.get_mut(&name)
+                        {
                             state.escalation_sent = true;
                         }
                         continue;
@@ -111,7 +119,9 @@ impl TeamDaemon {
                                     Some("stuck_task"),
                                 );
                             }
-                            if let Some(state) = self.owned_task_interventions.get_mut(&name) {
+                            if let Some(state) =
+                                self.interventions.owned_task_interventions.get_mut(&name)
+                            {
                                 state.escalation_sent = true;
                             }
                         }
@@ -150,7 +160,7 @@ impl TeamDaemon {
                 name,
                 owned_tasks.len()
             ));
-            self.owned_task_interventions.insert(
+            self.interventions.owned_task_interventions.insert(
                 name.clone(),
                 OwnedTaskInterventionState {
                     idle_epoch,
@@ -159,7 +169,8 @@ impl TeamDaemon {
                     escalation_sent: false,
                 },
             );
-            self.intervention_cooldowns
+            self.scheduler
+                .intervention_cooldowns
                 .insert(name.clone(), Instant::now());
             if delivered_live {
                 self.mark_member_working(&name);

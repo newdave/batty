@@ -760,7 +760,7 @@ fn stabilization_delay_prevents_premature_dispatch() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon
         .idle_started_at
         .insert("eng-1".to_string(), Instant::now() - Duration::from_secs(5));
@@ -768,9 +768,9 @@ fn stabilization_delay_prevents_premature_dispatch() {
     daemon.enqueue_dispatch_candidates().unwrap();
     daemon.process_dispatch_queue().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].validation_failures, 0);
-    assert_eq!(daemon.dispatch_queue[0].task_id, 101);
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].validation_failures, 0);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 101);
 }
 
 #[test]
@@ -801,7 +801,7 @@ fn wip_gate_blocks_double_assignment() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -810,10 +810,10 @@ fn wip_gate_blocks_double_assignment() {
     daemon.enqueue_dispatch_candidates().unwrap();
     daemon.process_dispatch_queue().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].validation_failures, 1);
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].validation_failures, 1);
     assert!(
-        daemon.dispatch_queue[0]
+        daemon.dispatch.queue[0]
             .last_failure
             .as_deref()
             .unwrap_or_default()
@@ -845,7 +845,7 @@ fn dispatch_guard_blocks_claimed_todo_assignment() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -854,10 +854,10 @@ fn dispatch_guard_blocks_claimed_todo_assignment() {
     daemon.enqueue_dispatch_candidates().unwrap();
     daemon.process_dispatch_queue().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].validation_failures, 1);
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].validation_failures, 1);
     assert!(
-        daemon.dispatch_queue[0]
+        daemon.dispatch.queue[0]
             .last_failure
             .as_deref()
             .unwrap_or_default()
@@ -927,7 +927,7 @@ fn worktree_gate_blocks_dirty_worktrees() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -938,13 +938,13 @@ fn worktree_gate_blocks_dirty_worktrees() {
 
     // Dirty idle worktrees are left untouched and re-queued with an
     // actionable preservation blocker instead of being auto-mutated.
-    assert_eq!(daemon.dispatch_queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue.len(), 1);
     assert_eq!(
-        daemon.dispatch_queue[0].validation_failures, 2,
+        daemon.dispatch.queue[0].validation_failures, 2,
         "dirty worktree recovery should record the readiness failure and the skipped reset"
     );
     assert!(
-        daemon.dispatch_queue[0]
+        daemon.dispatch.queue[0]
             .last_failure
             .as_deref()
             .unwrap_or("")
@@ -998,7 +998,7 @@ fn worktree_gate_resets_base_branch_that_remains_ahead_after_rebase() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1006,9 +1006,9 @@ fn worktree_gate_resets_base_branch_that_remains_ahead_after_rebase() {
 
     daemon.maybe_auto_dispatch().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].validation_failures, 0);
-    assert!(daemon.dispatch_queue[0].last_failure.is_none());
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].validation_failures, 0);
+    assert!(daemon.dispatch.queue[0].last_failure.is_none());
     assert_eq!(
         crate::worktree::git_current_branch(&worktree_dir).unwrap(),
         base_branch,
@@ -1095,7 +1095,7 @@ fn worktree_gate_archives_stray_branch_commits_before_reset() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1154,19 +1154,19 @@ fn queue_escalates_after_repeated_validation_failures() {
             ("manager".to_string(), MemberState::Idle),
         ]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
     );
 
     for _ in 0..DISPATCH_QUEUE_FAILURE_LIMIT {
-        daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+        daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
         daemon.maybe_auto_dispatch().unwrap();
     }
 
     assert!(
-        daemon.dispatch_queue.is_empty(),
+        daemon.dispatch.queue.is_empty(),
         "queue should be drained after failure limit"
     );
     // With the reassign-or-drop fix, blocked entries are silently dropped
@@ -1287,7 +1287,7 @@ fn dispatch_skips_future_scheduled_task() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1296,7 +1296,7 @@ fn dispatch_skips_future_scheduled_task() {
     daemon.maybe_auto_dispatch().unwrap();
 
     assert!(
-        daemon.dispatch_queue.is_empty(),
+        daemon.dispatch.queue.is_empty(),
         "future-scheduled task should not be dispatched"
     );
 }
@@ -1319,7 +1319,7 @@ fn dispatch_includes_past_scheduled_task() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1327,8 +1327,8 @@ fn dispatch_includes_past_scheduled_task() {
 
     daemon.maybe_auto_dispatch().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].task_id, 101);
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 101);
 }
 
 #[test]
@@ -1355,7 +1355,7 @@ fn completion_frees_engineer_and_dispatch_skips_already_claimed_tasks() {
             ("eng-2".to_string(), MemberState::Idle),
         ]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1368,13 +1368,13 @@ fn completion_frees_engineer_and_dispatch_skips_already_claimed_tasks() {
     daemon.maybe_auto_dispatch().unwrap();
 
     assert_eq!(
-        daemon.dispatch_queue.len(),
+        daemon.dispatch.queue.len(),
         1,
         "only the next unclaimed todo task should be queued"
     );
-    assert_eq!(daemon.dispatch_queue[0].engineer, "eng-1");
+    assert_eq!(daemon.dispatch.queue[0].engineer, "eng-1");
     assert_eq!(
-        daemon.dispatch_queue[0].task_id, 102,
+        daemon.dispatch.queue[0].task_id, 102,
         "claimed todo task should not be re-dispatched after completion"
     );
 }
@@ -1408,7 +1408,7 @@ fn dispatch_preps_worktree_for_idle_engineer() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1459,7 +1459,7 @@ fn e2e_past_scheduled_for_is_dispatchable() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1467,11 +1467,11 @@ fn e2e_past_scheduled_for_is_dispatchable() {
 
     daemon.maybe_auto_dispatch().unwrap();
     assert_eq!(
-        daemon.dispatch_queue.len(),
+        daemon.dispatch.queue.len(),
         1,
         "past-scheduled task should be dispatched"
     );
-    assert_eq!(daemon.dispatch_queue[0].task_id, 501);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 501);
 }
 
 #[test]
@@ -1514,7 +1514,7 @@ fn e2e_future_scheduled_for_is_blocked() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1522,7 +1522,7 @@ fn e2e_future_scheduled_for_is_blocked() {
 
     daemon.maybe_auto_dispatch().unwrap();
     assert!(
-        daemon.dispatch_queue.is_empty(),
+        daemon.dispatch.queue.is_empty(),
         "future-scheduled task should NOT be dispatched"
     );
 }
@@ -1562,7 +1562,7 @@ fn e2e_no_scheduled_for_always_runnable() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1570,11 +1570,11 @@ fn e2e_no_scheduled_for_always_runnable() {
 
     daemon.maybe_auto_dispatch().unwrap();
     assert_eq!(
-        daemon.dispatch_queue.len(),
+        daemon.dispatch.queue.len(),
         1,
         "task without scheduled_for should be dispatched"
     );
-    assert_eq!(daemon.dispatch_queue[0].task_id, 503);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 503);
 }
 
 #[test]
@@ -1595,7 +1595,7 @@ fn dedup_window_prevents_duplicate_enqueue() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1603,13 +1603,14 @@ fn dedup_window_prevents_duplicate_enqueue() {
 
     // Simulate a recent dispatch for this (task_id, engineer) pair.
     daemon
+        .dispatch
         .recent_dispatches
         .insert((101, "eng-1".to_string()), Instant::now());
 
     daemon.maybe_auto_dispatch().unwrap();
 
     assert!(
-        daemon.dispatch_queue.is_empty(),
+        daemon.dispatch.queue.is_empty(),
         "task should be skipped due to dedup window"
     );
 }
@@ -1633,7 +1634,7 @@ fn dedup_window_allows_different_task() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1641,14 +1642,15 @@ fn dedup_window_allows_different_task() {
 
     // Recent dispatch for task 102, but not 101.
     daemon
+        .dispatch
         .recent_dispatches
         .insert((102, "eng-1".to_string()), Instant::now());
 
     daemon.maybe_auto_dispatch().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue.len(), 1);
     assert_eq!(
-        daemon.dispatch_queue[0].task_id, 101,
+        daemon.dispatch.queue[0].task_id, 101,
         "a different task should still be dispatched"
     );
 }
@@ -1671,14 +1673,14 @@ fn dedup_window_expires_and_allows_reassignment() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
     );
 
     // Simulate a dispatch that happened 120 seconds ago — outside the 60s window.
-    daemon.recent_dispatches.insert(
+    daemon.dispatch.recent_dispatches.insert(
         (101, "eng-1".to_string()),
         Instant::now() - Duration::from_secs(120),
     );
@@ -1686,11 +1688,11 @@ fn dedup_window_expires_and_allows_reassignment() {
     daemon.maybe_auto_dispatch().unwrap();
 
     assert_eq!(
-        daemon.dispatch_queue.len(),
+        daemon.dispatch.queue.len(),
         1,
         "expired dedup entry should allow reassignment"
     );
-    assert_eq!(daemon.dispatch_queue[0].task_id, 101);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 101);
 }
 
 #[test]
@@ -1711,7 +1713,7 @@ fn dedup_window_zero_disables_dedup() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1719,17 +1721,18 @@ fn dedup_window_zero_disables_dedup() {
 
     // With window=0, even a "just now" entry should be expired immediately.
     daemon
+        .dispatch
         .recent_dispatches
         .insert((101, "eng-1".to_string()), Instant::now());
 
     daemon.maybe_auto_dispatch().unwrap();
 
     assert_eq!(
-        daemon.dispatch_queue.len(),
+        daemon.dispatch.queue.len(),
         1,
         "dedup_window_secs=0 should effectively disable dedup"
     );
-    assert_eq!(daemon.dispatch_queue[0].task_id, 101);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 101);
 }
 
 #[test]
@@ -1750,19 +1753,20 @@ fn manual_cooldown_blocks_dispatch() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
     );
     daemon
+        .dispatch
         .manual_assign_cooldowns
         .insert("eng-1".to_string(), Instant::now());
 
     daemon.maybe_auto_dispatch().unwrap();
 
     assert!(
-        daemon.dispatch_queue.is_empty(),
+        daemon.dispatch.queue.is_empty(),
         "engineer within manual cooldown should not be enqueued"
     );
 }
@@ -1785,12 +1789,12 @@ fn manual_cooldown_expires_and_allows_dispatch() {
         })
         .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
     );
-    daemon.manual_assign_cooldowns.insert(
+    daemon.dispatch.manual_assign_cooldowns.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
     );
@@ -1798,11 +1802,11 @@ fn manual_cooldown_expires_and_allows_dispatch() {
     daemon.maybe_auto_dispatch().unwrap();
 
     assert_eq!(
-        daemon.dispatch_queue.len(),
+        daemon.dispatch.queue.len(),
         1,
         "expired manual cooldown should allow dispatch"
     );
-    assert_eq!(daemon.dispatch_queue[0].task_id, 101);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 101);
 }
 
 #[test]
@@ -1827,7 +1831,7 @@ fn manual_cooldown_only_affects_assigned_engineer() {
             ("eng-2".to_string(), MemberState::Idle),
         ]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1837,17 +1841,18 @@ fn manual_cooldown_only_affects_assigned_engineer() {
         Instant::now() - Duration::from_secs(60),
     );
     daemon
+        .dispatch
         .manual_assign_cooldowns
         .insert("eng-1".to_string(), Instant::now());
 
     daemon.maybe_auto_dispatch().unwrap();
 
     assert_eq!(
-        daemon.dispatch_queue.len(),
+        daemon.dispatch.queue.len(),
         1,
         "only the non-cooldown engineer should be enqueued"
     );
-    assert_eq!(daemon.dispatch_queue[0].engineer, "eng-2");
+    assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
 }
 
 #[test]
@@ -1890,7 +1895,7 @@ fn scored_dispatch_prefers_engineer_with_matching_tag_history() {
             ("eng-2".to_string(), MemberState::Idle),
         ]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1902,9 +1907,9 @@ fn scored_dispatch_prefers_engineer_with_matching_tag_history() {
 
     daemon.maybe_auto_dispatch().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].engineer, "eng-2");
-    assert_eq!(daemon.dispatch_queue[0].task_id, 101);
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
+    assert_eq!(daemon.dispatch.queue[0].task_id, 101);
 }
 
 #[test]
@@ -1947,7 +1952,7 @@ fn scored_dispatch_prefers_engineer_with_matching_changed_paths() {
             ("eng-2".to_string(), MemberState::Idle),
         ]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -1959,8 +1964,8 @@ fn scored_dispatch_prefers_engineer_with_matching_changed_paths() {
 
     daemon.maybe_auto_dispatch().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].engineer, "eng-2");
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
 }
 
 #[test]
@@ -2001,7 +2006,7 @@ fn round_robin_allocation_ignores_profile_scoring() {
             ("eng-2".to_string(), MemberState::Idle),
         ]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -2013,8 +2018,8 @@ fn round_robin_allocation_ignores_profile_scoring() {
 
     daemon.maybe_auto_dispatch().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].engineer, "eng-1");
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].engineer, "eng-1");
 }
 
 #[test]
@@ -2050,7 +2055,7 @@ fn dispatch_queue_prefers_original_owner_for_verification_retry_rework() {
             ("eng-2".to_string(), MemberState::Idle),
         ]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -2062,9 +2067,9 @@ fn dispatch_queue_prefers_original_owner_for_verification_retry_rework() {
 
     daemon.enqueue_dispatch_candidates().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].task_id, 42);
-    assert_eq!(daemon.dispatch_queue[0].engineer, "eng-1");
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 42);
+    assert_eq!(daemon.dispatch.queue[0].engineer, "eng-1");
 }
 
 #[test]
@@ -2101,7 +2106,7 @@ fn dispatch_queue_ignores_done_verification_retry_metadata() {
             ("eng-2".to_string(), MemberState::Idle),
         ]))
         .build();
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-1".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -2113,8 +2118,8 @@ fn dispatch_queue_ignores_done_verification_retry_metadata() {
 
     daemon.enqueue_dispatch_candidates().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].task_id, 101);
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 101);
 }
 
 #[test]
@@ -2153,7 +2158,7 @@ fn dispatch_queue_sends_idle_peer_to_normal_work_before_retry_rework() {
         ]))
         .build();
     daemon.active_tasks.insert("eng-1".to_string(), 777);
-    daemon.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
+    daemon.scheduler.last_auto_dispatch = Instant::now() - Duration::from_secs(30);
     daemon.idle_started_at.insert(
         "eng-2".to_string(),
         Instant::now() - Duration::from_secs(60),
@@ -2161,9 +2166,9 @@ fn dispatch_queue_sends_idle_peer_to_normal_work_before_retry_rework() {
 
     daemon.enqueue_dispatch_candidates().unwrap();
 
-    assert_eq!(daemon.dispatch_queue.len(), 1);
-    assert_eq!(daemon.dispatch_queue[0].task_id, 101);
-    assert_eq!(daemon.dispatch_queue[0].engineer, "eng-2");
+    assert_eq!(daemon.dispatch.queue.len(), 1);
+    assert_eq!(daemon.dispatch.queue[0].task_id, 101);
+    assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
 }
 
 // -- dispatch_priority_rank tests --
@@ -2347,12 +2352,12 @@ fn dispatch_queue_is_preserved_when_processing_errors() {
         validation_failures: 0,
         last_failure: None,
     };
-    daemon.dispatch_queue = vec![entry("eng-1", 101), entry("eng-2", 102)];
+    daemon.dispatch.queue = vec![entry("eng-1", 101), entry("eng-2", 102)];
     // No board tasks directory, so loading the task for the first entry fails.
 
     assert!(daemon.process_dispatch_queue().is_err());
 
-    let queued: Vec<u32> = daemon.dispatch_queue.iter().map(|e| e.task_id).collect();
+    let queued: Vec<u32> = daemon.dispatch.queue.iter().map(|e| e.task_id).collect();
     assert_eq!(queued, vec![101, 102]);
 }
 

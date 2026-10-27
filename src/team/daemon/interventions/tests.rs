@@ -97,7 +97,7 @@ fn insert_idle_shim_handle(
 }
 
 fn expire_triage_cooldown(daemon: &mut TeamDaemon, member: &str) {
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         format!("triage::{member}"),
         Instant::now()
             - Duration::from_secs(
@@ -160,7 +160,7 @@ fn intervention_team_harness() -> TestHarness {
 }
 
 fn expire_owned_task_cooldown(daemon: &mut TeamDaemon, member: &str) {
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         member.to_string(),
         Instant::now()
             - Duration::from_secs(
@@ -175,7 +175,7 @@ fn expire_owned_task_cooldown(daemon: &mut TeamDaemon, member: &str) {
 }
 
 fn expire_intervention_key_cooldown(daemon: &mut TeamDaemon, key: &str) {
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         key.to_string(),
         Instant::now()
             - Duration::from_secs(
@@ -190,7 +190,7 @@ fn expire_intervention_key_cooldown(daemon: &mut TeamDaemon, key: &str) {
 }
 
 fn expire_utilization_cooldown(daemon: &mut TeamDaemon, key: &str) {
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         key.to_string(),
         Instant::now()
             - Duration::from_secs(
@@ -205,7 +205,7 @@ fn expire_utilization_cooldown(daemon: &mut TeamDaemon, key: &str) {
 }
 
 fn set_exact_cooldown_boundary(daemon: &mut TeamDaemon, key: &str) {
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         key.to_string(),
         Instant::now()
             - Duration::from_secs(
@@ -251,7 +251,10 @@ fn maybe_intervene_triage_backlog_queues_expected_message_for_idle_manager() {
     enter_idle_epoch(&mut daemon, "lead");
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&1));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&1)
+    );
     let pending = harness.pending_inbox_messages("lead").unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].from, "architect");
@@ -280,7 +283,12 @@ fn maybe_intervene_triage_backlog_skips_in_board_first_mode() {
     daemon.maybe_intervene_triage_backlog().unwrap();
 
     assert!(harness.pending_inbox_messages("lead").unwrap().is_empty());
-    assert!(!daemon.triage_interventions.contains_key("lead"));
+    assert!(
+        !daemon
+            .interventions
+            .triage_interventions
+            .contains_key("lead")
+    );
 }
 
 #[test]
@@ -295,7 +303,12 @@ fn maybe_intervene_triage_backlog_does_not_fire_without_idle_epoch() {
 
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert!(!daemon.triage_interventions.contains_key("lead"));
+    assert!(
+        !daemon
+            .interventions
+            .triage_interventions
+            .contains_key("lead")
+    );
     assert!(harness.pending_inbox_messages("lead").unwrap().is_empty());
 }
 
@@ -309,7 +322,12 @@ fn maybe_intervene_triage_backlog_ignores_reports_already_answered_by_manager() 
     enter_idle_epoch(&mut daemon, "lead");
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert!(!daemon.triage_interventions.contains_key("lead"));
+    assert!(
+        !daemon
+            .interventions
+            .triage_interventions
+            .contains_key("lead")
+    );
     assert!(harness.pending_inbox_messages("lead").unwrap().is_empty());
 }
 
@@ -331,7 +349,10 @@ fn maybe_intervene_triage_backlog_ignores_stale_status_rollups() {
     enter_idle_epoch(&mut daemon, "lead");
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&1));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&1)
+    );
     let pending = harness.pending_inbox_messages("lead").unwrap();
     assert_eq!(pending.len(), 2);
     assert!(
@@ -353,7 +374,10 @@ fn maybe_intervene_triage_backlog_respects_cooldown_after_new_idle_epoch() {
     enter_idle_epoch(&mut daemon, "lead");
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&1));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&1)
+    );
     assert!(harness.pending_inbox_messages("lead").unwrap().is_empty());
 }
 
@@ -370,7 +394,10 @@ fn maybe_intervene_triage_backlog_does_not_refire_while_prior_message_is_pending
 
     let pending = harness.pending_inbox_messages("lead").unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&1));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&1)
+    );
 }
 
 #[test]
@@ -390,7 +417,10 @@ fn maybe_intervene_triage_backlog_refires_after_cooldown_expires() {
 
     let pending = harness.pending_inbox_messages("lead").unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&2));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&2)
+    );
 }
 
 #[test]
@@ -442,7 +472,11 @@ fn maybe_intervene_owned_tasks_queues_task_message_for_idle_engineer() {
     assert!(pending[0].body.contains("Task #191"));
     assert!(pending[0].body.contains("batty send lead"));
 
-    let state = daemon.owned_task_interventions.get("eng-1").unwrap();
+    let state = daemon
+        .interventions
+        .owned_task_interventions
+        .get("eng-1")
+        .unwrap();
     assert_eq!(state.idle_epoch, 1);
     assert_eq!(state.signature, "191:in-progress");
     assert!(!state.escalation_sent);
@@ -464,6 +498,7 @@ fn maybe_intervene_owned_tasks_updates_idle_epoch_across_state_transitions() {
     assert_eq!(pending.len(), 1);
     assert_eq!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("eng-1")
             .map(|state| state.idle_epoch),
@@ -485,6 +520,7 @@ fn maybe_intervene_owned_tasks_escalates_to_manager_after_threshold() {
     enter_idle_epoch(&mut daemon, "eng-1");
     daemon.maybe_intervene_owned_tasks().unwrap();
     daemon
+        .interventions
         .owned_task_interventions
         .get_mut("eng-1")
         .unwrap()
@@ -500,6 +536,7 @@ fn maybe_intervene_owned_tasks_escalates_to_manager_after_threshold() {
     assert!(lead_pending[0].body.contains("Task #191"));
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("eng-1")
             .is_some_and(|state| state.escalation_sent)
@@ -520,6 +557,7 @@ fn maybe_intervene_owned_tasks_only_escalates_once_per_signature() {
     enter_idle_epoch(&mut daemon, "eng-1");
     daemon.maybe_intervene_owned_tasks().unwrap();
     daemon
+        .interventions
         .owned_task_interventions
         .get_mut("eng-1")
         .unwrap()
@@ -532,6 +570,7 @@ fn maybe_intervene_owned_tasks_only_escalates_once_per_signature() {
     assert_eq!(lead_pending.len(), 1);
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("eng-1")
             .is_some_and(|state| state.escalation_sent)
@@ -564,7 +603,11 @@ fn maybe_intervene_owned_tasks_signature_change_resets_state() {
     assert!(pending[0].body.contains("Task #191"));
     assert!(pending[0].body.contains("#192 (in-progress) second-task"));
 
-    let state = daemon.owned_task_interventions.get("eng-1").unwrap();
+    let state = daemon
+        .interventions
+        .owned_task_interventions
+        .get("eng-1")
+        .unwrap();
     assert_eq!(state.signature, "191:in-progress|192:in-progress");
     assert!(!state.escalation_sent);
 }
@@ -583,7 +626,12 @@ fn maybe_intervene_owned_tasks_skips_working_engineer() {
     daemon.maybe_intervene_owned_tasks().unwrap();
 
     assert!(harness.pending_inbox_messages("eng-1").unwrap().is_empty());
-    assert!(!daemon.owned_task_interventions.contains_key("eng-1"));
+    assert!(
+        !daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("eng-1")
+    );
 }
 
 #[test]
@@ -604,7 +652,12 @@ fn maybe_intervene_review_backlog_queues_for_idle_manager() {
     assert!(pending[0].body.contains("#191 by eng-1"));
     assert!(pending[0].body.contains("MERGE SUPPRESSED"));
     assert!(pending[0].body.contains("task branch metadata missing"));
-    assert!(daemon.owned_task_interventions.contains_key("review::lead"));
+    assert!(
+        daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("review::lead")
+    );
 }
 
 #[test]
@@ -625,6 +678,7 @@ fn maybe_intervene_review_backlog_dedupes_same_signature() {
     assert!(harness.pending_inbox_messages("lead").unwrap().is_empty());
     assert_eq!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("review::lead")
             .map(|state| state.signature.as_str()),
@@ -686,6 +740,7 @@ fn maybe_intervene_manager_dispatch_gap_queues_for_idle_lead() {
     assert!(pending[0].body.contains("batty assign eng-2"));
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .contains_key("dispatch::lead")
     );
@@ -769,6 +824,7 @@ fn maybe_intervene_manager_dispatch_gap_skips_in_board_first_mode() {
     assert!(harness.pending_inbox_messages("lead").unwrap().is_empty());
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("dispatch::lead")
     );
@@ -849,7 +905,7 @@ fn supervisory_manager_shim_chatter_still_trips_dispatch_gap() {
     daemon.maybe_intervene_manager_dispatch_gap().unwrap();
 
     assert_eq!(
-        daemon.pending_delivery_queue.get("lead").map(Vec::len),
+        daemon.delivery.pending_queue.get("lead").map(Vec::len),
         Some(1)
     );
     let events =
@@ -1331,6 +1387,7 @@ fn maybe_intervene_architect_utilization_queues_for_underloaded_architect() {
     assert!(pending[0].body.contains("Task #192"));
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .contains_key("utilization::architect")
     );
@@ -1434,7 +1491,7 @@ fn supervisory_architect_recent_action_clears_utilization_stall_signal() {
 
     daemon.maybe_intervene_architect_utilization().unwrap();
 
-    assert!(!daemon.pending_delivery_queue.contains_key("architect"));
+    assert!(!daemon.delivery.pending_queue.contains_key("architect"));
     let events = crate::team::events::read_events(&events_path).unwrap();
     assert!(!events.iter().any(|event| {
         event.event == "stall_detected" && event.role.as_deref() == Some("architect")
@@ -1479,6 +1536,7 @@ fn maybe_intervene_board_replenishment_fires_when_todo_below_threshold_and_idle_
     assert!(pending[0].body.contains("planning/roadmap.md"));
     assert!(
         daemon
+            .interventions
             .owned_task_interventions
             .contains_key("replenishment::architect")
     );
@@ -1511,6 +1569,7 @@ fn board_replenishment_surfaces_actionable_review_backlog_before_planning() {
     );
     assert!(
         daemon
+            .scheduler
             .intervention_cooldowns
             .contains_key(&review_intervention_key("lead"))
     );
@@ -1628,6 +1687,7 @@ fn maybe_intervene_board_replenishment_respects_cooldown() {
     mark_pending_delivered(&harness, "architect");
 
     daemon
+        .interventions
         .owned_task_interventions
         .remove("replenishment::architect");
     enter_idle_epoch(&mut daemon, "architect");
@@ -1717,6 +1777,7 @@ fn maybe_intervene_board_replenishment_does_not_fire_when_all_engineers_busy() {
     );
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("replenishment::architect")
     );
@@ -1910,7 +1971,12 @@ fn multi_intervention_cycle_pending_inbox_only_suppresses_targeted_member() {
     let triage_pending = harness.pending_inbox_messages("lead-triage").unwrap();
     assert_eq!(triage_pending.len(), 1);
     assert_eq!(triage_pending[0].from, "architect");
-    assert!(!daemon.triage_interventions.contains_key("lead-triage"));
+    assert!(
+        !daemon
+            .interventions
+            .triage_interventions
+            .contains_key("lead-triage")
+    );
     assert_eq!(
         harness.pending_inbox_messages("eng-owned").unwrap().len(),
         1
@@ -1981,9 +2047,13 @@ fn multi_intervention_cycle_exact_owned_cooldown_boundary_still_allows_parallel_
     daemon.maybe_intervene_owned_tasks().unwrap();
     daemon.maybe_intervene_review_backlog().unwrap();
 
-    assert_eq!(daemon.triage_interventions.get("lead"), Some(&2));
+    assert_eq!(
+        daemon.interventions.triage_interventions.get("lead"),
+        Some(&2)
+    );
     assert_eq!(
         daemon
+            .interventions
             .owned_task_interventions
             .get("eng-1")
             .map(|state| state.idle_epoch),
@@ -2547,7 +2617,7 @@ fn nudge_disabled_marker_suppresses_triage_intervention() {
     daemon.maybe_intervene_triage_backlog().unwrap();
 
     // No triage intervention should have fired
-    assert_eq!(daemon.triage_interventions.get("lead"), None);
+    assert_eq!(daemon.interventions.triage_interventions.get("lead"), None);
     let pending = harness.pending_inbox_messages("lead").unwrap();
     assert!(pending.is_empty());
 }
@@ -2588,7 +2658,7 @@ fn nudge_harness() -> TestHarness {
 fn maybe_fire_nudges_delivers_when_idle_past_interval() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "Get moving!".to_string(),
@@ -2633,7 +2703,7 @@ fn maybe_fire_nudges_does_not_fire_when_disabled() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
     daemon.config.team_config.automation.timeout_nudges = false;
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2653,7 +2723,7 @@ fn maybe_fire_nudges_does_not_fire_when_disabled() {
 fn maybe_fire_nudges_does_not_fire_when_already_fired_this_idle() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2673,7 +2743,7 @@ fn maybe_fire_nudges_does_not_fire_when_already_fired_this_idle() {
 fn maybe_fire_nudges_does_not_fire_without_idle_since() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2697,7 +2767,7 @@ fn maybe_fire_nudges_does_not_fire_with_pending_inbox() {
         false,
     );
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2724,7 +2794,7 @@ fn maybe_fire_nudges_does_not_fire_with_pending_inbox() {
 fn maybe_fire_nudges_marks_fired_this_idle() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2741,14 +2811,21 @@ fn maybe_fire_nudges_marks_fired_this_idle() {
 
     daemon.maybe_fire_nudges().unwrap();
 
-    assert!(daemon.nudges.get("eng-1").unwrap().fired_this_idle);
+    assert!(
+        daemon
+            .interventions
+            .nudges
+            .get("eng-1")
+            .unwrap()
+            .fired_this_idle
+    );
 }
 
 #[test]
 fn maybe_fire_nudges_paused_marker_suppresses() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2775,7 +2852,7 @@ fn maybe_fire_nudges_paused_marker_suppresses() {
 fn maybe_fire_nudges_skips_engineer_with_no_actionable_task() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2805,14 +2882,21 @@ fn maybe_fire_nudges_skips_engineer_with_no_actionable_task() {
     // No nudge should be delivered
     assert!(harness.pending_inbox_messages("eng-1").unwrap().is_empty());
     // But fired_this_idle should be set so we don't re-check every cycle
-    assert!(daemon.nudges.get("eng-1").unwrap().fired_this_idle);
+    assert!(
+        daemon
+            .interventions
+            .nudges
+            .get("eng-1")
+            .unwrap()
+            .fired_this_idle
+    );
 }
 
 #[test]
 fn maybe_fire_nudges_fires_for_engineer_with_in_progress_task() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "Get moving!".to_string(),
@@ -2857,7 +2941,7 @@ fn maybe_fire_nudges_fires_for_engineer_with_in_progress_task() {
 fn update_nudge_for_state_idle_sets_idle_since_and_clears_fired() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2868,9 +2952,11 @@ fn update_nudge_for_state_idle_sets_idle_since_and_clears_fired() {
         },
     );
 
-    daemon.update_nudge_for_state("eng-1", MemberState::Idle);
+    daemon
+        .interventions
+        .update_nudge_for_state("eng-1", MemberState::Idle);
 
-    let schedule = daemon.nudges.get("eng-1").unwrap();
+    let schedule = daemon.interventions.nudges.get("eng-1").unwrap();
     assert!(schedule.idle_since.is_some());
     assert!(!schedule.fired_this_idle);
     assert!(!schedule.paused);
@@ -2880,7 +2966,7 @@ fn update_nudge_for_state_idle_sets_idle_since_and_clears_fired() {
 fn update_nudge_for_state_working_clears_idle_and_pauses() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2891,9 +2977,11 @@ fn update_nudge_for_state_working_clears_idle_and_pauses() {
         },
     );
 
-    daemon.update_nudge_for_state("eng-1", MemberState::Working);
+    daemon
+        .interventions
+        .update_nudge_for_state("eng-1", MemberState::Working);
 
-    let schedule = daemon.nudges.get("eng-1").unwrap();
+    let schedule = daemon.interventions.nudges.get("eng-1").unwrap();
     assert!(schedule.idle_since.is_none());
     assert!(!schedule.fired_this_idle);
     assert!(schedule.paused);
@@ -2904,7 +2992,7 @@ fn update_nudge_for_state_idle_preserves_active_window() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
     let original = Instant::now() - Duration::from_secs(100);
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2915,10 +3003,12 @@ fn update_nudge_for_state_idle_preserves_active_window() {
         },
     );
 
-    daemon.update_nudge_for_state("eng-1", MemberState::Idle);
+    daemon
+        .interventions
+        .update_nudge_for_state("eng-1", MemberState::Idle);
 
     // Should not reset idle_since when already tracking and not paused
-    let schedule = daemon.nudges.get("eng-1").unwrap();
+    let schedule = daemon.interventions.nudges.get("eng-1").unwrap();
     assert_eq!(schedule.idle_since, Some(original));
 }
 
@@ -2926,7 +3016,7 @@ fn update_nudge_for_state_idle_preserves_active_window() {
 fn update_nudge_for_state_idle_from_paused_resets_window() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.nudges.insert(
+    daemon.interventions.nudges.insert(
         "eng-1".to_string(),
         NudgeSchedule {
             text: "nudge".to_string(),
@@ -2937,9 +3027,11 @@ fn update_nudge_for_state_idle_from_paused_resets_window() {
         },
     );
 
-    daemon.update_nudge_for_state("eng-1", MemberState::Idle);
+    daemon
+        .interventions
+        .update_nudge_for_state("eng-1", MemberState::Idle);
 
-    let schedule = daemon.nudges.get("eng-1").unwrap();
+    let schedule = daemon.interventions.nudges.get("eng-1").unwrap();
     // idle_since should be reset to ~now since paused was true
     assert!(schedule.idle_since.unwrap().elapsed() < Duration::from_secs(10));
     assert!(!schedule.fired_this_idle);
@@ -2951,8 +3043,12 @@ fn update_nudge_for_state_unknown_member_is_noop() {
     let mut daemon = harness.build_daemon().unwrap();
 
     // Should not panic
-    daemon.update_nudge_for_state("nonexistent", MemberState::Idle);
-    daemon.update_nudge_for_state("nonexistent", MemberState::Working);
+    daemon
+        .interventions
+        .update_nudge_for_state("nonexistent", MemberState::Idle);
+    daemon
+        .interventions
+        .update_nudge_for_state("nonexistent", MemberState::Working);
 }
 
 #[test]
@@ -2960,20 +3056,33 @@ fn update_triage_for_state_working_creates_entry_at_zero() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
 
-    daemon.update_triage_intervention_for_state("eng-1", MemberState::Working);
+    daemon
+        .interventions
+        .update_triage_intervention_for_state("eng-1", MemberState::Working);
 
-    assert_eq!(daemon.triage_idle_epochs.get("eng-1"), Some(&0));
+    assert_eq!(
+        daemon.interventions.triage_idle_epochs.get("eng-1"),
+        Some(&0)
+    );
 }
 
 #[test]
 fn update_triage_for_state_idle_increments_existing() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.triage_idle_epochs.insert("eng-1".to_string(), 2);
+    daemon
+        .interventions
+        .triage_idle_epochs
+        .insert("eng-1".to_string(), 2);
 
-    daemon.update_triage_intervention_for_state("eng-1", MemberState::Idle);
+    daemon
+        .interventions
+        .update_triage_intervention_for_state("eng-1", MemberState::Idle);
 
-    assert_eq!(daemon.triage_idle_epochs.get("eng-1"), Some(&3));
+    assert_eq!(
+        daemon.interventions.triage_idle_epochs.get("eng-1"),
+        Some(&3)
+    );
 }
 
 #[test]
@@ -2981,10 +3090,15 @@ fn update_triage_for_state_idle_first_time_no_increment() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
 
-    daemon.update_triage_intervention_for_state("eng-1", MemberState::Idle);
+    daemon
+        .interventions
+        .update_triage_intervention_for_state("eng-1", MemberState::Idle);
 
     // First idle transition creates entry at 0, does not increment
-    assert_eq!(daemon.triage_idle_epochs.get("eng-1"), Some(&0));
+    assert_eq!(
+        daemon.interventions.triage_idle_epochs.get("eng-1"),
+        Some(&0)
+    );
 }
 
 #[test]
@@ -3000,6 +3114,7 @@ fn intervention_on_cooldown_true_during_cooldown() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
     daemon
+        .scheduler
         .intervention_cooldowns
         .insert("test::key".to_string(), Instant::now());
 
@@ -3010,7 +3125,7 @@ fn intervention_on_cooldown_true_during_cooldown() {
 fn intervention_on_cooldown_false_after_expiry() {
     let harness = nudge_harness();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         "test::key".to_string(),
         Instant::now()
             - Duration::from_secs(
@@ -3043,7 +3158,7 @@ fn utilization_cooldown_uses_separate_duration() {
         .intervention_cooldown_secs = 30;
 
     // Within utilization cooldown but past regular cooldown
-    daemon.intervention_cooldowns.insert(
+    daemon.scheduler.intervention_cooldowns.insert(
         "test::key".to_string(),
         Instant::now() - Duration::from_secs(100),
     );
@@ -3186,7 +3301,12 @@ fn triage_not_fire_when_disabled() {
     enter_idle_epoch(&mut daemon, "lead");
     daemon.maybe_intervene_triage_backlog().unwrap();
 
-    assert!(!daemon.triage_interventions.contains_key("lead"));
+    assert!(
+        !daemon
+            .interventions
+            .triage_interventions
+            .contains_key("lead")
+    );
     assert!(harness.pending_inbox_messages("lead").unwrap().is_empty());
 }
 
@@ -3357,7 +3477,7 @@ fn owned_tasks_clears_intervention_when_no_owned_tasks() {
     let harness = owned_task_harness();
     fs::create_dir_all(harness.board_tasks_dir()).unwrap();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.owned_task_interventions.insert(
+    daemon.interventions.owned_task_interventions.insert(
         "eng-1".to_string(),
         OwnedTaskInterventionState {
             idle_epoch: 1,
@@ -3369,7 +3489,12 @@ fn owned_tasks_clears_intervention_when_no_owned_tasks() {
 
     daemon.maybe_intervene_owned_tasks().unwrap();
 
-    assert!(!daemon.owned_task_interventions.contains_key("eng-1"));
+    assert!(
+        !daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("eng-1")
+    );
 }
 
 #[test]
@@ -3423,7 +3548,12 @@ fn owned_tasks_skips_intervention_when_matching_task_branch_has_local_progress()
             .unwrap()
             .is_empty()
     );
-    assert!(!daemon.owned_task_interventions.contains_key("eng-1"));
+    assert!(
+        !daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("eng-1")
+    );
 }
 
 #[test]
@@ -3433,7 +3563,7 @@ fn review_clears_intervention_when_no_review_tasks() {
         .with_pane("lead", "%999997");
     fs::create_dir_all(harness.board_tasks_dir()).unwrap();
     let mut daemon = harness.build_daemon().unwrap();
-    daemon.owned_task_interventions.insert(
+    daemon.interventions.owned_task_interventions.insert(
         "review::lead".to_string(),
         OwnedTaskInterventionState {
             idle_epoch: 1,
@@ -3446,7 +3576,12 @@ fn review_clears_intervention_when_no_review_tasks() {
     enter_idle_epoch(&mut daemon, "lead");
     daemon.maybe_intervene_review_backlog().unwrap();
 
-    assert!(!daemon.owned_task_interventions.contains_key("review::lead"));
+    assert!(
+        !daemon
+            .interventions
+            .owned_task_interventions
+            .contains_key("review::lead")
+    );
 }
 
 #[test]
@@ -3733,6 +3868,7 @@ fn suppress_starvation_when_all_engineers_have_tasks() {
     );
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("replenishment::architect")
     );
@@ -3786,6 +3922,7 @@ fn suppress_utilization_when_all_loaded() {
     );
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("utilization::architect")
     );
@@ -3845,6 +3982,7 @@ fn phase_gate_suppresses_utilization_when_no_dispatchable_tasks() {
     );
     assert!(
         !daemon
+            .interventions
             .owned_task_interventions
             .contains_key("utilization::architect")
     );

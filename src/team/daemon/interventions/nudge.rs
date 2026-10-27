@@ -18,7 +18,7 @@ impl TeamDaemon {
 
         // Load board tasks once so we can check whether engineers actually
         // have in-progress work before nudging them.
-        if self.nudges.is_empty() {
+        if self.interventions.nudges.is_empty() {
             return Ok(());
         }
         let board_tasks = {
@@ -30,11 +30,11 @@ impl TeamDaemon {
             }
         };
 
-        let member_names: Vec<String> = self.nudges.keys().cloned().collect();
+        let member_names: Vec<String> = self.interventions.nudges.keys().cloned().collect();
 
         for name in member_names {
             let fire = {
-                let schedule = &self.nudges[&name];
+                let schedule = &self.interventions.nudges[&name];
                 if schedule.fired_this_idle {
                     false
                 } else if let Some(idle_since) = schedule.idle_since {
@@ -65,13 +65,13 @@ impl TeamDaemon {
                             member = %name,
                             "skipping nudge — engineer has no in-progress or todo task"
                         );
-                        if let Some(schedule) = self.nudges.get_mut(&name) {
+                        if let Some(schedule) = self.interventions.nudges.get_mut(&name) {
                             schedule.fired_this_idle = true;
                         }
                         continue;
                     }
                 }
-                let prompt_text = self.nudges[&name].text.clone();
+                let prompt_text = self.interventions.nudges[&name].text.clone();
                 let text = format!(
                     "{prompt_text}\n\nIdle nudge: you have been idle past your configured timeout. Move the current lane forward now or report the exact blocker."
                 );
@@ -84,7 +84,7 @@ impl TeamDaemon {
                         continue;
                     }
                 };
-                if let Some(schedule) = self.nudges.get_mut(&name) {
+                if let Some(schedule) = self.interventions.nudges.get_mut(&name) {
                     schedule.fired_this_idle = true;
                 }
                 if delivered_live {
