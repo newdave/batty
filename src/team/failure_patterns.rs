@@ -362,6 +362,7 @@ mod tests {
             first_pass_test_rate: None,
             retry_rate: None,
             time_to_completion_secs: None,
+            count_since_last: None,
             exit_category: None,
             ts,
         }
@@ -407,6 +408,7 @@ mod tests {
             first_pass_test_rate: None,
             retry_rate: None,
             time_to_completion_secs: None,
+            count_since_last: None,
             exit_category: None,
             ts,
         }

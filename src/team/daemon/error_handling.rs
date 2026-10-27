@@ -44,7 +44,7 @@ impl TeamDaemon {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self))) {
             Ok(Ok(())) => {
                 self.subsystem_error_counts.remove(step);
-                self.deferred.step_failures.clear(step);
+                self.clear_step_failures(step);
             }
             Ok(Err(error)) => {
                 self.record_loop_step_error(step, &error.to_string());
@@ -73,7 +73,7 @@ impl TeamDaemon {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self))) {
             Ok(Ok(())) => {
                 self.subsystem_error_counts.remove(step);
-                self.deferred.step_failures.clear(step);
+                self.clear_step_failures(step);
                 self.record_optional_subsystem_success(subsystem);
             }
             Ok(Err(error)) => {

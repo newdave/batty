@@ -220,6 +220,9 @@ pub struct DiscordBot {
     commands_channel_id: String,
     last_message_id: Option<String>,
     last_message_content_fault: Option<DiscordMessageContentFault>,
+    /// Authorized messages skipped by the startup seed, reported once via
+    /// `take_skipped_backlog`.
+    skipped_backlog: usize,
 }
 
 /// Diagnostic emitted when Discord returns command-channel messages but the
@@ -249,6 +252,7 @@ impl DiscordBot {
             commands_channel_id,
             last_message_id: None,
             last_message_content_fault: None,
+            skipped_backlog: 0,
         }
     }
 
@@ -504,9 +508,15 @@ impl DiscordBot {
                     "seeded Discord command cursor; ignoring messages sent before startup"
                 );
             }
+            self.skipped_backlog += messages.len();
             return Vec::new();
         }
         messages
+    }
+
+    /// Number of messages skipped at startup; returns it once, then 0.
+    pub fn take_skipped_backlog(&mut self) -> usize {
+        std::mem::take(&mut self.skipped_backlog)
     }
 
     pub fn take_message_content_fault(&mut self) -> Option<DiscordMessageContentFault> {
@@ -1450,6 +1460,25 @@ mod tests {
         let second = bot.advance_command_cursor(vec![message("1002")], Some("1002".to_string()));
         assert_eq!(second, vec![message("1002")]);
         assert_eq!(bot.last_message_id.as_deref(), Some("1002"));
+    }
+
+    #[test]
+    fn first_poll_records_skipped_backlog_once() {
+        let mut bot = DiscordBot::new("token".to_string(), vec![42], "55".to_string());
+        let message = |id: &str| InboundMessage {
+            message_id: id.to_string(),
+            channel_id: "55".to_string(),
+            from_user_id: 42,
+            text: "$status".to_string(),
+        };
+        bot.advance_command_cursor(
+            vec![message("1"), message("2"), message("3")],
+            Some("3".to_string()),
+        );
+        assert_eq!(bot.take_skipped_backlog(), 3);
+        assert_eq!(bot.take_skipped_backlog(), 0);
+        bot.advance_command_cursor(vec![message("4")], Some("4".to_string()));
+        assert_eq!(bot.take_skipped_backlog(), 0);
     }
 
     #[test]

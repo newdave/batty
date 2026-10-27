@@ -1925,6 +1925,34 @@
       ],
       "title": "Review Disposition Latency",
       "type": "gauge"
+    },
+    {
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "batty-telemetry"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 146
+      },
+      "id": 135,
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "batty-telemetry"
+          },
+          "queryText": "SELECT COALESCE(SUM(CASE WHEN event_type='loop_step_error' THEN 1 ELSE COALESCE(json_extract(payload, '$.count_since_last'), 0) END), 0) AS value FROM events WHERE event_type IN ('loop_step_error', 'loop_step_error_summary');",
+          "queryType": "table",
+          "rawSELECT COALESCE(SUM(CASE WHEN event_type='loop_step_error' THEN 1 ELSE COALESCE(json_extract(payload, '$.count_since_last'), 0) END), 0) AS value FROM events WHERE event_type IN ('loop_step_error', 'loop_step_error_summary');ueryText": "SELECT COALESCE(SUM(CASE WHEN event_type='loop_step_error' THEN 1 ELSE COALESCE(json_extract(payload, '$.count_since_last'), 0) END), 0) AS value FROM events WHERE event_type IN ('loop_step_error', 'loop_step_error_summary');",
+          "rawSql": "SELECT COALESCE(SUM(CASE WHEN event_type='loop_step_error' THEN 1 ELSE COALESCE(json_extract(payload, '$.count_since_last'), 0) END), 0) AS value FROM events WHERE event_type IN ('loop_step_error', 'loop_step_error_summary');",
+          "refId": "A"
+        }
+      ],
+      "title": "Loop Step Errors (incl. throttled)",
+      "type": "stat"
     }
   ],
   "refresh": "30s",

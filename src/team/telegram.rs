@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::config::ChannelConfig;
@@ -28,14 +29,30 @@ pub struct TelegramBot {
     last_update_offset: i64,
     /// False until the first poll has acknowledged the startup backlog.
     seeded: bool,
+    /// Authorized messages skipped by the startup seed, as (chat id, count),
+    /// waiting to be reported once via `take_skipped_backlog`.
+    skipped_backlog: Vec<(i64, usize)>,
     /// Chunks already delivered for multi-chunk messages whose send failed
     /// part-way, keyed by hash of (chat, text). A retry resumes after the last
-    /// delivered chunk instead of re-sending the earlier ones.
-    chunk_progress: Mutex<HashMap<u64, usize>>,
+    /// delivered chunk instead of re-sending the earlier ones. Entries expire
+    /// `CHUNK_PROGRESS_TTL` after the first failed attempt, so a later,
+    /// identical but unrelated message is sent in full.
+    chunk_progress: Mutex<HashMap<u64, ChunkProgress>>,
+}
+
+/// Partial delivery of one multi-chunk message.
+#[derive(Debug, Clone, Copy)]
+struct ChunkProgress {
+    delivered: usize,
+    /// When the first failed attempt recorded progress; retries keep it.
+    first_attempt: Instant,
 }
 
 /// Bound on remembered partially-sent messages.
 const MAX_CHUNK_PROGRESS_ENTRIES: usize = 64;
+
+/// How long a partial send stays resumable.
+const CHUNK_PROGRESS_TTL: Duration = Duration::from_secs(600);
 
 impl TelegramBot {
     /// Create a new `TelegramBot` with the given token and allowed user IDs.
@@ -45,6 +62,7 @@ impl TelegramBot {
             allowed_user_ids,
             last_update_offset: 0,
             seeded: false,
+            skipped_backlog: Vec::new(),
             chunk_progress: Mutex::new(HashMap::new()),
         }
     }
@@ -90,17 +108,23 @@ impl TelegramBot {
         &self,
         chat_id: &str,
         text: &str,
+        send_chunk: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        self.send_chunks_at(Instant::now(), chat_id, text, send_chunk)
+    }
+
+    fn send_chunks_at(
+        &self,
+        now: Instant,
+        chat_id: &str,
+        text: &str,
         mut send_chunk: impl FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         let chunks = split_message(text, Self::MAX_MESSAGE_LEN);
         let total_chunks = chunks.len();
         let progress_key = outbound_chunk_message_id(chat_id, text, 0, total_chunks);
-        let start = self
-            .chunk_progress
-            .lock()
-            .map(|progress| progress.get(&progress_key).copied().unwrap_or(0))
-            .unwrap_or(0)
-            .min(total_chunks);
+        let previous = self.take_live_chunk_progress(now, progress_key);
+        let start = previous.map_or(0, |p| p.delivered).min(total_chunks);
 
         for (index, chunk) in chunks.into_iter().enumerate().skip(start) {
             let chunk_id = outbound_chunk_message_id(chat_id, chunk, index, total_chunks);
@@ -113,23 +137,39 @@ impl TelegramBot {
             );
             if let Err(error) = send_chunk(chunk) {
                 if index > 0 {
-                    self.set_chunk_progress(progress_key, index);
+                    let first_attempt = previous.map_or(now, |p| p.first_attempt);
+                    self.set_chunk_progress(
+                        now,
+                        progress_key,
+                        ChunkProgress {
+                            delivered: index,
+                            first_attempt,
+                        },
+                    );
                 }
                 return Err(error);
             }
         }
-        if let Ok(mut progress) = self.chunk_progress.lock() {
-            progress.remove(&progress_key);
-        }
         Ok(())
     }
 
-    fn set_chunk_progress(&self, key: u64, delivered: usize) {
+    /// Remove and return the resumable progress for `key`, dropping it when
+    /// it is older than `CHUNK_PROGRESS_TTL`. The caller re-records progress
+    /// if the send fails again, so a completed message leaves no entry.
+    fn take_live_chunk_progress(&self, now: Instant, key: u64) -> Option<ChunkProgress> {
+        let mut progress = self.chunk_progress.lock().ok()?;
+        let entry = progress.remove(&key)?;
+        (now.saturating_duration_since(entry.first_attempt) < CHUNK_PROGRESS_TTL).then_some(entry)
+    }
+
+    fn set_chunk_progress(&self, now: Instant, key: u64, entry: ChunkProgress) {
         if let Ok(mut progress) = self.chunk_progress.lock() {
-            if progress.len() >= MAX_CHUNK_PROGRESS_ENTRIES && !progress.contains_key(&key) {
+            progress
+                .retain(|_, p| now.saturating_duration_since(p.first_attempt) < CHUNK_PROGRESS_TTL);
+            if progress.len() >= MAX_CHUNK_PROGRESS_ENTRIES {
                 progress.clear();
             }
-            progress.insert(key, delivered);
+            progress.insert(key, entry);
         }
     }
 
@@ -209,6 +249,12 @@ impl TelegramBot {
         Ok(self.advance_update_cursor(messages, new_offset))
     }
 
+    /// Chats that sent messages while Batty was offline, with how many were
+    /// skipped. Returns each entry once; empty after the first call.
+    pub fn take_skipped_backlog(&mut self) -> Vec<(i64, usize)> {
+        std::mem::take(&mut self.skipped_backlog)
+    }
+
     /// Advance the update offset and return the messages to process. The
     /// first poll after startup only seeds the offset and processes nothing.
     fn advance_update_cursor(
@@ -224,6 +270,16 @@ impl TelegramBot {
                     skipped = messages.len(),
                     "seeded Telegram update offset; ignoring messages sent before startup"
                 );
+            }
+            for message in &messages {
+                match self
+                    .skipped_backlog
+                    .iter_mut()
+                    .find(|(chat_id, _)| *chat_id == message.chat_id)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => self.skipped_backlog.push((message.chat_id, 1)),
+                }
             }
             return Vec::new();
         }
@@ -628,6 +684,23 @@ mod tests {
         let second = bot.advance_update_cursor(vec![message("/status")], 102);
         assert_eq!(second.len(), 1);
         assert_eq!(bot.last_update_offset, 102);
+    }
+
+    #[test]
+    fn first_poll_records_skipped_backlog_per_chat_once() {
+        let mut bot = TelegramBot::new("token".to_string(), vec![42]);
+        let message = |chat_id: i64| InboundMessage {
+            from_user_id: 42,
+            chat_id,
+            text: "/status".to_string(),
+        };
+        let first = bot.advance_update_cursor(vec![message(7), message(7), message(9)], 11);
+        assert!(first.is_empty());
+        assert_eq!(bot.take_skipped_backlog(), vec![(7, 2), (9, 1)]);
+        assert!(bot.take_skipped_backlog().is_empty());
+
+        bot.advance_update_cursor(vec![message(7)], 12);
+        assert!(bot.take_skipped_backlog().is_empty());
     }
 
     #[test]
@@ -1102,6 +1175,64 @@ roles:
         })
         .unwrap();
         assert_eq!(again, 3);
+    }
+
+    #[test]
+    fn identical_message_after_completed_send_delivers_all_chunks() {
+        let bot = TelegramBot::new("tok".into(), vec![]);
+        let text = "a".repeat(10_000); // 3 chunks
+        let mut calls = 0;
+        // Fail the 3rd chunk once, then complete on retry.
+        let _ = bot.send_chunks("1", &text, |_| {
+            calls += 1;
+            if calls == 3 {
+                anyhow::bail!("boom");
+            }
+            Ok(())
+        });
+        bot.send_chunks("1", &text, |_| Ok(())).unwrap();
+
+        let mut again = 0;
+        bot.send_chunks("1", &text, |_| {
+            again += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(again, 3, "repeat of a completed message is sent in full");
+    }
+
+    #[test]
+    fn stale_partial_progress_expires_so_identical_message_is_sent_in_full() {
+        let bot = TelegramBot::new("tok".into(), vec![]);
+        let text = "a".repeat(10_000);
+        let start = Instant::now();
+        let mut n = 0;
+        let _ = bot.send_chunks_at(start, "1", &text, |_| {
+            n += 1;
+            if n == 3 {
+                anyhow::bail!("boom")
+            } else {
+                Ok(())
+            }
+        });
+
+        // Within the TTL the retry resumes at the failed chunk.
+        let mut resumed = 0;
+        let _ = bot.send_chunks_at(start + Duration::from_secs(60), "1", &text, |_| {
+            resumed += 1;
+            anyhow::bail!("still down")
+        });
+        assert_eq!(resumed, 1, "resumes at chunk 3");
+
+        // Retries keep the first-attempt time, so the entry expires 10 minutes
+        // after the first failure, not after the latest retry.
+        let mut full = 0;
+        bot.send_chunks_at(start + Duration::from_secs(601), "1", &text, |_| {
+            full += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(full, 3);
     }
 
     #[test]

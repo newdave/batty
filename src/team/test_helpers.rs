@@ -44,6 +44,7 @@ pub(crate) fn team_config_with_roles(roles: Vec<RoleDef>) -> TeamConfig {
         layout: None,
         cost: Default::default(),
         grafana: Default::default(),
+        telemetry: Default::default(),
         use_shim: false,
         use_sdk_mode: false,
         auto_respawn_on_crash: false,

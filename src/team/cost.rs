@@ -878,6 +878,7 @@ mod tests {
             workflow_policy: Default::default(),
             cost: CostConfig { models },
             grafana: Default::default(),
+            telemetry: Default::default(),
             use_shim: false,
             use_sdk_mode: false,
             auto_respawn_on_crash: false,

@@ -39,6 +39,12 @@ pub(super) trait ChatPlatform: Sized {
         None
     }
 
+    /// Messages ignored because they were sent while Batty was offline, as
+    /// (where to reply, how many). Each backlog is returned once.
+    fn take_skipped_backlog(&mut self) -> Vec<(ChatReplyTarget, usize)> {
+        Vec::new()
+    }
+
     fn log_poll_failure(error: &Error) {
         debug!(error = %error, "{} poll failed", Self::NAME);
     }
@@ -53,6 +59,23 @@ pub(super) trait ChatPlatform: Sized {
     fn inbox_targets(team_config: &TeamConfig) -> Vec<String>;
 }
 
+/// Reply text telling a user that `count` of their messages were skipped.
+fn offline_backlog_notice(count: usize) -> String {
+    format!(
+        "Batty restarted; ignored {count} message(s) sent while it was offline. \
+         Resend any commands you still need."
+    )
+}
+
+/// Tell each chat with a skipped startup backlog, once.
+fn notify_skipped_backlog<P: ChatPlatform>(bot: &mut P) {
+    for (target, count) in bot.take_skipped_backlog() {
+        if let Err(error) = bot.send_reply(&target, &offline_backlog_notice(count)) {
+            warn!(error = %error, "failed to send {} offline-backlog notice", P::NAME);
+        }
+    }
+}
+
 impl TeamDaemon {
     /// Poll one platform and route what arrived.
     pub(super) fn poll_chat_platform<P: ChatPlatform>(&mut self) -> Result<()> {
@@ -63,6 +86,7 @@ impl TeamDaemon {
 
         let polled = bot.poll();
         let fault = if polled.is_ok() {
+            notify_skipped_backlog(bot);
             bot.take_fault()
         } else {
             None
@@ -230,5 +254,92 @@ impl TeamDaemon {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    /// A platform whose startup seed skipped a backlog, recording replies.
+    struct FakePlatform {
+        backlog: usize,
+        polled_inbound: Vec<ChatInbound>,
+        replies: RefCell<Vec<(ChatReplyTarget, String)>>,
+    }
+
+    impl FakePlatform {
+        fn with_backlog(backlog: usize) -> Self {
+            Self {
+                backlog,
+                polled_inbound: Vec::new(),
+                replies: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ChatPlatform for FakePlatform {
+        const NAME: &'static str = "fake";
+
+        fn slot(_: &mut Integrations) -> (&mut Option<Self>, &mut PollHealth) {
+            unreachable!("not used by notice tests")
+        }
+
+        fn poll(&mut self) -> Result<Vec<ChatInbound>> {
+            // A seeding poll processes none of the backlog.
+            Ok(std::mem::take(&mut self.polled_inbound))
+        }
+
+        fn take_skipped_backlog(&mut self) -> Vec<(ChatReplyTarget, usize)> {
+            match std::mem::take(&mut self.backlog) {
+                0 => Vec::new(),
+                n => vec![(ChatReplyTarget::Discord, n)],
+            }
+        }
+
+        fn parse_command(_: &str) -> Result<Option<TelegramCommand>> {
+            Ok(None)
+        }
+
+        fn send_reply(&self, to: &ChatReplyTarget, text: &str) -> Result<()> {
+            self.replies
+                .borrow_mut()
+                .push((to.clone(), text.to_string()));
+            Ok(())
+        }
+
+        fn inbox_targets(_: &TeamConfig) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn three_message_backlog_gives_one_notice_and_processes_none() {
+        let mut bot = FakePlatform::with_backlog(3);
+        assert!(
+            bot.poll().unwrap().is_empty(),
+            "no backlog message is processed"
+        );
+
+        notify_skipped_backlog(&mut bot);
+        notify_skipped_backlog(&mut bot);
+
+        let replies = bot.replies.borrow();
+        assert_eq!(replies.len(), 1, "exactly one notice");
+        assert_eq!(replies[0].0, ChatReplyTarget::Discord);
+        assert_eq!(
+            replies[0].1,
+            "Batty restarted; ignored 3 message(s) sent while it was offline. \
+             Resend any commands you still need."
+        );
+    }
+
+    #[test]
+    fn empty_backlog_sends_no_notice() {
+        let mut bot = FakePlatform::with_backlog(0);
+        notify_skipped_backlog(&mut bot);
+        assert!(bot.replies.borrow().is_empty());
     }
 }

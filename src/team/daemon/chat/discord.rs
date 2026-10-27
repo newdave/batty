@@ -65,6 +65,13 @@ impl ChatPlatform for DiscordBot {
             .collect())
     }
 
+    fn take_skipped_backlog(&mut self) -> Vec<(background_tests::ChatReplyTarget, usize)> {
+        match DiscordBot::take_skipped_backlog(self) {
+            0 => Vec::new(),
+            count => vec![(background_tests::ChatReplyTarget::Discord, count)],
+        }
+    }
+
     fn take_fault(&mut self) -> Option<String> {
         self.take_message_content_fault()
             .map(|fault| fault.status_message())

@@ -47,6 +47,13 @@ impl ChatPlatform for TelegramBot {
             .collect())
     }
 
+    fn take_skipped_backlog(&mut self) -> Vec<(ChatReplyTarget, usize)> {
+        TelegramBot::take_skipped_backlog(self)
+            .into_iter()
+            .map(|(chat_id, count)| (ChatReplyTarget::Telegram { chat_id }, count))
+            .collect()
+    }
+
     fn parse_command(text: &str) -> Result<Option<TelegramCommand>> {
         parse_telegram_command(text)
     }
@@ -347,6 +354,7 @@ mod tests {
                 layout: None,
                 cost: Default::default(),
                 grafana: Default::default(),
+                telemetry: Default::default(),
                 use_shim: false,
                 use_sdk_mode: false,
                 auto_respawn_on_crash: false,
@@ -842,6 +850,7 @@ mod tests {
                 layout: None,
                 cost: Default::default(),
                 grafana: Default::default(),
+                telemetry: Default::default(),
                 use_shim: false,
                 use_sdk_mode: false,
                 auto_respawn_on_crash: false,
@@ -884,6 +893,7 @@ mod tests {
                 layout: None,
                 cost: Default::default(),
                 grafana: Default::default(),
+                telemetry: Default::default(),
                 use_shim: false,
                 use_sdk_mode: false,
                 auto_respawn_on_crash: false,
@@ -1038,6 +1048,7 @@ mod tests {
                 layout: None,
                 cost: Default::default(),
                 grafana: Default::default(),
+                telemetry: Default::default(),
                 use_shim: false,
                 use_sdk_mode: false,
                 auto_respawn_on_crash: false,

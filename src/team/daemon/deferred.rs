@@ -2,10 +2,21 @@
 //! retries, pending member removals, and repeated-failure log throttling.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Largest gap, in poll cycles, between two reports of the same failure.
 const MAX_REPORT_GAP_CYCLES: u32 = 64;
+
+/// How often a throttled step reports how many failures it swallowed.
+pub(super) const FAILURE_SUMMARY_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Failures swallowed by the throttle since the last summary for one step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FailureSummary {
+    pub(super) step: String,
+    pub(super) count_since_last: u32,
+    pub(super) last_error: String,
+}
 
 /// A retry notice scheduled for a member after a stalled-mid-turn completion.
 #[derive(Debug, Clone)]
@@ -32,6 +43,10 @@ struct FailureThrottle {
     skipped: u32,
     /// Failures to swallow before the next report.
     gap: u32,
+    /// Failures swallowed (never reported individually) since the last summary.
+    unreported: u32,
+    /// When the current summary window began.
+    window_started: Instant,
 }
 
 /// Decides when a repeating failure is worth reporting: the first time, when
@@ -51,6 +66,8 @@ impl FailureThrottles {
                     last_error: error.to_string(),
                     skipped: 0,
                     gap: 1,
+                    unreported: 0,
+                    window_started: Instant::now(),
                 },
             );
             return true;
@@ -70,8 +87,48 @@ impl FailureThrottles {
         false
     }
 
-    pub(super) fn clear(&mut self, key: &str) {
-        self.entries.remove(key);
+    /// Record a failure that `should_report` throttled and that was not
+    /// emitted by any other path.
+    pub(super) fn note_suppressed(&mut self, key: &str) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.unreported += 1;
+        }
+    }
+
+    /// Summaries for every step with swallowed failures whose window is at
+    /// least `interval` old as of `now`. Each returned step starts a new window.
+    pub(super) fn take_due_summaries(
+        &mut self,
+        now: Instant,
+        interval: Duration,
+    ) -> Vec<FailureSummary> {
+        let mut due = Vec::new();
+        for (step, entry) in &mut self.entries {
+            if now.saturating_duration_since(entry.window_started) < interval {
+                continue;
+            }
+            entry.window_started = now;
+            if entry.unreported > 0 {
+                due.push(FailureSummary {
+                    step: step.clone(),
+                    count_since_last: std::mem::take(&mut entry.unreported),
+                    last_error: entry.last_error.clone(),
+                });
+            }
+        }
+        due.sort_by(|a, b| a.step.cmp(&b.step));
+        due
+    }
+
+    /// Forget `key` after a success, returning any swallowed failures that
+    /// were never summarised so the caller can still account for them.
+    pub(super) fn clear(&mut self, key: &str) -> Option<FailureSummary> {
+        let entry = self.entries.remove(key)?;
+        (entry.unreported > 0).then(|| FailureSummary {
+            step: key.to_string(),
+            count_since_last: entry.unreported,
+            last_error: entry.last_error,
+        })
     }
 }
 
@@ -133,6 +190,49 @@ mod tests {
         assert!(t.should_report("s", "b"));
         t.clear("s");
         assert!(t.should_report("s", "b"));
+    }
+
+    #[test]
+    fn summaries_count_only_suppressed_failures_per_window() {
+        let mut t = FailureThrottles::default();
+        let start = Instant::now();
+        for _ in 0..10 {
+            if !t.should_report("s", "boom") {
+                t.note_suppressed("s");
+            }
+        }
+        // Reported at cycles 1, 2, 4, 8 -> 6 swallowed.
+        assert!(
+            t.take_due_summaries(start, FAILURE_SUMMARY_INTERVAL)
+                .is_empty()
+        );
+        let later = start + FAILURE_SUMMARY_INTERVAL + Duration::from_secs(1);
+        assert_eq!(
+            t.take_due_summaries(later, FAILURE_SUMMARY_INTERVAL),
+            vec![FailureSummary {
+                step: "s".into(),
+                count_since_last: 6,
+                last_error: "boom".into(),
+            }]
+        );
+        // Window restarted and counter drained.
+        assert!(
+            t.take_due_summaries(later + FAILURE_SUMMARY_INTERVAL, FAILURE_SUMMARY_INTERVAL)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn clear_returns_unsummarised_failures() {
+        let mut t = FailureThrottles::default();
+        for _ in 0..3 {
+            if !t.should_report("s", "x") {
+                t.note_suppressed("s");
+            }
+        }
+        let summary = t.clear("s").expect("one swallowed failure");
+        assert_eq!(summary.count_since_last, 1);
+        assert!(t.clear("s").is_none());
     }
 
     #[test]

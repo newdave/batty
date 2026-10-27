@@ -1136,3 +1136,19 @@ roles:
     assert_eq!(config.workflow_policy.graceful_shutdown_timeout_secs, 9);
     assert!(!config.workflow_policy.auto_commit_on_restart);
 }
+
+// --- telemetry retention config ---
+
+#[test]
+fn telemetry_retention_days_defaults_to_90_and_parses_override() {
+    let default_config: TeamConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
+    assert_eq!(default_config.telemetry.retention_days, 90);
+
+    let yaml = format!("{}\ntelemetry:\n  retention_days: 0\n", minimal_yaml());
+    let disabled: TeamConfig = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(disabled.telemetry.retention_days, 0);
+
+    let yaml = format!("{}\ntelemetry:\n  retention_days: 14\n", minimal_yaml());
+    let custom: TeamConfig = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(custom.telemetry.retention_days, 14);
+}

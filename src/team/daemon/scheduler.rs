@@ -23,8 +23,9 @@ pub(in crate::team) struct Scheduler {
     pub(in crate::team) retro_generated: bool,
     /// When the last binary freshness check ran (#675). Gated to at most once per hour.
     pub(in crate::team) last_binary_freshness_check: Option<Instant>,
-    /// Last daily telemetry retention pass.
-    pub(in crate::team) last_telemetry_retention: Instant,
+    /// Last telemetry retention pass. `None` until the first pass runs, so a
+    /// daemon restarted more often than daily still prunes on its first tick.
+    pub(in crate::team) last_telemetry_retention: Option<Instant>,
     /// When the last tiered inbox expiry sweep ran (#658). Gated to at most once per minute.
     pub(in crate::team) last_tiered_inbox_sweep: Option<Instant>,
     /// Keyed cooldowns for interventions, alerts and optional-subsystem budgets.
@@ -49,10 +50,8 @@ impl Scheduler {
             retro_generated: false,
             // Start far enough in the past to trigger an immediate check at startup.
             last_binary_freshness_check: None,
-            // Run one retention pass shortly after startup.
-            last_telemetry_retention: Instant::now()
-                .checked_sub(Duration::from_secs(24 * 3600))
-                .unwrap_or_else(Instant::now),
+            // Run one retention pass on the first tick after startup.
+            last_telemetry_retention: None,
             // First sweep runs on the first tick after startup.
             last_tiered_inbox_sweep: None,
             intervention_cooldowns: HashMap::new(),

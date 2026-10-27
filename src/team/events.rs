@@ -130,6 +130,10 @@ pub struct TeamEvent {
     pub retry_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_to_completion_secs: Option<u64>,
+    /// Failures swallowed by throttling since the previous summary
+    /// (`loop_step_error_summary`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_since_last: Option<u32>,
     pub ts: u64,
 }
 
@@ -176,6 +180,7 @@ impl TeamEvent {
             first_pass_test_rate: None,
             retry_rate: None,
             time_to_completion_secs: None,
+            count_since_last: None,
             ts: Self::now(),
         }
     }
@@ -285,6 +290,17 @@ impl TeamEvent {
             step: Some(step.into()),
             error: Some(error.into()),
             ..Self::base("loop_step_error")
+        }
+    }
+
+    /// Roll-up of `count_since_last` failures of `step` that throttling kept
+    /// out of the event log; `last_error` is the most recent error text.
+    pub fn loop_step_error_summary(step: &str, count_since_last: u32, last_error: &str) -> Self {
+        Self {
+            step: Some(step.into()),
+            error: Some(last_error.into()),
+            count_since_last: Some(count_since_last),
+            ..Self::base("loop_step_error_summary")
         }
     }
 

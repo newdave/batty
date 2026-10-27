@@ -110,6 +110,11 @@ grafana:
   enabled: true
   port: 3000
 
+# Telemetry database (.batty/telemetry.db)
+telemetry:
+  retention_days: 90   # prune events older than this; 0 disables pruning.
+                       # First pass runs on daemon startup, then every 24h.
+
 roles:
   - name: human
     role_type: user

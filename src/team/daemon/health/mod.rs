@@ -354,6 +354,7 @@ exit 1
             layout: None,
             cost: Default::default(),
             grafana: Default::default(),
+            telemetry: Default::default(),
             use_shim: false,
             use_sdk_mode: false,
             auto_respawn_on_crash: false,

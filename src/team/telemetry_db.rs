@@ -3008,6 +3008,31 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_loop_error_panel_counts_throttled_failures() {
+        let dashboard: serde_json::Value =
+            serde_json::from_str(crate::team::grafana::DASHBOARD_JSON).unwrap();
+        let panel = dashboard["panels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["title"] == "Loop Step Errors (incl. throttled)")
+            .expect("loop error panel");
+        let sql = panel["targets"][0]["rawSql"].as_str().unwrap();
+
+        let conn = open_in_memory().unwrap();
+        for _ in 0..6 {
+            insert_event(&conn, &TeamEvent::loop_step_error("poll", "boom")).unwrap();
+        }
+        insert_event(
+            &conn,
+            &TeamEvent::loop_step_error_summary("poll", 34, "boom"),
+        )
+        .unwrap();
+        let total: i64 = conn.query_row(sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(total, 40);
+    }
+
+    #[test]
     fn checkpoint_wal_succeeds_on_file_db() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".batty")).unwrap();

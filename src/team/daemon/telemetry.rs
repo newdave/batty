@@ -65,21 +65,33 @@ impl TeamDaemon {
         }
     }
 
-    /// Prune old telemetry rows and checkpoint the WAL, at most once per 24h.
+    /// Prune old telemetry rows and checkpoint the WAL: on the first tick
+    /// after startup, then at most once per 24h. `telemetry.retention_days: 0`
+    /// disables pruning.
     pub(super) fn maybe_run_telemetry_retention(&mut self) {
-        if self.scheduler.last_telemetry_retention.elapsed() < TELEMETRY_RETENTION_INTERVAL {
+        if self
+            .scheduler
+            .last_telemetry_retention
+            .is_some_and(|t| t.elapsed() < TELEMETRY_RETENTION_INTERVAL)
+        {
             return;
         }
-        self.scheduler.last_telemetry_retention = std::time::Instant::now();
+        self.scheduler.last_telemetry_retention = Some(std::time::Instant::now());
+        let retention_days = self.config.team_config.telemetry.retention_days;
+        if retention_days == 0 {
+            debug!("telemetry retention disabled (retention_days: 0)");
+            return;
+        }
         let Some(conn) = &self.telemetry_db else {
             return;
         };
         match crate::team::telemetry_db::run_retention(
             conn,
             crate::team::now_unix(),
-            crate::team::telemetry_db::DEFAULT_RETENTION_DAYS,
+            retention_days,
         ) {
             Ok(report) => info!(
+                retention_days,
                 events_deleted = report.events_deleted,
                 review_queue_deleted = report.review_queue_deleted,
                 "telemetry retention pass complete"
@@ -331,12 +343,42 @@ impl TeamDaemon {
         }
         if report || optional_subsystem_for_step(step).is_some() {
             self.emit_event(TeamEvent::loop_step_error(step, error));
+        } else {
+            self.deferred.step_failures.note_suppressed(step);
         }
+        self.emit_due_loop_step_error_summaries(std::time::Instant::now());
         // Capture into the per-tick error buffer so `tick()` can return
         // structured diagnostics in TickReport. Cleared at the start of
         // each tick. Cheap when no errors occur.
         self.current_tick_errors
             .push((step.to_string(), error.to_string()));
+    }
+
+    /// Emit a `loop_step_error_summary` for each throttled step whose summary
+    /// window has elapsed, so dashboards can recover the true failure count.
+    pub(super) fn emit_due_loop_step_error_summaries(&mut self, now: std::time::Instant) {
+        let due = self
+            .deferred
+            .step_failures
+            .take_due_summaries(now, super::deferred::FAILURE_SUMMARY_INTERVAL);
+        for summary in due {
+            self.emit_loop_step_error_summary(&summary);
+        }
+    }
+
+    /// Flush swallowed failures for a step that just recovered.
+    pub(super) fn clear_step_failures(&mut self, step: &str) {
+        if let Some(summary) = self.deferred.step_failures.clear(step) {
+            self.emit_loop_step_error_summary(&summary);
+        }
+    }
+
+    fn emit_loop_step_error_summary(&mut self, summary: &super::deferred::FailureSummary) {
+        self.emit_event(TeamEvent::loop_step_error_summary(
+            &summary.step,
+            summary.count_since_last,
+            &summary.last_error,
+        ));
     }
 
     pub(super) fn record_daemon_reloading(&mut self) {
@@ -1197,6 +1239,7 @@ mod tests {
                 layout: None,
                 cost: Default::default(),
                 grafana: Default::default(),
+                telemetry: Default::default(),
                 use_shim: false,
                 use_sdk_mode: false,
                 auto_respawn_on_crash: false,
@@ -1416,6 +1459,122 @@ mod tests {
         assert_eq!(tasks[0].task_id, "42");
         assert_eq!(tasks[0].narration_rejections, 1);
         assert_eq!(tasks[0].confidence_score, Some(0.87));
+    }
+
+    #[test]
+    fn persistent_step_failure_emits_summaries_matching_actual_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon_for_orchestrator_logging(tmp.path(), WorkflowMode::Hybrid, true);
+        for _ in 0..40 {
+            daemon.record_loop_step_error("poll_flaky", "still broken");
+        }
+        let path = crate::team::team_events_path(tmp.path());
+        let events = read_events(&path).unwrap();
+        let individual = events
+            .iter()
+            .filter(|e| e.event == "loop_step_error")
+            .count();
+        assert_eq!(individual, 6, "individual events stay throttled");
+        assert!(
+            !events.iter().any(|e| e.event == "loop_step_error_summary"),
+            "no summary before the interval elapses"
+        );
+
+        let later = std::time::Instant::now() + Duration::from_secs(601);
+        daemon.emit_due_loop_step_error_summaries(later);
+        let events = read_events(&path).unwrap();
+        let summaries: Vec<_> = events
+            .iter()
+            .filter(|e| e.event == "loop_step_error_summary")
+            .collect();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].step.as_deref(), Some("poll_flaky"));
+        assert_eq!(summaries[0].error.as_deref(), Some("still broken"));
+        assert_eq!(summaries[0].count_since_last, Some(34));
+        assert_eq!(individual as u32 + 34, 40);
+
+        // A second window with no new failures emits nothing more.
+        daemon.emit_due_loop_step_error_summaries(later + Duration::from_secs(601));
+        let events = read_events(&path).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event == "loop_step_error_summary")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_flushes_pending_failure_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon_for_orchestrator_logging(tmp.path(), WorkflowMode::Hybrid, true);
+        for _ in 0..3 {
+            daemon.record_loop_step_error("poll_flaky", "down");
+        }
+        daemon.clear_step_failures("poll_flaky");
+        let events = read_events(&crate::team::team_events_path(tmp.path())).unwrap();
+        let summary = events
+            .iter()
+            .find(|e| e.event == "loop_step_error_summary")
+            .expect("summary on recovery");
+        assert_eq!(summary.count_since_last, Some(1));
+    }
+
+    fn count_events(daemon: &TeamDaemon) -> i64 {
+        daemon
+            .telemetry_db
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn seed_aged_events(daemon: &TeamDaemon, ages_days: &[u64]) {
+        let now = crate::team::now_unix();
+        let conn = daemon.telemetry_db.as_ref().unwrap();
+        for age in ages_days {
+            conn.execute(
+                "INSERT INTO events (timestamp, event_type, payload) VALUES (?1, 'seed', '{}')",
+                [(now - age * 86_400) as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn telemetry_retention_zero_days_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon_for_orchestrator_logging(tmp.path(), WorkflowMode::Hybrid, true);
+        daemon.config.team_config.telemetry.retention_days = 0;
+        seed_aged_events(&daemon, &[400, 5]);
+        daemon.maybe_run_telemetry_retention();
+        assert_eq!(count_events(&daemon), 2);
+    }
+
+    #[test]
+    fn telemetry_retention_prunes_at_configured_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon_for_orchestrator_logging(tmp.path(), WorkflowMode::Hybrid, true);
+        daemon.config.team_config.telemetry.retention_days = 7;
+        seed_aged_events(&daemon, &[30, 10, 3, 1]);
+        daemon.maybe_run_telemetry_retention();
+        assert_eq!(count_events(&daemon), 2);
+    }
+
+    #[test]
+    fn telemetry_retention_runs_on_first_tick_then_waits_a_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon_for_orchestrator_logging(tmp.path(), WorkflowMode::Hybrid, true);
+        assert!(daemon.scheduler.last_telemetry_retention.is_none());
+        seed_aged_events(&daemon, &[200]);
+        daemon.maybe_run_telemetry_retention();
+        assert_eq!(count_events(&daemon), 0, "first tick prunes");
+        assert!(daemon.scheduler.last_telemetry_retention.is_some());
+
+        seed_aged_events(&daemon, &[200]);
+        daemon.maybe_run_telemetry_retention();
+        assert_eq!(count_events(&daemon), 1, "second tick within 24h skips");
     }
 
     #[test]
@@ -1647,6 +1806,7 @@ mod tests {
                 layout: None,
                 cost: Default::default(),
                 grafana: Default::default(),
+                telemetry: Default::default(),
                 use_shim: false,
                 use_sdk_mode: false,
                 auto_respawn_on_crash: false,

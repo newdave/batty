@@ -31,6 +31,7 @@ pub struct TeamConfig {
     pub workflow_policy: WorkflowPolicy,
     pub cost: CostConfig,
     pub grafana: GrafanaConfig,
+    pub telemetry: TelemetryConfig,
     /// When true, agents are spawned as shim subprocesses instead of
     /// directly in tmux panes. The shim manages PTY, state classification,
     /// and message delivery over a structured channel.
@@ -95,6 +96,8 @@ struct TeamConfigWire {
     #[serde(default)]
     pub grafana: GrafanaConfig,
     #[serde(default)]
+    pub telemetry: TelemetryConfig,
+    #[serde(default)]
     pub use_shim: bool,
     #[serde(default = "default_use_sdk_mode")]
     pub use_sdk_mode: bool,
@@ -146,6 +149,7 @@ impl From<TeamConfigWire> for TeamConfig {
             workflow_policy: wire.workflow_policy,
             cost: wire.cost,
             grafana: wire.grafana,
+            telemetry: wire.telemetry,
             use_shim: wire.use_shim,
             use_sdk_mode: wire.use_sdk_mode,
             auto_respawn_on_crash: wire.auto_respawn_on_crash,
@@ -185,6 +189,26 @@ impl Default for GrafanaConfig {
             port: default_grafana_port(),
         }
     }
+}
+
+/// Telemetry database settings (`telemetry:` in team.yaml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// Days of event history kept in `.batty/telemetry.db`. 0 disables pruning.
+    #[serde(default = "default_telemetry_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_telemetry_retention_days(),
+        }
+    }
+}
+
+fn default_telemetry_retention_days() -> u64 {
+    crate::team::telemetry_db::DEFAULT_RETENTION_DAYS
 }
 
 fn default_grafana_port() -> u16 {
