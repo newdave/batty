@@ -486,6 +486,9 @@ impl TeamDaemon {
 
     /// Create a new daemon from resolved config and layout.
     pub fn new(config: DaemonConfig) -> Result<Self> {
+        crate::team::test_job::set_default_timeout_secs(
+            config.team_config.workflow_policy.verification.timeout_secs,
+        );
         let is_git_repo = super::git_cmd::is_git_repo(&config.project_root);
         let (is_multi_repo, sub_repo_names) = if is_git_repo {
             (false, Vec::new())
@@ -848,19 +851,23 @@ impl TeamDaemon {
 
         let project_root = self.project_root().to_path_buf();
         let job_command = command.clone();
-        let job = crate::team::test_job::TestJob::spawn("main-smoke", move |child_pgid| {
-            crate::team::task_loop::run_tests_in_worktree_tracked(
-                &project_root,
-                Some(&job_command),
-                Some(child_pgid.as_ref()),
-            )
-            .with_context(|| {
-                format!(
-                    "failed while running main smoke command `{job_command}` in {}",
-                    project_root.display()
+        let job = crate::team::test_job::TestJob::spawn_with_timeout(
+            "main-smoke",
+            self.test_job_timeout(),
+            move |child_pgid| {
+                crate::team::task_loop::run_tests_in_worktree_tracked(
+                    &project_root,
+                    Some(&job_command),
+                    Some(child_pgid.as_ref()),
                 )
-            })
-        });
+                .with_context(|| {
+                    format!(
+                        "failed while running main smoke command `{job_command}` in {}",
+                        project_root.display()
+                    )
+                })
+            },
+        );
         self.verification.background_tests.main_smoke =
             Some(background_tests::MainSmokeJob { command, head, job });
         Ok(())

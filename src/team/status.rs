@@ -162,6 +162,8 @@ struct PersistedDaemonHealthState {
     #[serde(default)]
     main_smoke_state: Option<MainSmokeState>,
     #[serde(default)]
+    running_tests: Vec<crate::team::test_job::RunningTestInfo>,
+    #[serde(default)]
     optional_subsystem_backoff: HashMap<String, u32>,
     #[serde(default)]
     optional_subsystem_disabled_remaining_secs: HashMap<String, u64>,
@@ -2104,6 +2106,21 @@ pub(crate) fn load_main_smoke_state(project_root: &Path) -> Option<MainSmokeStat
         .ok()
         .flatten()
         .and_then(|state| state.main_smoke_state)
+}
+
+/// One line per background test job the daemon is running, with elapsed time.
+pub(crate) fn load_running_test_summaries(project_root: &Path) -> Vec<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    load_persisted_daemon_health_state(&daemon_state_path(project_root))
+        .ok()
+        .flatten()
+        .map(|state| state.running_tests)
+        .unwrap_or_default()
+        .iter()
+        .map(|job| job.summary(now))
+        .collect()
 }
 
 pub(crate) fn format_main_smoke_summary(main_smoke: &MainSmokeState) -> String {

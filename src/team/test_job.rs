@@ -6,7 +6,7 @@
 //! result on later polls.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,22 @@ pub(crate) type ChildPgid = Arc<AtomicU32>;
 /// Slot value meaning the job was killed. A command spawned after the kill
 /// sees it and is killed at once instead of running as an orphan.
 const CANCELLED: u32 = u32::MAX;
+
+/// Default wall-clock limit for a test job, in seconds (0 disables the
+/// limit). The daemon mirrors `workflow_policy.verification.timeout_secs`
+/// here so every spawn site, including the merge queue, is bounded.
+static DEFAULT_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(3600);
+
+pub(crate) fn set_default_timeout_secs(secs: u64) {
+    DEFAULT_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
+}
+
+fn default_timeout() -> Option<Duration> {
+    match DEFAULT_TIMEOUT_SECS.load(Ordering::Relaxed) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
 
 /// Record a freshly spawned child's process group. Returns `false` (and
 /// kills the group) if the job was already cancelled.
@@ -50,11 +66,43 @@ fn kill_group(pgid: u32) {
     }
 }
 
+/// Error reported by [`TestJob::try_take`] when the wall-clock limit passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TestTimedOut {
+    pub(crate) secs: u64,
+}
+
+impl std::fmt::Display for TestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timed out after {}s", self.secs)
+    }
+}
+
+impl std::error::Error for TestTimedOut {}
+
+/// A running job as persisted for `batty status`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RunningTestInfo {
+    pub(crate) label: String,
+    pub(crate) started_unix_secs: u64,
+}
+
+impl RunningTestInfo {
+    /// Human-readable summary such as `verify-eng-1 (running 2m05s)`.
+    pub(crate) fn summary(&self, now_unix_secs: u64) -> String {
+        let secs = now_unix_secs.saturating_sub(self.started_unix_secs);
+        format!("{} (running {}m{:02}s)", self.label, secs / 60, secs % 60)
+    }
+}
+
 pub(crate) struct TestJob<T> {
     label: String,
     rx: Receiver<Result<T>>,
     child_pgid: ChildPgid,
     started_at: Instant,
+    started_unix_secs: u64,
+    /// Wall-clock limit measured from spawn; `None` means unbounded.
+    timeout: Option<Duration>,
 }
 
 impl<T: Send + 'static> TestJob<T> {
@@ -62,6 +110,17 @@ impl<T: Send + 'static> TestJob<T> {
     /// hand to the tracked test runner.
     pub(crate) fn spawn(
         label: impl Into<String>,
+        work: impl FnOnce(&ChildPgid) -> Result<T> + Send + 'static,
+    ) -> Self {
+        Self::spawn_with_timeout(label, default_timeout(), work)
+    }
+
+    /// Like [`spawn`](Self::spawn) with an explicit wall-clock limit. Once it
+    /// is exceeded, `try_take` kills the command's process group and reports
+    /// a "timed out" error.
+    pub(crate) fn spawn_with_timeout(
+        label: impl Into<String>,
+        timeout: Option<Duration>,
         work: impl FnOnce(&ChildPgid) -> Result<T> + Send + 'static,
     ) -> Self {
         let label = label.into();
@@ -84,6 +143,10 @@ impl<T: Send + 'static> TestJob<T> {
             rx,
             child_pgid,
             started_at: Instant::now(),
+            started_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            timeout,
         }
     }
 }
@@ -94,11 +157,31 @@ impl<T> TestJob<T> {
     pub(crate) fn try_take(&self) -> Option<Result<T>> {
         match self.rx.try_recv() {
             Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Empty) => {
+                let limit = self
+                    .timeout
+                    .filter(|limit| self.started_at.elapsed() >= *limit)?;
+                tracing::warn!(
+                    label = %self.label,
+                    timeout_secs = limit.as_secs(),
+                    "background test job timed out"
+                );
+                self.kill();
+                Some(Err(anyhow::Error::new(TestTimedOut {
+                    secs: limit.as_secs(),
+                })))
+            }
             Err(TryRecvError::Disconnected) => Some(Err(anyhow!(
                 "background test job `{}` exited without a result",
                 self.label
             ))),
+        }
+    }
+
+    pub(crate) fn info(&self) -> RunningTestInfo {
+        RunningTestInfo {
+            label: self.label.clone(),
+            started_unix_secs: self.started_unix_secs,
         }
     }
 
@@ -183,6 +266,50 @@ mod tests {
             .unwrap();
         assert!(!run.passed);
         assert!(started.elapsed() < Duration::from_secs(25));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_past_its_timeout_is_killed_and_reported_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let job =
+            TestJob::spawn_with_timeout("timeout", Some(Duration::from_secs(1)), move |pgid| {
+                crate::team::task_loop::run_tests_in_worktree_tracked(
+                    &dir,
+                    Some("sleep 30; exit 0"),
+                    Some(pgid),
+                )
+            });
+        let mut outcome = None;
+        assert!(
+            crate::team::test_support::wait_until(Duration::from_secs(25), || {
+                outcome = job.try_take();
+                outcome.is_some()
+            }),
+            "timed-out job was never reported"
+        );
+        let error = outcome.unwrap().unwrap_err().to_string();
+        assert_eq!(error, "timed out after 1s");
+        // The process group was killed: the worker finishes well before 30s.
+        assert!(job.wait(Duration::from_secs(20)).is_some());
+    }
+
+    #[test]
+    fn running_test_summary_shows_elapsed_minutes_and_seconds() {
+        let info = RunningTestInfo {
+            label: "verify-eng-1".into(),
+            started_unix_secs: 1_000,
+        };
+        assert_eq!(info.summary(1_125), "verify-eng-1 (running 2m05s)");
+        assert_eq!(info.summary(500), "verify-eng-1 (running 0m00s)");
+    }
+
+    #[test]
+    fn finished_result_wins_over_an_expired_timeout() {
+        let job = TestJob::spawn_with_timeout("done", Some(Duration::ZERO), |_| Ok(5));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(job.try_take().unwrap().unwrap(), 5);
     }
 
     #[cfg(unix)]

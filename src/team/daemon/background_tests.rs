@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use super::TeamDaemon;
 use crate::team::merge::{self, VerificationJob};
-use crate::team::test_job::TestJob;
+use crate::team::test_job::{RunningTestInfo, TestJob};
 use crate::team::test_results::TestRunOutput;
 
 #[derive(Default)]
@@ -58,6 +58,19 @@ impl BackgroundTests {
         self.main_smoke.is_some()
     }
 
+    /// Jobs currently running, for `batty status`.
+    pub(crate) fn running_tests(&self) -> Vec<RunningTestInfo> {
+        let mut running: Vec<RunningTestInfo> = self
+            .verification
+            .values()
+            .map(VerificationJob::running_info)
+            .collect();
+        running.extend(self.main_smoke.iter().map(|smoke| smoke.job.info()));
+        running.extend(self.chat_merges.iter().map(|merge| merge.job.info()));
+        running.sort_by(|a, b| a.label.cmp(&b.label));
+        running
+    }
+
     /// Verifications that must survive a restart: those in flight plus those
     /// still waiting to be re-run.
     pub(crate) fn pending_verifications(&self) -> HashMap<String, u32> {
@@ -70,9 +83,33 @@ impl BackgroundTests {
 }
 
 impl TeamDaemon {
+    /// Wall-clock limit for background test commands, from
+    /// `workflow_policy.verification.timeout_secs` (`None` when 0).
+    pub(crate) fn test_job_timeout(&self) -> Option<std::time::Duration> {
+        match self
+            .config
+            .team_config
+            .workflow_policy
+            .verification
+            .timeout_secs
+        {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
+
     /// Poll-loop step: re-run interrupted verifications and apply results of
     /// finished background test jobs.
     pub(crate) fn poll_background_tests(&mut self) -> Result<()> {
+        // Keep the default used by spawn sites we do not control (the merge
+        // queue) in step with the live config.
+        crate::team::test_job::set_default_timeout_secs(
+            self.config
+                .team_config
+                .workflow_policy
+                .verification
+                .timeout_secs,
+        );
         self.retrigger_pending_verifications();
         let result = merge::poll_verification_jobs(self);
         self.poll_chat_merge_jobs();

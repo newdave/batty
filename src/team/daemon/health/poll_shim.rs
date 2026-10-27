@@ -2194,6 +2194,53 @@ mod tests {
     }
 
     #[test]
+    fn id_less_completion_then_death_replays_every_unretired_message_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![
+                architect_member("architect"),
+                manager_member("manager", Some("architect")),
+            ])
+            .build();
+        let _child = insert_mock_handle(&mut daemon, "manager");
+        {
+            let handle = daemon.shim_handles.get_mut("manager").unwrap();
+            for (body, id) in [("first", "m1"), ("second", "m2")] {
+                handle
+                    .send_message_with_id("architect", body, Some(id.into()))
+                    .unwrap();
+            }
+        }
+
+        // The shim completed a turn but lost the id: nothing may be retired.
+        daemon
+            .handle_shim_event(
+                "manager",
+                Event::Completion {
+                    message_id: None,
+                    response: "done".into(),
+                    last_lines: String::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(daemon.shim_handles["manager"].in_flight_messages.len(), 2);
+
+        let mut previous = daemon.shim_handles.remove("manager").unwrap();
+        let requeued = daemon
+            .replay_or_requeue_pending_messages_after_respawn(
+                "manager",
+                &mut previous,
+                ShimDisconnectDisposition::RestartHandoff,
+            )
+            .unwrap();
+        assert!(requeued);
+        let queue = daemon.delivery.pending_queue.get("manager").unwrap();
+        let bodies: Vec<_> = queue.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["first", "second"]);
+        assert!(previous.in_flight_messages.is_empty());
+    }
+
+    #[test]
     fn supervisory_restart_handoff_requeues_inflight_message_and_marks_shutdown_reason() {
         let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();

@@ -373,6 +373,7 @@ fn daemon_state_round_trip_preserves_runtime_fields() {
             },
         )]),
         pending_verifications: HashMap::from([("eng-1".to_string(), 42)]),
+        running_tests: Vec::new(),
         merge_queue: Default::default(),
     };
 
@@ -5834,6 +5835,7 @@ fn save_daemon_state_returns_error_on_readonly_dir() {
             recently_rescued_tasks: HashMap::new(),
             recently_released_by: HashMap::new(),
             pending_verifications: HashMap::new(),
+            running_tests: Vec::new(),
             merge_queue: Default::default(),
         };
 

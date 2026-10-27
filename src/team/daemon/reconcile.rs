@@ -80,6 +80,10 @@ impl TeamDaemon {
             "adding new member to topology"
         );
 
+        // A member re-added while its old shim is still being reaped must
+        // not inherit (or lose) state to the pending removal.
+        self.cancel_pending_removal(&member.name);
+
         // Create inbox
         let inboxes = inbox::inboxes_root(&self.config.project_root);
         if let Err(e) = inbox::init_inbox(&inboxes, &member.name) {
@@ -231,6 +235,33 @@ impl TeamDaemon {
         self.finish_member_removal(name, is_working)
     }
 
+    /// Finish a pending removal of `name` against the old shim only: kill and
+    /// reap the old pid, drop the old handle and pane, and forget the pending
+    /// entry. Worktree and board state are kept for the re-added member.
+    fn cancel_pending_removal(&mut self, name: &str) {
+        let Some(pending) = self.deferred.pending_removals.remove(name) else {
+            return;
+        };
+        info!(
+            member = name,
+            pid = pending.pid,
+            "member re-added during pending removal — reaping old shim"
+        );
+        reap_old_shim(pending.pid);
+        if self
+            .shim_handles
+            .get(name)
+            .is_some_and(|handle| handle.child_pid == pending.pid)
+        {
+            self.shim_handles.remove(name);
+        }
+        if let Some(pane_id) = self.config.pane_map.remove(name) {
+            if let Err(error) = tmux::kill_pane(&pane_id) {
+                debug!(member = name, error = %error, "failed to kill old pane");
+            }
+        }
+    }
+
     /// Advance removals started by `remove_member`: finish once the shim has
     /// exited, or force-kill it when the shutdown timeout elapses.
     pub(super) fn process_pending_removals(&mut self) -> Result<()> {
@@ -262,6 +293,15 @@ impl TeamDaemon {
                 continue;
             }
             self.deferred.pending_removals.remove(&name);
+            // The name may now belong to a re-added member with a different
+            // shim; the old process is reaped, nothing else may be touched.
+            if self
+                .shim_handles
+                .get(&name)
+                .is_some_and(|handle| handle.child_pid != pending.pid)
+            {
+                continue;
+            }
             if let Err(error) = self.finish_member_removal(&name, pending.was_working) {
                 warn!(member = name.as_str(), error = %error, "failed to finish member removal");
             }
@@ -699,6 +739,18 @@ fn task_is_finished(status: &str) -> bool {
     matches!(status, "done" | "archived")
 }
 
+/// SIGKILL `pid` and wait (bounded) for it to be reaped.
+fn reap_old_shim(pid: u32) {
+    if reap_if_exited(pid) {
+        return;
+    }
+    kill_pid(pid, libc::SIGKILL);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !reap_if_exited(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -895,6 +947,78 @@ mod tests {
         assert!(!daemon.shim_handles.contains_key("eng-9"));
         // Already reaped by the daemon.
         let _ = child.try_wait();
+    }
+
+    #[test]
+    fn re_adding_member_cancels_pending_removal_without_touching_new_shim() {
+        use crate::shim::protocol::{Channel, socketpair};
+        use crate::team::daemon::agent_handle::AgentHandle;
+        use crate::team::daemon::deferred::PendingRemoval;
+        use std::time::Instant;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = make_test_daemon(tmp.path(), Vec::new());
+        let mk = |tmp: &std::path::Path, pid: u32| {
+            let (parent_sock, _child_sock) = socketpair().unwrap();
+            AgentHandle::new(
+                "eng-1".into(),
+                Channel::new(parent_sock),
+                pid,
+                "claude".into(),
+                "claude".into(),
+                tmp.to_path_buf(),
+            )
+        };
+        let mut old = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let old_pid = old.id();
+        daemon
+            .shim_handles
+            .insert("eng-1".into(), mk(tmp.path(), old_pid));
+        daemon.remove_member("eng-1").unwrap();
+        assert!(daemon.deferred.pending_removals.contains_key("eng-1"));
+
+        // Re-add: old shim reaped, pending entry dropped.
+        daemon.cancel_pending_removal("eng-1");
+        assert!(daemon.deferred.pending_removals.is_empty());
+        assert!(!daemon.shim_handles.contains_key("eng-1"));
+        assert!(
+            !crate::team::daemon::helpers::pid_alive(old_pid),
+            "old pid must be reaped"
+        );
+        let _ = old.try_wait();
+
+        // New instance is registered; a stale entry for the old pid expiring
+        // must not remove it.
+        let mut new = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let new_pid = new.id();
+        daemon
+            .shim_handles
+            .insert("eng-1".into(), mk(tmp.path(), new_pid));
+        daemon
+            .states
+            .insert("eng-1".into(), crate::team::standup::MemberState::Idle);
+        daemon.deferred.pending_removals.insert(
+            "eng-1".into(),
+            PendingRemoval {
+                pid: 0,
+                deadline: Instant::now(),
+                was_working: false,
+                killed: false,
+            },
+        );
+        daemon.process_pending_removals().unwrap();
+        assert!(daemon.deferred.pending_removals.is_empty());
+        assert!(daemon.shim_handles.contains_key("eng-1"));
+        assert!(daemon.states.contains_key("eng-1"));
+        assert!(crate::team::daemon::helpers::pid_alive(new_pid));
+        let _ = new.kill();
+        let _ = new.wait();
     }
 
     #[test]

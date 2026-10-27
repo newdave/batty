@@ -38,6 +38,10 @@ impl VerificationJob {
     pub(crate) fn kill(&self) {
         self.job.kill();
     }
+
+    pub(crate) fn running_info(&self) -> crate::team::test_job::RunningTestInfo {
+        self.job.info()
+    }
 }
 
 /// True when a verification for `task_id` is already running (a repeated
@@ -173,13 +177,17 @@ pub(super) fn start_verification_job(
         worktree = %worktree_dir.display(),
         "starting background completion verification"
     );
-    let job = TestJob::spawn(format!("verify-{engineer}"), move |child_pgid| {
-        run_automatic_verification_tracked(
-            &worktree_dir,
-            test_command.as_deref(),
-            Some(child_pgid.as_ref()),
-        )
-    });
+    let job = TestJob::spawn_with_timeout(
+        format!("verify-{engineer}"),
+        daemon.test_job_timeout(),
+        move |child_pgid| {
+            run_automatic_verification_tracked(
+                &worktree_dir,
+                test_command.as_deref(),
+                Some(child_pgid.as_ref()),
+            )
+        },
+    );
     daemon
         .verification
         .background_tests
@@ -248,6 +256,28 @@ pub(crate) fn poll_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+pub(crate) fn timed_out_verification_run(
+    timed_out: crate::team::test_job::TestTimedOut,
+) -> VerificationRunResult {
+    let message = format!("verification {timed_out}");
+    VerificationRunResult {
+        passed: false,
+        output: message.clone(),
+        results: crate::team::test_results::TestResults {
+            framework: "timeout".to_string(),
+            total: None,
+            passed: 0,
+            failed: 1,
+            ignored: 0,
+            failures: Vec::new(),
+            summary: Some(message.clone()),
+        },
+        failures: vec![message],
+        file_paths: Vec::new(),
+        recovery: None,
+    }
+}
+
 fn apply_verification_result(
     daemon: &mut TeamDaemon,
     engineer: &str,
@@ -286,6 +316,15 @@ fn apply_verification_result(
         return handle_engineer_completion(daemon, engineer);
     }
 
+    // A job past `verification.timeout_secs` is a failed verification, not a
+    // daemon error: the engineer is told and the retry loop continues.
+    let result = match result {
+        Err(error) => match error.downcast_ref::<crate::team::test_job::TestTimedOut>() {
+            Some(timed_out) => Ok(timed_out_verification_run(*timed_out)),
+            None => Err(error),
+        },
+        ok => ok,
+    };
     let verification_run = result.with_context(|| {
         format!(
             "automatic verification failed while running tests in {}",

@@ -1265,6 +1265,16 @@ impl TeamEvent {
             ..Self::base("agent_removed")
         }
     }
+
+    /// Emitted when a legacy queued command is dropped after exhausting its
+    /// retry budget.
+    pub fn command_dropped(role: &str, reason: &str) -> Self {
+        Self {
+            role: Some(role.into()),
+            reason: Some(reason.into()),
+            ..Self::base("command_dropped")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -258,13 +258,34 @@ impl AgentHandle {
         }
     }
 
-    /// A turn completed. Remove the message it reports, or the oldest
-    /// outstanding one when the completion carries no (known) id.
+    /// A turn completed. A completion with a `message_id` retires exactly that
+    /// entry; an unknown id retires nothing. A completion without an id can
+    /// only belong to a message sent without one (the shim echoes the id of
+    /// every id-carrying message), so it retires the oldest id-less entry and
+    /// never an id-carrying one: guessing would drop the wrong message from
+    /// replay.
     pub fn complete_in_flight_message(&mut self, id: Option<&str>) {
-        if id.is_some_and(|id| self.remove_in_flight_message(id)) {
-            return;
+        let retired = match id {
+            Some(id) => self.remove_in_flight_message(id),
+            None => match self
+                .in_flight_messages
+                .iter()
+                .position(|m| m.message_id.is_none())
+            {
+                Some(index) => {
+                    self.in_flight_messages.remove(index);
+                    true
+                }
+                None => false,
+            },
+        };
+        if !retired {
+            tracing::debug!(
+                member = self.id.as_str(),
+                message_id = ?id,
+                "completion matched no in-flight message; none retired"
+            );
         }
-        self.in_flight_messages.pop_front();
     }
 
     #[cfg(test)]
@@ -578,9 +599,33 @@ mod tests {
         assert!(!handle.has_in_flight_message("m2"));
         assert!(handle.remove_in_flight_message("m3"));
         assert!(!handle.remove_in_flight_message("m3"));
-        // Unknown / absent id retires the oldest.
+        // An absent id never retires an id-carrying entry.
         handle.complete_in_flight_message(None);
+        assert!(handle.has_in_flight_message("m1"));
+        handle.complete_in_flight_message(Some("m1"));
         assert!(handle.in_flight_messages.is_empty());
+        handle
+            .send_message_with_id("manager", "keep", Some("m4".into()))
+            .unwrap();
+        handle.complete_in_flight_message(None);
+        handle.complete_in_flight_message(Some("unknown"));
+        assert!(handle.has_in_flight_message("m4"));
+    }
+
+    #[test]
+    fn id_less_completion_retires_only_id_less_entries() {
+        let (mut handle, _child) = make_test_handle();
+        handle.send_message("manager", "plain").unwrap();
+        handle
+            .send_message_with_id("manager", "tracked", Some("m1".into()))
+            .unwrap();
+        handle.complete_in_flight_message(None);
+        let left: Vec<_> = handle
+            .in_flight_messages
+            .iter()
+            .map(|m| m.message_id.clone())
+            .collect();
+        assert_eq!(left, [Some("m1".to_string())]);
     }
 
     #[test]

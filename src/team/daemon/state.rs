@@ -124,6 +124,9 @@ pub(super) struct PersistedDaemonState {
     /// queued to re-run when the daemon stopped; re-run after restart.
     #[serde(default)]
     pub pending_verifications: HashMap<String, u32>,
+    /// Background test jobs running at save time, shown by `batty status`.
+    #[serde(default)]
+    pub running_tests: Vec<crate::team::test_job::RunningTestInfo>,
     /// Queued merges and the merge awaiting post-merge verification, so a
     /// crash or restart neither drops queued work nor leaves an unverified
     /// merge on trunk.
@@ -308,6 +311,7 @@ impl TeamDaemon {
                 })
                 .collect(),
             pending_verifications: self.verification.background_tests.pending_verifications(),
+            running_tests: self.verification.background_tests.running_tests(),
             merge_queue: self.merge.queue.snapshot(),
         };
         save_daemon_state(&self.config.project_root, &state)

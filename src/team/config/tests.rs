@@ -1466,6 +1466,17 @@ roles:
 }
 
 #[test]
+fn verification_timeout_defaults_to_an_hour_and_is_configurable() {
+    let base =
+        "name: t\nroles:\n  - name: architect\n    role_type: architect\n    agent: claude\n";
+    let config: TeamConfig = serde_yaml::from_str(base).unwrap();
+    assert_eq!(config.workflow_policy.verification.timeout_secs, 3600);
+    let yaml = format!("{base}workflow_policy:\n  verification:\n    timeout_secs: 90\n");
+    let config: TeamConfig = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(config.workflow_policy.verification.timeout_secs, 90);
+}
+
+#[test]
 fn parse_verification_policy_fields_from_yaml() {
     let yaml = r#"
 name: test-team

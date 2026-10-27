@@ -523,6 +523,11 @@ pub struct VerificationPolicy {
     pub require_evidence: bool,
     #[serde(default)]
     pub test_command: Option<String>,
+    /// Wall-clock limit for one background verification/test command. The
+    /// command's process group is killed and the run counts as failed once
+    /// it is exceeded. `0` disables the limit.
+    #[serde(default = "default_verification_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 impl Default for VerificationPolicy {
@@ -532,8 +537,13 @@ impl Default for VerificationPolicy {
             auto_run_tests: default_verification_auto_run_tests(),
             require_evidence: default_verification_require_evidence(),
             test_command: None,
+            timeout_secs: default_verification_timeout_secs(),
         }
     }
+}
+
+fn default_verification_timeout_secs() -> u64 {
+    3600
 }
 
 fn default_graceful_shutdown_timeout_secs() -> u64 {

@@ -257,8 +257,9 @@ impl TeamDaemon {
             .workflow_policy
             .test_command
             .clone());
-        let job = crate::team::test_job::TestJob::spawn(
+        let job = crate::team::test_job::TestJob::spawn_with_timeout(
             format!("chat-merge-{task_id}"),
+            self.test_job_timeout(),
             move |child_pgid| {
                 crate::team::task_loop::run_tests_in_worktree_tracked(
                     &worktree_dir,

@@ -1196,45 +1196,58 @@ impl TeamDaemon {
         let queue_path = legacy_command_queue::command_queue_path(&self.config.project_root);
         let root = inbox::inboxes_root(&self.config.project_root);
         let tiered = self.config.team_config.workflow_policy.tiered_inboxes;
-        legacy_command_queue::drain_with(&queue_path, |cmd| match cmd {
-            legacy_command_queue::QueuedCommand::Send {
-                from,
-                to,
-                message: msg,
-            } => {
-                let is_user = self
-                    .config
-                    .team_config
-                    .roles
-                    .iter()
-                    .any(|role| role.name == to.as_str() && role.role_type == RoleType::User);
+        let dropped =
+            legacy_command_queue::drain_with(&queue_path, |cmd| match cmd {
+                legacy_command_queue::QueuedCommand::Send {
+                    from,
+                    to,
+                    message: msg,
+                    ..
+                } => {
+                    let is_user =
+                        self.config.team_config.roles.iter().any(|role| {
+                            role.name == to.as_str() && role.role_type == RoleType::User
+                        });
 
-                if is_user {
-                    // A user role without a live channel cannot be reached
-                    // now; fail so the command stays queued for a retry.
-                    if !self.delivery.channels.contains_key(to.as_str()) {
-                        anyhow::bail!("no channel available for user role '{to}'");
+                    if is_user {
+                        // A user role without a live channel cannot be reached
+                        // now; fail so the command stays queued for a retry.
+                        if !self.delivery.channels.contains_key(to.as_str()) {
+                            anyhow::bail!("no channel available for user role '{to}'");
+                        }
+                        let formatted = format!("[From {from}]\n{msg}");
+                        self.deliver_channel_message(from, to, &formatted)?;
+                    } else {
+                        let inbox_msg = inbox::InboxMessage::new_send(from, to, msg);
+                        crate::team::inbox_tiered::deliver_flag_aware(&root, &inbox_msg, tiered)?;
+                        debug!(from, to, "legacy command routed to inbox");
                     }
-                    let formatted = format!("[From {from}]\n{msg}");
-                    self.deliver_channel_message(from, to, &formatted)?;
-                } else {
-                    let inbox_msg = inbox::InboxMessage::new_send(from, to, msg);
-                    crate::team::inbox_tiered::deliver_flag_aware(&root, &inbox_msg, tiered)?;
-                    debug!(from, to, "legacy command routed to inbox");
+                    Ok(())
                 }
-                Ok(())
-            }
-            legacy_command_queue::QueuedCommand::Assign {
-                from,
-                engineer,
-                task,
-            } => {
-                let msg = inbox::InboxMessage::new_assign(from, engineer, task);
-                crate::team::inbox_tiered::deliver_flag_aware(&root, &msg, tiered)?;
-                debug!(engineer, "legacy assign routed to inbox");
-                Ok(())
-            }
-        })
+                legacy_command_queue::QueuedCommand::Assign {
+                    from,
+                    engineer,
+                    task,
+                    ..
+                } => {
+                    let msg = inbox::InboxMessage::new_assign(from, engineer, task);
+                    crate::team::inbox_tiered::deliver_flag_aware(&root, &msg, tiered)?;
+                    debug!(engineer, "legacy assign routed to inbox");
+                    Ok(())
+                }
+            })?;
+        for dropped in dropped {
+            self.emit_event(TeamEvent::command_dropped(
+                dropped.command.recipient(),
+                &dropped.reason,
+            ));
+            self.record_orchestrator_action(format!(
+                "delivery: dropped legacy command for {}: {}",
+                dropped.command.recipient(),
+                dropped.reason
+            ));
+        }
+        Ok(())
     }
 
     pub(in crate::team) fn deliver_inbox_messages(&mut self) -> Result<()> {
@@ -2038,6 +2051,8 @@ mod tests {
                 from: "architect".into(),
                 to: "human".into(),
                 message: "status".into(),
+                attempts: 0,
+                first_failed_at: None,
             },
         )
         .unwrap();
@@ -2047,6 +2062,8 @@ mod tests {
                 from: "manager".into(),
                 engineer: "eng-1".into(),
                 task: "Task #7: recover".into(),
+                attempts: 0,
+                first_failed_at: None,
             },
         )
         .unwrap();
@@ -2092,6 +2109,8 @@ mod tests {
                 from: "architect".into(),
                 to: "human".into(),
                 message: "status".into(),
+                attempts: 0,
+                first_failed_at: None,
             },
         )
         .unwrap();
@@ -2108,6 +2127,46 @@ mod tests {
 
         let remaining = message::read_command_queue(&queue_path).unwrap();
         assert_eq!(remaining.len(), 1, "undeliverable command must be retained");
+    }
+
+    #[test]
+    fn drain_legacy_command_queue_drops_send_to_unreachable_role_at_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue_path = message::command_queue_path(tmp.path());
+        message::enqueue_command(
+            &queue_path,
+            &message::QueuedCommand::Send {
+                from: "architect".into(),
+                to: "human".into(),
+                message: "status".into(),
+                attempts: message::MAX_COMMAND_ATTEMPTS - 1,
+                first_failed_at: Some(1),
+            },
+        )
+        .unwrap();
+
+        let mut daemon = empty_legacy_daemon(&tmp);
+        daemon.config.team_config.roles = vec![RoleDef {
+            channel: Some("telegram".to_string()),
+            channel_config: Some(test_channel_config("123", "fake")),
+            ..RoleDef::test("human", RoleType::User)
+        }];
+        daemon.delivery.channels = HashMap::new();
+
+        daemon.drain_legacy_command_queue().unwrap();
+
+        assert!(
+            message::read_command_queue(&queue_path).unwrap().is_empty(),
+            "command past its retry budget must be dropped"
+        );
+        let events = crate::team::events::read_events(&tmp.path().join("events.jsonl")).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "command_dropped"
+                    && event.role.as_deref() == Some("human")),
+            "{events:?}"
+        );
     }
 
     #[test]

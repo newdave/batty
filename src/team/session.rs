@@ -476,6 +476,10 @@ pub fn team_status(project_root: &Path, json: bool, detail: bool, health: bool) 
                 status::format_main_smoke_summary(main_smoke)
             );
         }
+        let running_tests = status::load_running_test_summaries(project_root);
+        if !running_tests.is_empty() {
+            println!("Background tests: {}", running_tests.join(", "));
+        }
         if let Some(handoff) = publish_handoff.as_ref() {
             println!(
                 "Publish handoff: {}",

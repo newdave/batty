@@ -658,6 +658,39 @@ fn slow_verification_does_not_block_and_is_applied_on_a_later_poll() {
 }
 
 #[test]
+fn verification_past_its_timeout_is_killed_and_recorded_as_failed() {
+    let (_tmp, repo, mut daemon) = setup_background_verification("sleep 30; exit 0");
+    daemon
+        .config
+        .team_config
+        .workflow_policy
+        .verification
+        .timeout_secs = 1;
+
+    let started = std::time::Instant::now();
+    handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+    wait_for_verification_jobs(&mut daemon).unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "the 30s command must have been killed"
+    );
+    let state = daemon.verification.engineers.get("eng-1").unwrap();
+    assert!(!state.last_test_passed);
+    assert!(
+        state
+            .last_test_output
+            .as_deref()
+            .is_some_and(|output| output.contains("timed out after 1s")),
+        "{:?}",
+        state.last_test_output
+    );
+    let snapshot =
+        std::fs::read_to_string(verification_snapshot_path(&repo, 42, "eng-1", 1)).unwrap();
+    assert!(snapshot.contains("timed out after 1s"));
+}
+
+#[test]
 fn repeated_completion_while_verifying_does_not_start_a_second_job() {
     let counter_dir = tempfile::tempdir().unwrap();
     let counter = counter_dir.path().join("runs");
