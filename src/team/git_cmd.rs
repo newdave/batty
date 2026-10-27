@@ -42,14 +42,16 @@ impl From<crate::git::GitError> for GitError {
             crate::git::GitError::Failed { stderr, .. } => classify_error(&stderr),
             crate::git::GitError::Spawn { command, source }
             | crate::git::GitError::Wait { command, source } => GitError::Exec { command, source },
+            // A timeout is permanent: the runner already waited the whole
+            // budget and killed the group, so retrying would block the
+            // caller for minutes repeating the same hang.
             crate::git::GitError::Timeout {
-                command, timeout, ..
-            } => GitError::Exec {
                 command,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("git timed out after {}s", timeout.as_secs()),
-                ),
+                timeout,
+                stderr,
+            } => GitError::Permanent {
+                message: format!("`{command}` timed out after {}s", timeout.as_secs()),
+                stderr,
             },
         }
     }
@@ -294,6 +296,31 @@ mod tests {
     use super::*;
     use crate::team::test_support::git_ok;
     use tempfile::TempDir;
+
+    #[test]
+    fn runner_timeout_maps_to_permanent_and_is_not_retried() {
+        use crate::team::retry::{RetryConfig, retry_sync};
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        let calls = Cell::new(0u32);
+        let result: Result<(), GitError> = retry_sync(&RetryConfig::default(), || {
+            calls.set(calls.get() + 1);
+            Err(crate::git::GitError::Timeout {
+                command: "git -C /r status".to_string(),
+                timeout: Duration::from_secs(120),
+                // Even stderr that looks like lock contention must not retry.
+                stderr: "index.lock timeout".to_string(),
+            }
+            .into())
+        });
+        let error = result.unwrap_err();
+        assert!(matches!(error, GitError::Permanent { .. }), "{error:?}");
+        assert!(!error.is_transient());
+        assert_eq!(calls.get(), 1);
+        assert!(error.to_string().contains("timed out after 120s"));
+    }
+
     fn init_repo() -> TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Default timeout for local read/plumbing git commands.
 /// Override with `BATTY_GIT_TIMEOUT_SECS`.
@@ -57,7 +57,71 @@ const LONG_RUNNING_SUBCOMMANDS: &[&str] = &[
     "checkout",
     "switch",
     "worktree",
+    // walk or rewrite the index/working tree; legitimately slow on big repos
+    "reset",
+    "stash",
+    "add",
+    "status",
+    "clean",
+    "diff",
+    "merge-tree",
 ];
+
+/// Subcommands that may run hooks, signing programs or credential helpers
+/// that need the user's terminal when batty itself runs on one.
+const INTERACTIVE_SUBCOMMANDS: &[&str] = &["commit", "merge", "rebase", "tag", "push"];
+
+/// How long a timed-out command gets to exit after SIGTERM before SIGKILL.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// The git subcommand in `args`, skipping global options such as
+/// `-c key=value` and `-C dir`.
+fn subcommand_of(args: &[OsString]) -> Option<String> {
+    let mut skip_next = false;
+    for arg in args {
+        let arg = arg.to_string_lossy();
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "-c" || arg == "-C" {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return Some(arg.into_owned());
+    }
+    None
+}
+
+/// Whether `subcommand` gets the long timeout class. Read-only plumbing
+/// (`rev-parse`, `rev-list`, `for-each-ref`, `config`, ...) stays short.
+fn is_long_running(subcommand: Option<&str>) -> bool {
+    subcommand.is_some_and(|sub| LONG_RUNNING_SUBCOMMANDS.contains(&sub))
+}
+
+/// Whether the child gets its own process group. It does, except when batty
+/// runs on a terminal and the command may need that terminal (hooks reading
+/// `/dev/tty`, signing prompts): a separate background group would get
+/// SIGTTIN on `/dev/tty` reads and would not receive the terminal's Ctrl-C.
+/// The daemon has no TTY, so it always gets a group.
+fn use_own_process_group(is_tty: bool, subcommand: Option<&str>) -> bool {
+    !(is_tty && subcommand.is_some_and(|sub| INTERACTIVE_SUBCOMMANDS.contains(&sub)))
+}
+
+fn stdin_is_tty() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: isatty has no memory-safety preconditions.
+        unsafe { libc::isatty(0) == 1 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
 
 fn timeout_from_env(var: &str, default: Duration) -> Duration {
     std::env::var(var)
@@ -218,6 +282,9 @@ pub struct GitCommand {
     envs: Vec<(OsString, Option<OsString>)>,
     timeout: Option<Duration>,
     allow_fail: bool,
+    /// Internal: skip stale `index.lock` cleanup after a timeout (set for the
+    /// cleanup's own `rev-parse`, which must not recurse).
+    skip_lock_cleanup: bool,
 }
 
 impl GitCommand {
@@ -228,6 +295,7 @@ impl GitCommand {
             envs: Vec::new(),
             timeout: None,
             allow_fail: false,
+            skip_lock_cleanup: false,
         }
     }
 
@@ -296,37 +364,19 @@ impl GitCommand {
         if let Some(timeout) = self.timeout {
             return timeout;
         }
-        let subcommand = self
-            .args
-            .iter()
-            .map(|arg| arg.to_string_lossy())
-            .scan(false, |skip_next, arg| {
-                // Skip global options such as `-c key=value` before the
-                // subcommand.
-                if *skip_next {
-                    *skip_next = false;
-                    return Some(None);
-                }
-                if arg == "-c" || arg == "-C" {
-                    *skip_next = true;
-                    return Some(None);
-                }
-                if arg.starts_with('-') {
-                    return Some(None);
-                }
-                Some(Some(arg.into_owned()))
-            })
-            .flatten()
-            .next();
-        match subcommand {
-            Some(sub) if LONG_RUNNING_SUBCOMMANDS.contains(&sub.as_str()) => {
-                timeout_from_env("BATTY_GIT_LONG_TIMEOUT_SECS", LONG_TIMEOUT)
-            }
-            _ => timeout_from_env("BATTY_GIT_TIMEOUT_SECS", DEFAULT_TIMEOUT),
+        if is_long_running(subcommand_of(&self.args).as_deref()) {
+            timeout_from_env("BATTY_GIT_LONG_TIMEOUT_SECS", LONG_TIMEOUT)
+        } else {
+            timeout_from_env("BATTY_GIT_TIMEOUT_SECS", DEFAULT_TIMEOUT)
         }
     }
 
-    fn build(&self) -> Command {
+    /// Whether this command runs in its own process group.
+    fn own_process_group(&self) -> bool {
+        use_own_process_group(stdin_is_tty(), subcommand_of(&self.args).as_deref())
+    }
+
+    fn build(&self, grouped: bool) -> Command {
         let mut command = Command::new(program());
         if let Some(repo) = &self.repo {
             command.arg("-C").arg(repo);
@@ -348,10 +398,12 @@ impl GitCommand {
             };
         }
         #[cfg(unix)]
-        {
+        if grouped {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        #[cfg(not(unix))]
+        let _ = grouped;
 
         command
     }
@@ -360,13 +412,16 @@ impl GitCommand {
     pub fn run(self) -> Result<GitOutput, GitError> {
         let display = self.display();
         let timeout = self.effective_timeout();
+        let grouped = self.own_process_group();
 
-        let mut command = self.build();
+        let mut command = self.build(grouped);
 
+        let spawned_at = SystemTime::now();
         let mut child = command.spawn().map_err(|source| GitError::Spawn {
             command: display.clone(),
             source,
         })?;
+        let pid = child.id();
 
         let (tx, rx) = mpsc::channel::<(Stream, std::io::Result<Vec<u8>>)>();
         let mut pending = 0;
@@ -384,7 +439,12 @@ impl GitCommand {
         let status = match wait_until(&mut child, deadline) {
             Ok(Some(status)) => status,
             Ok(None) => {
-                kill_group(&mut child);
+                terminate_child(&mut child, grouped, KILL_GRACE);
+                if !self.skip_lock_cleanup
+                    && let Some(repo) = &self.repo
+                {
+                    remove_stale_index_lock(repo, spawned_at, grouped.then_some(pid));
+                }
                 let streams = collect(&rx, pending, Instant::now() + DRAIN_GRACE);
                 return Err(GitError::Timeout {
                     command: display,
@@ -393,7 +453,7 @@ impl GitCommand {
                 });
             }
             Err(source) => {
-                kill_group(&mut child);
+                kill_group(&mut child, grouped);
                 return Err(GitError::Wait {
                     command: display,
                     source,
@@ -408,7 +468,7 @@ impl GitCommand {
         // reused) and give the readers one more grace period.
         let mut streams = collect(&rx, pending, Instant::now() + DRAIN_GRACE);
         if streams.pending > 0 {
-            kill_group_by_pid(child.id());
+            kill_group_by_pid(child.id(), grouped);
             let late = collect(&rx, streams.pending, Instant::now() + DRAIN_GRACE);
             if late.pending > 0 {
                 return Err(GitError::Timeout {
@@ -542,30 +602,128 @@ fn wait_until(child: &mut Child, deadline: Instant) -> std::io::Result<Option<Ex
     }
 }
 
-/// Kill the child's whole process group and reap the child.
-fn kill_group(child: &mut Child) {
-    kill_group_by_pid(child.id());
+/// Signal the child's process group (`grouped`) or just the child.
+#[cfg(unix)]
+fn signal_child(pid: u32, grouped: bool, signal: libc::c_int) {
+    let Ok(id) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // Never signal pid/group 0 (our own group) or negative ids.
+    if id <= 0 {
+        return;
+    }
+    // SAFETY: kill/killpg have no memory-safety preconditions.
+    unsafe {
+        if grouped {
+            // The child was spawned with `process_group(0)`, so its pid is
+            // the process-group id.
+            libc::killpg(id, signal);
+        } else {
+            libc::kill(id, signal);
+        }
+    }
+}
+
+/// Whether any process is still alive in group `pgid`.
+#[cfg(unix)]
+fn group_alive(pgid: u32) -> bool {
+    let Ok(id) = libc::pid_t::try_from(pgid) else {
+        return false;
+    };
+    if id <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks for existence.
+    let rc = unsafe { libc::killpg(id, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Stop a timed-out child: SIGTERM first so git can release `index.lock`
+/// and clean up, then SIGKILL for whatever is still alive after `grace`.
+/// Reaps the child; returns once the group (if any) is gone.
+fn terminate_child(child: &mut Child, grouped: bool, grace: Duration) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        signal_child(pid, grouped, libc::SIGTERM);
+        let deadline = Instant::now() + grace;
+        loop {
+            let exited = child.try_wait().ok().flatten().is_some();
+            if exited && (!grouped || !group_alive(pid)) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        signal_child(pid, grouped, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (grouped, grace);
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
 
-fn kill_group_by_pid(pid: u32) {
+/// Kill the child (and its whole process group when `grouped`) immediately
+/// and reap it.
+fn kill_group(child: &mut Child, grouped: bool) {
+    kill_group_by_pid(child.id(), grouped);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// SIGKILL the group led by `pid`. A no-op when the child shares our group:
+/// there is no group of its own to kill, and the pid may already be reaped.
+fn kill_group_by_pid(pid: u32, grouped: bool) {
     #[cfg(unix)]
-    {
-        // The child was spawned with `process_group(0)`, so its pid is the
-        // process-group id. Never signal group 0 (our own group).
-        if let Ok(pgid) = libc::pid_t::try_from(pid)
-            && pgid > 0
-        {
-            // SAFETY: killpg has no memory-safety preconditions.
-            unsafe {
-                libc::killpg(pgid, libc::SIGKILL);
-            }
-        }
+    if grouped {
+        signal_child(pid, true, libc::SIGKILL);
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
+        let _ = (pid, grouped);
+    }
+}
+
+/// After a killed command, remove `index.lock` if it is a leftover of that
+/// command: modified at or after `spawned_at`, with no process left in the
+/// command's group (`pgid`, when it ran in its own group). A lock that
+/// predates the command, or one a live process in the group may still own, is
+/// left alone. Returns whether a lock was removed.
+fn remove_stale_index_lock(repo: &Path, spawned_at: SystemTime, pgid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    if pgid.is_some_and(group_alive) {
+        return false;
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+    let mut probe = cmd(repo).args(["rev-parse", "--git-path", "index.lock"]);
+    probe.skip_lock_cleanup = true;
+    let Ok(raw) = probe.timeout(Duration::from_secs(10)).stdout() else {
+        return false;
+    };
+    if raw.is_empty() {
+        return false;
+    }
+    let lock = repo.join(raw);
+    let Ok(modified) = std::fs::metadata(&lock).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    if modified < spawned_at {
+        return false;
+    }
+    match std::fs::remove_file(&lock) {
+        Ok(()) => {
+            tracing::warn!(
+                lock = %lock.display(),
+                "removed stale index.lock left by a killed git command"
+            );
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -709,7 +867,7 @@ mod tests {
 
     #[test]
     fn env_hygiene_removes_ambient_repo_vars_and_disables_prompts() {
-        let command = cmd("/repo").arg("status").build();
+        let command = cmd("/repo").arg("status").build(true);
         let envs: Vec<(String, Option<String>)> = command
             .get_envs()
             .map(|(k, v)| {
@@ -767,7 +925,11 @@ mod tests {
             LONG_TIMEOUT
         );
         assert_eq!(cmd(".").arg("commit").effective_timeout(), LONG_TIMEOUT);
-        assert_eq!(cmd(".").arg("status").effective_timeout(), DEFAULT_TIMEOUT);
+        assert_eq!(cmd(".").arg("status").effective_timeout(), LONG_TIMEOUT);
+        assert_eq!(
+            cmd(".").arg("rev-parse").effective_timeout(),
+            DEFAULT_TIMEOUT
+        );
         assert_eq!(
             cmd(".")
                 .arg("fetch")
@@ -775,6 +937,183 @@ mod tests {
                 .effective_timeout(),
             Duration::from_secs(1)
         );
+    }
+
+    fn args_of(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn command_class_mapping() {
+        for sub in [
+            "reset",
+            "stash",
+            "add",
+            "status",
+            "clean",
+            "checkout",
+            "diff",
+            "merge-tree",
+            "fetch",
+            "commit",
+        ] {
+            assert!(is_long_running(Some(sub)), "{sub} should be long");
+        }
+        for sub in [
+            "rev-parse",
+            "rev-list",
+            "for-each-ref",
+            "config",
+            "show-ref",
+        ] {
+            assert!(!is_long_running(Some(sub)), "{sub} should be short");
+        }
+        assert!(!is_long_running(None));
+        // Global options before the subcommand are skipped.
+        let args = args_of(&["-c", "core.x=1", "--no-pager", "reset", "--hard"]);
+        assert_eq!(subcommand_of(&args).as_deref(), Some("reset"));
+        assert_eq!(subcommand_of(&[]), None);
+    }
+
+    #[test]
+    fn effective_timeout_uses_long_class_for_reset_and_short_for_rev_parse() {
+        assert_eq!(
+            cmd("/r").args(["reset", "--hard"]).effective_timeout(),
+            LONG_TIMEOUT
+        );
+        assert_eq!(
+            cmd("/r").args(["rev-parse", "HEAD"]).effective_timeout(),
+            DEFAULT_TIMEOUT
+        );
+        assert_eq!(
+            cmd("/r")
+                .args(["reset", "--hard"])
+                .timeout(Duration::from_secs(7))
+                .effective_timeout(),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn process_group_decision_depends_on_tty_and_subcommand() {
+        for sub in ["commit", "merge", "rebase", "tag", "push"] {
+            assert!(!use_own_process_group(true, Some(sub)), "{sub} on a tty");
+            assert!(use_own_process_group(false, Some(sub)), "{sub} headless");
+        }
+        for sub in ["status", "rev-parse", "reset", "fetch"] {
+            assert!(use_own_process_group(true, Some(sub)), "{sub} on a tty");
+            assert!(use_own_process_group(false, Some(sub)), "{sub} headless");
+        }
+        assert!(use_own_process_group(true, None));
+        assert!(use_own_process_group(false, None));
+    }
+
+    #[cfg(unix)]
+    fn spawn_grouped(script: &str) -> Child {
+        use std::os::unix::process::CommandExt;
+        Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_child_sigterm_is_enough_for_a_cooperative_process() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = spawn_grouped("sleep 30");
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        terminate_child(&mut child, true, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_child_escalates_to_sigkill_after_the_grace_period() {
+        use std::os::unix::process::ExitStatusExt;
+        // Ignores SIGTERM (the ignore is inherited by `sleep`).
+        let mut child = spawn_grouped("trap '' TERM; while :; do sleep 1; done");
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(300));
+        let grace = Duration::from_millis(600);
+        let started = Instant::now();
+        terminate_child(&mut child, true, grace);
+        assert!(
+            started.elapsed() >= grace,
+            "SIGKILL must wait out the grace period"
+        );
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(!group_alive(pid), "whole group must be gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_index_lock_from_killed_command_is_removed() {
+        let tmp = init_repo();
+        let lock = tmp.path().join(".git/index.lock");
+        let spawned_at = SystemTime::now() - Duration::from_secs(5);
+        std::fs::write(&lock, "").unwrap();
+        // pgid of an already-dead group.
+        let mut dead = spawn_grouped("true");
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        assert!(remove_stale_index_lock(
+            tmp.path(),
+            spawned_at,
+            Some(dead_pid)
+        ));
+        assert!(!lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_lock_owned_by_a_live_process_or_older_than_the_command_is_kept() {
+        let tmp = init_repo();
+        let lock = tmp.path().join(".git/index.lock");
+        std::fs::write(&lock, "").unwrap();
+
+        // A live process remains in the group: do not touch the lock.
+        let mut live = spawn_grouped("sleep 30");
+        assert!(!remove_stale_index_lock(
+            tmp.path(),
+            SystemTime::now() - Duration::from_secs(5),
+            Some(live.id())
+        ));
+        assert!(lock.exists());
+        signal_child(live.id(), true, libc::SIGKILL);
+        live.wait().unwrap();
+
+        // The lock predates the command: it is someone else's.
+        assert!(!remove_stale_index_lock(
+            tmp.path(),
+            SystemTime::now() + Duration::from_secs(60),
+            None
+        ));
+        assert!(lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_removes_index_lock_created_by_the_killed_command() {
+        let tmp = init_repo();
+        let lock = tmp.path().join(".git/index.lock");
+        // The aliased "git" creates the lock then hangs, like a killed `add`.
+        let script = format!("!f() {{ touch '{}'; sleep 30; }}; f", lock.display());
+        let error = cmd(tmp.path())
+            .args(["-c", &format!("alias.hang={script}"), "hang"])
+            .timeout(Duration::from_millis(500))
+            .run()
+            .unwrap_err();
+        assert!(matches!(error, GitError::Timeout { .. }), "{error:?}");
+        assert!(!lock.exists(), "stale index.lock left behind after kill");
     }
 
     #[test]

@@ -313,20 +313,84 @@ pub(crate) fn archive_branch_if_commits_ahead(
 /// of trunk (labelled `detached_label`).
 fn archive_checked_out_work(
     worktree_path: &Path,
-    current_branch: Option<&str>,
-    trunk_branch: &str,
     subsystem: &str,
+    trunk_branch: &str,
     detached_label: &str,
 ) -> Result<Option<String>> {
-    match current_branch {
-        Some(branch) => {
-            archive_branch_if_commits_ahead(worktree_path, branch, trunk_branch, subsystem)
+    archive_checked_out_work_except(worktree_path, subsystem, trunk_branch, detached_label, None)
+}
+
+/// [`archive_checked_out_work`], leaving any repo that is on `skip_branch`
+/// alone (the caller archives that branch itself).
+fn archive_checked_out_work_except(
+    worktree_path: &Path,
+    subsystem: &str,
+    trunk_branch: &str,
+    detached_label: &str,
+    skip_branch: Option<&str>,
+) -> Result<Option<String>> {
+    let mut first = None;
+    for repo in repos_for_mutation(worktree_path) {
+        let trunk = effective_trunk_branch_for_repo(&repo, trunk_branch);
+        let branch = git_current_branch(&repo).ok();
+        if skip_branch.is_some() && branch.as_deref() == skip_branch {
+            continue;
         }
-        None if ahead_count(worktree_path, trunk_branch, "HEAD")? > 0 => {
-            Ok(Some(archive_branch(worktree_path, "HEAD", detached_label)?))
+        let trunk_present = commit_resolves(&repo, &trunk)?;
+        let archive = match (branch.as_deref(), trunk_present) {
+            (Some(branch), true) => {
+                archive_branch_if_commits_ahead(&repo, branch, &trunk, subsystem)?
+            }
+            (Some(branch), false) => {
+                if ref_exists(&repo, &format!("refs/heads/{branch}"))? {
+                    let archive = archive_branch(&repo, branch, branch)?;
+                    warn!(
+                        subsystem,
+                        repo = %repo.display(),
+                        branch,
+                        trunk = %trunk,
+                        archive = %archive,
+                        "trunk ref missing; archived checked-out branch unconditionally"
+                    );
+                    Some(archive)
+                } else {
+                    None
+                }
+            }
+            (None, true) if ahead_count(&repo, &trunk, "HEAD")? > 0 => {
+                Some(archive_branch(&repo, "HEAD", detached_label)?)
+            }
+            (None, true) => None,
+            (None, false) if commit_resolves(&repo, "HEAD")? => {
+                let archive = archive_branch(&repo, "HEAD", detached_label)?;
+                warn!(
+                    subsystem,
+                    repo = %repo.display(),
+                    trunk = %trunk,
+                    archive = %archive,
+                    "trunk ref missing; archived detached HEAD unconditionally"
+                );
+                Some(archive)
+            }
+            (None, false) => None,
+        };
+        if first.is_none() {
+            first = archive;
         }
-        None => Ok(None),
     }
+    Ok(first)
+}
+
+/// Whether `rev` resolves to a commit in `repo`.
+fn commit_resolves(repo: &Path, rev: &str) -> Result<bool> {
+    Ok(crate::git::cmd(repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .succeeds()?)
 }
 
 pub(crate) fn log_mutation_audit(
@@ -759,15 +823,15 @@ pub(crate) fn reset_to_base(
         match current_branch.as_deref() {
             // The base branch itself is archived below.
             Some(branch) if branch == base_branch => {}
-            current => {
+            _ => {
                 // The current branch ref survives `checkout -B base`, but
                 // archive anyway so a later cleanup of it cannot drop work.
-                archive_checked_out_work(
+                archive_checked_out_work_except(
                     worktree_path,
-                    current,
-                    trunk_branch,
                     subsystem,
+                    trunk_branch,
                     "detached",
+                    Some(base_branch),
                 )?;
             }
         }
@@ -831,9 +895,8 @@ pub(crate) fn heal_stray_task_branch(
 
     let archive = archive_checked_out_work(
         worktree_path,
-        current_branch.as_deref(),
-        trunk_branch,
         subsystem,
+        trunk_branch,
         &format!("detached-{expected_branch}"),
     )?;
 
@@ -1049,5 +1112,134 @@ mod tests {
         assert_ne!(first, second);
         assert!(ref_exists(dir, &format!("refs/heads/{second}")).unwrap());
         assert!(!ref_exists(dir, "refs/heads/nope").unwrap());
+    }
+
+    fn run(dir: &Path, args: &[&str]) {
+        crate::git::cmd(dir).args(args).run().unwrap();
+    }
+
+    /// A container holding one sub-repo whose default branch is `mainline`
+    /// (no `main`), with `feature` checked out one commit ahead of it.
+    fn mainline_container() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("PkgA");
+        std::fs::create_dir_all(&sub).unwrap();
+        for args in [
+            &["init", "-q", "-b", "mainline"][..],
+            &["config", "user.email", "ops@example.com"],
+            &["config", "user.name", "Ops"],
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+            &["checkout", "-q", "-b", "feature"],
+            &["commit", "-q", "--allow-empty", "-m", "work"],
+        ] {
+            run(&sub, args);
+        }
+        (tmp, sub)
+    }
+
+    fn archives(repo: &Path) -> Vec<String> {
+        crate::git::cmd(repo)
+            .args([
+                "branch",
+                "--list",
+                "--format=%(refname:short)",
+                "preserved/*",
+            ])
+            .stdout()
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn archive_uses_per_repo_trunk_for_mainline_sub_repo() {
+        let (container, sub) = mainline_container();
+        // The configured trunk is the generic `main`, which this sub-repo lacks.
+        let archive = archive_checked_out_work(container.path(), "test", "main", "detached")
+            .unwrap()
+            .expect("feature is ahead of mainline");
+        assert!(archive.starts_with("preserved/feature-"), "{archive}");
+        assert_eq!(archives(&sub), [archive]);
+    }
+
+    #[test]
+    fn archive_detached_head_in_sub_repo_is_archived_with_detached_label() {
+        let (container, sub) = mainline_container();
+        run(&sub, &["checkout", "-q", "--detach"]);
+        let archive = archive_checked_out_work(container.path(), "test", "main", "detached-x")
+            .unwrap()
+            .expect("detached HEAD is ahead of mainline");
+        assert!(archive.starts_with("preserved/detached-x-"), "{archive}");
+    }
+
+    #[test]
+    fn archive_with_missing_trunk_archives_unconditionally_instead_of_failing() {
+        let (_container, sub) = mainline_container();
+        // `develop` does not exist: nothing to compare against.
+        let archive = archive_checked_out_work(&sub, "test", "develop", "detached")
+            .unwrap()
+            .expect("branch archived unconditionally");
+        assert!(archive.starts_with("preserved/feature-"), "{archive}");
+
+        run(&sub, &["checkout", "-q", "--detach"]);
+        let detached = archive_checked_out_work(&sub, "test", "develop", "detached")
+            .unwrap()
+            .expect("detached HEAD archived unconditionally");
+        assert!(detached.starts_with("preserved/detached-"), "{detached}");
+    }
+
+    #[test]
+    fn archive_skips_branch_with_nothing_ahead_of_trunk() {
+        let tmp = repo();
+        assert_eq!(
+            archive_checked_out_work(tmp.path(), "test", "main", "detached").unwrap(),
+            None
+        );
+        run(tmp.path(), &["checkout", "-q", "--detach"]);
+        assert_eq!(
+            archive_checked_out_work(tmp.path(), "test", "main", "detached").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_reset_succeeds_in_mainline_sub_repo_and_archives_the_branch() {
+        let (container, sub) = mainline_container();
+        let reason = crate::worktree::recover_worktree_to_base_preserving(
+            container.path(),
+            "eng-main/eng-1",
+            "test",
+            "main",
+        )
+        .unwrap();
+        assert!(reason.reset_performed(), "{reason:?}");
+        assert_eq!(
+            crate::git::cmd(&sub)
+                .args(["branch", "--show-current"])
+                .stdout()
+                .unwrap(),
+            "eng-main/eng-1"
+        );
+        assert_eq!(archives(&sub).len(), 1, "{:?}", archives(&sub));
+    }
+
+    #[test]
+    fn recovery_reset_succeeds_for_detached_sub_repo() {
+        let (container, sub) = mainline_container();
+        run(&sub, &["checkout", "-q", "--detach"]);
+        let reason = crate::worktree::recover_worktree_to_base_preserving(
+            container.path(),
+            "eng-main/eng-1",
+            "test",
+            "main",
+        )
+        .unwrap();
+        assert!(reason.reset_performed(), "{reason:?}");
+        assert!(
+            archives(&sub).iter().any(|name| name.contains("detached")),
+            "{:?}",
+            archives(&sub)
+        );
     }
 }

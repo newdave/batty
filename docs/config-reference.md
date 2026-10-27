@@ -253,3 +253,21 @@ when `<provider> --version` reports something older than 2026.5.26.
 - Leave `board.auto_dispatch: true` and `workflow_policy.auto_merge.enabled: true`.
 - Enable `use_worktrees: true` for engineers.
 - Use `workflow_mode: hybrid` unless you are intentionally forcing workflow-first behavior.
+
+## Git Environment Variables
+
+Every `git` command Batty runs has a timeout. Commands are split into two classes:
+
+- **Long** (default 600s): network and object-store commands (`fetch`, `push`, `pull`, `clone`, `gc`, ...), commands that run hooks (`commit`, `merge`, `rebase`, ...), and commands that walk or rewrite the index or working tree (`checkout`, `switch`, `worktree`, `reset`, `stash`, `add`, `status`, `clean`, `diff`, `merge-tree`).
+- **Short** (default 120s): everything else, mainly read-only plumbing such as `rev-parse`, `rev-list`, `for-each-ref` and `config`.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `BATTY_GIT_TIMEOUT_SECS` | `120` | Timeout in seconds for short-class git commands. |
+| `BATTY_GIT_LONG_TIMEOUT_SECS` | `600` | Timeout in seconds for long-class git commands. |
+
+Values must be positive integers; anything else falls back to the default.
+
+On timeout Batty sends SIGTERM to the command's process group, waits 5 seconds, then sends SIGKILL. If the killed command left a stale `.git/index.lock` behind (modified after the command started, with no process left in its group), Batty removes it and logs a warning. A timeout is reported as a permanent error and is not retried.
+
+When Batty runs from a terminal, `commit`, `merge`, `rebase`, `tag` and `push` stay in the terminal's foreground process group so hooks and signing programs can read `/dev/tty` and Ctrl-C reaches git. The daemon has no terminal and always isolates git in its own process group.
