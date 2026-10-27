@@ -88,7 +88,12 @@ support roles, each tiled inside.
 
 ## Recommendation
 
-Default to `auto`:
+> **Current default:** `panes` with `keys: false`, matching upstream. `auto`
+> and the F-keys are opt-in until the batty key table stops disabling tmux's
+> mouse and root key bindings. The recommendation below is the intended
+> default once that is fixed.
+
+Recommended default, `auto`:
 
 - Tile panes only when they stay usable: at most 4 agent panes (including the
   orchestrator pane) and a terminal that gives each pane at least 50 columns
@@ -147,8 +152,8 @@ Minimum sizes: panes below 50x12 are considered unreadable. If you force
 
 ```yaml
 layout:
-  mode: auto   # auto | panes | windows | focus
-  keys: true   # install F-key bindings (batty-only key table); false skips them
+  mode: panes  # panes (default) | auto | windows | focus
+  keys: false  # true installs F-key bindings (batty-only key table; disables mouse bindings for now)
 ```
 
 `zones` (see the config reference) still applies to `panes` mode. Existing

@@ -494,14 +494,19 @@ mod tests {
     }
 
     #[test]
-    fn layout_mode_defaults_to_auto_for_legacy_zones() {
+    fn layout_mode_defaults_to_panes() {
         let layout: crate::team::config::LayoutConfig =
             serde_yaml::from_str("zones:\n- name: architect\n  width_pct: 100\n").unwrap();
-        assert_eq!(layout.mode, LayoutMode::Auto);
+        assert_eq!(layout.mode, LayoutMode::Panes);
+        assert_eq!(
+            crate::team::config::LayoutConfig::default().mode,
+            LayoutMode::Panes
+        );
         assert_eq!(layout.zones.len(), 1);
-        assert!(layout.keys);
-        let off: crate::team::config::LayoutConfig = serde_yaml::from_str("keys: false\n").unwrap();
-        assert!(!off.keys);
+        assert!(!layout.keys, "keys stay off until mouse bindings survive");
+        assert!(!crate::team::config::LayoutConfig::default().keys);
+        let on: crate::team::config::LayoutConfig = serde_yaml::from_str("keys: true\n").unwrap();
+        assert!(on.keys);
     }
 
     #[test]

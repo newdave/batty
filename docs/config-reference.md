@@ -187,8 +187,8 @@ must exist locally or as `origin/develop`; when only the remote branch exists,
 
 ```yaml
 layout:
-  mode: auto        # auto | panes | windows | focus (default: auto)
-  keys: true        # F-key bindings in a batty-only key table (default: true)
+  mode: panes       # panes | auto | windows | focus (default: panes)
+  keys: false       # F-key bindings in a batty-only key table (default: false)
   zones: []         # optional hand-built tiled layout (panes mode)
 ```
 
@@ -199,9 +199,10 @@ layout:
   in hierarchy order, with a clickable tab bar and F-key jumps.
 - `focus`: one big pane plus a narrow column; F2-F10 swap a member in, F11 cycles.
 
-- `keys`: when `true` (default) Batty installs F1 (help), F2-F10 (jump), F12
-  (zoom) and F11 (focus) in a key table used only by its own session; the
-  prefix and all other keys are unaffected. `false` installs none.
+- `keys`: when `true`, Batty installs F1 (help), F2-F10 (jump), F12 (zoom) and
+  F11 (focus) in a key table used only by its own session. Default `false`:
+  that key table currently disables tmux's mouse and root key bindings in the
+  session (clicking panes, wheel scrolling, clickable tabs).
 
 See [tmux-layouts.md](tmux-layouts.md) for the comparison and key reference.
 

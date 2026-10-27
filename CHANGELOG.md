@@ -14,9 +14,8 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
 - `batty config` exits non-zero when no team config exists (it printed a message
   and exited 0). `--json` adds `schema_version: 2` and the full resolved `config`
   object next to the upstream top-level keys.
-- tmux layouts default to `layout.mode: auto`: teams with more than four agent
-  panes now get one window per member plus a dashboard window instead of tiled
-  panes. Configs with `layout.zones` stay tiled. The first window is index 1.
+- tmux window numbering starts at 1. Layouts still default to tiled panes
+  (`layout.mode: panes`, as upstream).
 - Status moves made by the daemon go through the task state machine, so illegal
   moves are refused and reported instead of applied.
 - Every git command runs with a timeout (120s, or 600s for slow commands such as
@@ -31,10 +30,13 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
   New flags: `--wide` (all columns), `--watch [SECS]` (live refresh) and
   `--no-color`. Colour is used only on a TTY with `NO_COLOR` unset. `--json` is
   unchanged.
-- `layout.mode` (`auto`, `panes`, `windows`, `focus`) and `layout.keys`. Batty
-  sessions get clickable window tabs, a key-hint line, F1 help, F2–F10 to jump to
-  a member, F11 to cycle focus and F12 to zoom, in a per-session key table that
-  leaves other tmux sessions alone. See docs/tmux-layouts.md.
+- `layout.mode` (`panes` by default, `auto`, `windows`, `focus`). `windows`
+  gives a live status dashboard plus one window per member; `auto` picks windows
+  for teams of more than four agents. Batty sessions get clickable window tabs
+  and a key-hint line. See docs/tmux-layouts.md.
+- `layout.keys` (default `false`) installs F1 help, F2–F10 jumps, F11 focus and
+  F12 zoom in a per-session key table. It is off by default because that key
+  table currently disables tmux's mouse and root key bindings in the session.
 - `batty attach [MEMBER]` jumps to a member's window or pane.
 - `telemetry.retention_days` (default 90, 0 disables) prunes old telemetry rows,
   starting on the first tick after startup.

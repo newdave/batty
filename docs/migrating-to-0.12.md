@@ -11,26 +11,24 @@ This guide covers changes you may need to act on when upgrading from batty 0.11.
    daemon hot-reloading in the middle of a merge.
 2. Install the new binary and run `batty validate` in each project. Fix any
    errors it reports about channels; review its warnings about unused keys.
-3. Start the team with `batty start`. If the team has more than four agents,
-   the tmux session now opens with one window per member (see
-   [tmux layouts](tmux-layouts.md)).
+3. Start the team with `batty start`. The tmux layout is unchanged (tiled
+   panes) unless you opt into another mode (see [tmux layouts](tmux-layouts.md)).
 
 ## Behaviour changes to check
 
 ### tmux layout
 
-`layout.mode` defaults to `auto`. Teams with more than four agent panes get a
-dashboard window plus one window per member instead of tiled panes. Window
-numbers start at 1. To keep the old layout:
+Layouts still default to tiled panes (`layout.mode: panes`). Window numbers now
+start at 1. Large teams can opt into a dashboard plus one window per member:
 
 ```yaml
 layout:
-  mode: panes
+  mode: windows   # or auto: windows only for more than four agents
 ```
 
-Configs that already define `layout.zones` keep tiled panes. Batty's function
-keys (F1–F12) apply only inside batty sessions; set `layout.keys: false` to turn
-them off.
+Batty's function keys (F1–F12) are off by default (`layout.keys: false`). If you
+turn them on, tmux's default mouse bindings stop working in batty sessions until
+a later release fixes the key table.
 
 ### `batty status`
 

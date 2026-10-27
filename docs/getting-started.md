@@ -139,10 +139,10 @@ Attach to the tmux session:
 batty attach            # or: batty attach architect  (jump to one member)
 ```
 
-Larger teams get one tmux window per member plus a dashboard window. Click a
-tab in the bottom bar or press F2-F10 to switch, F1 for help, F12 to zoom, and
-`Ctrl-b d` to detach. See [tmux-layouts.md](tmux-layouts.md) and the
-`layout.mode` setting.
+By default every member is tiled in one tmux window: click a pane to focus it,
+scroll with the mouse wheel, and press `Ctrl-b d` to detach. Large teams can set
+`layout.mode: windows` for a dashboard plus one window per member. See
+[tmux-layouts.md](tmux-layouts.md).
 
 In a second shell, keep a non-interactive view open:
 

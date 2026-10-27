@@ -919,10 +919,12 @@ impl Default for AutomationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
-    /// How members are arranged in tmux. Omitted means `auto`.
+    /// How members are arranged in tmux. Omitted means `panes`.
     #[serde(default)]
     pub mode: LayoutMode,
-    /// Install batty's F-key bindings (in a batty-only key table). Default true.
+    /// Install batty's F-key bindings (in a batty-only key table). Default
+    /// false: the custom key table currently disables tmux's root and mouse
+    /// bindings in that session.
     #[serde(default = "default_layout_keys")]
     pub keys: bool,
     /// Custom tiled-pane zones (used by `panes` mode; honoured by `auto`).
@@ -935,9 +937,10 @@ pub struct LayoutConfig {
 #[serde(rename_all = "lowercase")]
 pub enum LayoutMode {
     /// Tiled panes when they stay usable, otherwise one window per member.
-    #[default]
     Auto,
-    /// Always tile every member into one window.
+    /// Always tile every member into one window. The default (as upstream)
+    /// until windows mode keeps tmux's mouse bindings working.
+    #[default]
     Panes,
     /// Dashboard window plus one window per member.
     Windows,
@@ -946,14 +949,15 @@ pub enum LayoutMode {
 }
 
 fn default_layout_keys() -> bool {
-    true
+    // Off until the batty key table keeps tmux's root/mouse bindings working.
+    false
 }
 
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
-            mode: LayoutMode::Auto,
-            keys: true,
+            mode: LayoutMode::Panes,
+            keys: false,
             zones: Vec::new(),
         }
     }
