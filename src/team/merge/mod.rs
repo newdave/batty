@@ -20,12 +20,15 @@ mod operations;
 pub(crate) use completion::handle_engineer_completion_and_wait;
 pub(crate) use completion::{
     DeferredDirectMerge, VerificationJob, append_merge_learning, enqueue_reviewed_merge,
-    handle_engineer_completion, poll_deferred_direct_merges, poll_verification_jobs,
-    record_merge_test_timing,
+    handle_engineer_completion, multi_repo_changed_paths, poll_deferred_direct_merges,
+    poll_verification_jobs, record_merge_test_timing, restore_deferred_direct_merges,
 };
+#[cfg(test)]
+pub(crate) use lock::acquire_eventually_for_test;
 pub(crate) use lock::{
     MergeLock, MergeMode, MergeOutcome, infer_merge_mode_from_failure, merge_lock_is_held,
+    merge_lock_path,
 };
 pub(crate) use operations::{
-    RootDirtyState, inspect_root_dirty_state, merge_engineer_branch_into_trunk,
+    RootCheckoutDirty, RootDirtyState, inspect_root_dirty_state, merge_engineer_branch_into_trunk,
 };

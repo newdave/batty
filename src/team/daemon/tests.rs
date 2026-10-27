@@ -375,6 +375,7 @@ fn daemon_state_round_trip_preserves_runtime_fields() {
         pending_verifications: HashMap::from([("eng-1".to_string(), 42)]),
         running_tests: Vec::new(),
         merge_queue: Default::default(),
+        deferred_direct_merges: Vec::new(),
     };
 
     save_daemon_state(tmp.path(), &state).unwrap();
@@ -5837,6 +5838,7 @@ fn save_daemon_state_returns_error_on_readonly_dir() {
             pending_verifications: HashMap::new(),
             running_tests: Vec::new(),
             merge_queue: Default::default(),
+            deferred_direct_merges: Vec::new(),
         };
 
         let result = save_daemon_state(tmp.path(), &state);

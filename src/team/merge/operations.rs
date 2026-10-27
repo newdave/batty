@@ -24,6 +24,34 @@ use super::git_ops::{
 };
 use super::lock::{MergeMode, MergeOutcome, MergeSuccess};
 
+/// The root checkout has trunk checked out with local changes that a
+/// fast-forward to the merge would overwrite. Nothing landed; the merge can
+/// be retried once the root checkout is clean.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "root {trunk_branch} checkout is dirty and its local changes conflict with the merge; \
+     deferring until the root checkout is clean: {stderr}"
+)]
+pub(crate) struct RootCheckoutDirty {
+    pub(crate) trunk_branch: String,
+    /// Paths git reported as in the way, from its stderr.
+    pub(crate) paths: Vec<String>,
+    pub(crate) stderr: String,
+}
+
+/// Paths listed (tab-indented) under git's "would be overwritten" errors.
+pub(crate) fn overwritten_paths_from_git_stderr(stderr: &str) -> Vec<String> {
+    let mut paths: Vec<String> = stderr
+        .lines()
+        .filter(|line| line.starts_with('\t'))
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RootMergePlan {
     mode: MergeMode,
@@ -226,6 +254,10 @@ pub(crate) fn merge_engineer_branch_into_trunk(
         ),
     };
     if let Err(error) = merge_result {
+        if error.downcast_ref::<RootCheckoutDirty>().is_some() {
+            // Not a merge failure: nothing landed and a retry can succeed.
+            return Err(error);
+        }
         let prefix = match merge_plan.mode {
             MergeMode::DirectRoot => "direct merge path failed",
             MergeMode::IsolatedIntegration => "isolated merge path failed",
@@ -407,11 +439,13 @@ fn merge_branch_via_isolated_integration(
             &format!("fast-forward dirty root {trunk_branch} checkout to isolated merge"),
         )?;
         if !ff.status.success() {
-            bail!(
-                "root {trunk_branch} checkout is dirty and its local changes conflict with the merge; \
-                 deferring until the root checkout is clean: {}",
-                String::from_utf8_lossy(&ff.stderr).trim()
-            );
+            let stderr = String::from_utf8_lossy(&ff.stderr).trim().to_string();
+            return Err(RootCheckoutDirty {
+                trunk_branch: trunk_branch.to_string(),
+                paths: overwritten_paths_from_git_stderr(&stderr),
+                stderr,
+            }
+            .into());
         }
         return Ok(());
     }
@@ -735,6 +769,16 @@ mod tests {
         let mut perms = std::fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn overwritten_paths_are_parsed_from_git_stderr() {
+        let stderr = "error: Your local changes to the following files would be overwritten by merge:\n\tsrc/lib.rs\n\tCargo.toml\nPlease commit your changes or stash them before you merge.\nerror: The following untracked working tree files would be overwritten by merge:\n\tnew.txt\nAborting";
+        assert_eq!(
+            overwritten_paths_from_git_stderr(stderr),
+            vec!["Cargo.toml", "new.txt", "src/lib.rs"]
+        );
+        assert!(overwritten_paths_from_git_stderr("fatal: boom").is_empty());
     }
 
     #[test]
@@ -1741,15 +1785,28 @@ overall_parity: 100%
         let main_before = git_stdout(&repo, &["rev-parse", "main"]);
         std::fs::write(repo.join("Cargo.toml"), "# user edit\n").unwrap();
 
-        let err = merge_branch_via_isolated_integration(&repo, "eng-1", "feature", "main")
-            .unwrap_err()
-            .to_string();
+        let error =
+            merge_branch_via_isolated_integration(&repo, "eng-1", "feature", "main").unwrap_err();
+        let err = error.to_string();
 
         assert!(err.contains("deferring"), "{err}");
+        let dirty = error
+            .downcast_ref::<RootCheckoutDirty>()
+            .expect("an overlapping dirty root is a typed, retryable deferral");
+        assert_eq!(dirty.paths, vec!["Cargo.toml".to_string()]);
         assert_eq!(git_stdout(&repo, &["rev-parse", "main"]), main_before);
         assert_eq!(
             std::fs::read_to_string(repo.join("Cargo.toml")).unwrap(),
             "# user edit\n"
+        );
+
+        // Once the root checkout is clean, the retry lands.
+        git_ok(&repo, &["checkout", "--", "Cargo.toml"]);
+        merge_branch_via_isolated_integration(&repo, "eng-1", "feature", "main").unwrap();
+        git_ok(&repo, &["merge-base", "--is-ancestor", "feature", "main"]);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("Cargo.toml")).unwrap(),
+            "# engineer edit\n"
         );
     }
 

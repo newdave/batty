@@ -470,19 +470,9 @@ fn setup_multi_repo_direct_merge() -> (
     std::fs::write(sub_wt.join("lib.rs"), "pub fn work() {}\n").unwrap();
     git_ok(&sub_wt, &["add", "lib.rs"]);
     git_ok(&sub_wt, &["commit", "-q", "-m", "engineer work"]);
-    // Unclaimed on the board: the scope fence inspects a claimed task's
-    // worktree root as one git repo, which a multi-repo root is not.
-    let tasks_dir = project
-        .join(".batty")
-        .join("team_config")
-        .join("board")
-        .join("tasks");
-    std::fs::create_dir_all(&tasks_dir).unwrap();
-    std::fs::write(
-        tasks_dir.join("042-multi-repo-direct.md"),
-        "---\nid: 42\ntitle: multi-repo-direct\nstatus: in-progress\npriority: high\nclass: standard\n---\n\nTask description.\n",
-    )
-    .unwrap();
+    // Claimed by eng-1, as in normal operation: the completion scope fence
+    // inspects claimed tasks.
+    write_task_file(&project, 42, "multi-repo-direct");
 
     let mut daemon = setup_completion_daemon(&project, "eng-1");
     daemon.is_multi_repo = true;
@@ -571,4 +561,229 @@ fn deferred_direct_merge_is_dropped_when_task_is_reassigned() {
 
     assert!(daemon.merge.deferred_direct.is_empty());
     assert_eq!(head_of(&sub_repo, "main"), main_before);
+}
+
+/// Engineer name the scope-ack team config resolves (its manager is
+/// `manager`), so the scope ACK reaches the right recipient.
+const FENCED_ENGINEER: &str = "eng-1-1";
+
+/// Multi-repo project with sub-repos `A` and `B`; the engineer's worktree
+/// adds `A/a.rs` and `B/b.rs`. Task #42 is claimed by the engineer with
+/// `fence` as its scope fence, and the scope is acknowledged.
+fn setup_multi_repo_fenced_completion(
+    fence: &str,
+) -> (tempfile::TempDir, PathBuf, crate::team::daemon::TeamDaemon) {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().to_path_buf();
+    write_scope_ack_team_config(&project);
+    let wt_root = project
+        .join(".batty")
+        .join("worktrees")
+        .join(FENCED_ENGINEER);
+    std::fs::create_dir_all(&wt_root).unwrap();
+    for (repo, file) in [("A", "a.rs"), ("B", "b.rs")] {
+        let repo_dir = init_sub_repo(&project, repo);
+        let wt = wt_root.join(repo);
+        git_ok(
+            &repo_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("{FENCED_ENGINEER}/42"),
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(wt.join(file), format!("{repo} work\n")).unwrap();
+        git_ok(&wt, &["add", file]);
+        git_ok(&wt, &["commit", "-q", "-m", "engineer work"]);
+    }
+    let tasks_dir = project
+        .join(".batty")
+        .join("team_config")
+        .join("board")
+        .join("tasks");
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("042-multi-repo-fenced.md"),
+        format!(
+            "---\nid: 42\ntitle: multi-repo-fenced\nstatus: in-progress\npriority: high\nclaimed_by: {FENCED_ENGINEER}\nclass: standard\n---\n\nTask description.\nSCOPE FENCE: {fence}\n"
+        ),
+    )
+    .unwrap();
+    let ack = inbox::InboxMessage::new_send(FENCED_ENGINEER, "manager", "Scope ACK #42");
+    inbox::deliver_to_inbox(&inbox::inboxes_root(&project), &ack).unwrap();
+
+    let mut daemon = setup_completion_daemon(&project, FENCED_ENGINEER);
+    daemon.is_multi_repo = true;
+    daemon.sub_repo_names = vec!["A".to_string(), "B".to_string()];
+    let workflow = &mut daemon.config.team_config.workflow_policy;
+    workflow.auto_merge.enabled = false;
+    workflow.verification.auto_run_tests = false;
+    workflow.test_command = Some("true".to_string());
+    daemon.set_active_task_for_test(FENCED_ENGINEER, 42);
+    daemon.set_member_state_for_test(FENCED_ENGINEER, MemberState::Working);
+    (tmp, project, daemon)
+}
+
+fn scope_violation_events(project: &Path) -> usize {
+    read_events(
+        &project
+            .join(".batty")
+            .join("team_config")
+            .join("events.jsonl"),
+    )
+    .unwrap_or_default()
+    .iter()
+    .filter(|event| event.event == "scope_fence_violation")
+    .count()
+}
+
+#[test]
+fn multi_repo_claimed_task_with_in_scope_changes_passes_scope_fence() {
+    let (_tmp, project, mut daemon) = setup_multi_repo_fenced_completion("A, B");
+
+    handle_engineer_completion_and_wait(&mut daemon, FENCED_ENGINEER).unwrap();
+
+    assert_eq!(scope_violation_events(&project), 0);
+    assert_eq!(
+        git_stdout(&project.join("A"), &["show", "main:a.rs"]),
+        "A work"
+    );
+    assert_eq!(
+        git_stdout(&project.join("B"), &["show", "main:b.rs"]),
+        "B work"
+    );
+    assert_eq!(daemon.active_task_id(FENCED_ENGINEER), None);
+}
+
+#[test]
+fn multi_repo_out_of_scope_changes_are_reverted_in_their_sub_repo_only() {
+    let (_tmp, project, mut daemon) = setup_multi_repo_fenced_completion("A");
+    let wt_root = project
+        .join(".batty")
+        .join("worktrees")
+        .join(FENCED_ENGINEER);
+    let a_head = head_of(&wt_root.join("A"), "HEAD");
+
+    handle_engineer_completion_and_wait(&mut daemon, FENCED_ENGINEER).unwrap();
+
+    assert_eq!(scope_violation_events(&project), 1);
+    // B's out-of-scope file was removed by a revert commit in B...
+    assert!(!wt_root.join("B").join("b.rs").exists());
+    let b_subject = git_stdout(&wt_root.join("B"), &["log", "-1", "--format=%s"]);
+    assert!(
+        b_subject.contains("Restore fenced files after automatic scope recovery"),
+        "{b_subject}"
+    );
+    // ...while A, in scope, is untouched.
+    assert_eq!(head_of(&wt_root.join("A"), "HEAD"), a_head);
+    assert!(wt_root.join("A").join("a.rs").exists());
+}
+
+/// Defer the multi-repo direct merge of task #42 behind a held merge lock.
+fn deferred_multi_repo_merge() -> (
+    tempfile::TempDir,
+    PathBuf,
+    PathBuf,
+    crate::team::daemon::TeamDaemon,
+    crate::team::merge::MergeLock,
+) {
+    let (tmp, project, sub_repo, mut daemon) = setup_multi_repo_direct_merge();
+    let held = crate::team::merge::MergeLock::try_acquire(&project)
+        .unwrap()
+        .unwrap();
+    handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
+    assert_eq!(daemon.merge.deferred_direct.len(), 1);
+    assert_eq!(task_board_status(&project, 42), "review");
+    (tmp, project, sub_repo, daemon, held)
+}
+
+/// A daemon for the same multi-repo project after a restart or hot reload
+/// (no active tasks known).
+fn restarted_multi_repo_daemon(project: &Path) -> crate::team::daemon::TeamDaemon {
+    let mut daemon = setup_completion_daemon(project, "eng-1");
+    daemon.is_multi_repo = true;
+    daemon.sub_repo_names = vec!["A".to_string()];
+    let workflow = &mut daemon.config.team_config.workflow_policy;
+    workflow.auto_merge.enabled = false;
+    workflow.verification.auto_run_tests = false;
+    daemon
+}
+
+#[test]
+fn deferred_direct_merge_survives_restart_and_lands_when_lock_frees() {
+    let (_tmp, project, sub_repo, daemon, held) = deferred_multi_repo_merge();
+    let main_before = head_of(&sub_repo, "main");
+    drop(daemon);
+
+    let mut restarted = restarted_multi_repo_daemon(&project);
+    restarted.restore_merge_queue_state();
+    assert_eq!(restarted.merge.deferred_direct.len(), 1);
+    assert_eq!(restarted.merge.deferred_direct[0].task_id, 42);
+
+    poll_deferred_direct_merges(&mut restarted).unwrap();
+    assert_eq!(restarted.merge.deferred_direct.len(), 1, "still waiting");
+    assert_eq!(head_of(&sub_repo, "main"), main_before);
+
+    drop(held);
+    poll_deferred_direct_merges(&mut restarted).unwrap();
+    assert!(restarted.merge.deferred_direct.is_empty());
+    assert_ne!(head_of(&sub_repo, "main"), main_before);
+    assert!(sub_repo.join("lib.rs").exists());
+
+    // The landed merge is gone from the persisted state too.
+    let mut again = restarted_multi_repo_daemon(&project);
+    again.restore_merge_queue_state();
+    assert!(again.merge.deferred_direct.is_empty());
+}
+
+#[test]
+fn restored_deferred_direct_merge_for_reassigned_task_is_dropped() {
+    let (_tmp, project, sub_repo, daemon, held) = deferred_multi_repo_merge();
+    let main_before = head_of(&sub_repo, "main");
+    drop(daemon);
+    // Task #42 was handed to another engineer while the daemon was down.
+    let task_path = crate::team::task_cmd::find_task_path(
+        &project.join(".batty").join("team_config").join("board"),
+        42,
+    )
+    .unwrap();
+    let content = std::fs::read_to_string(&task_path).unwrap();
+    std::fs::write(
+        &task_path,
+        content.replace("claimed_by: eng-1", "claimed_by: eng-2"),
+    )
+    .unwrap();
+
+    let mut restarted = restarted_multi_repo_daemon(&project);
+    restarted.restore_merge_queue_state();
+    assert!(restarted.merge.deferred_direct.is_empty());
+
+    drop(held);
+    poll_deferred_direct_merges(&mut restarted).unwrap();
+    assert_eq!(head_of(&sub_repo, "main"), main_before);
+}
+
+#[test]
+fn long_deferred_direct_merge_escalates_once() {
+    let (_tmp, project, _sub_repo, mut daemon, _held) = deferred_multi_repo_merge();
+    let escalations = |project: &Path| {
+        inbox::pending_messages(&inbox::inboxes_root(project), "manager")
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.body.contains("has waited"))
+            .count()
+    };
+    poll_deferred_direct_merges(&mut daemon).unwrap();
+    assert_eq!(escalations(&project), 0);
+
+    daemon.merge.deferred_direct[0].deferred_since -= 31 * 60;
+    poll_deferred_direct_merges(&mut daemon).unwrap();
+    poll_deferred_direct_merges(&mut daemon).unwrap();
+    assert_eq!(escalations(&project), 1);
+    assert!(daemon.merge.deferred_direct[0].escalated);
+    assert_eq!(daemon.merge.deferred_direct.len(), 1, "still retried");
 }

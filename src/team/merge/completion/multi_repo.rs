@@ -13,10 +13,57 @@ use crate::team::task_loop::{
 
 use super::super::git_ops::{
     abort_failed_merge, code_files_changed_from_trunk, commits_ahead_of_trunk,
-    diff_stat_from_trunk, files_changed_from_trunk, rev_parse, run_git_with_context,
-    run_git_with_context_allow_fail,
+    diff_stat_from_trunk, files_changed_from_trunk, rev_parse, revert_out_of_scope_files,
+    run_git_with_context, run_git_with_context_allow_fail,
 };
 use super::super::lock::{MergeMode, MergeOutcome, MergeSuccess};
+
+/// Files changed relative to trunk across the sub-repo worktrees under
+/// `worktree_dir`, each path prefixed with its sub-repo name (`A/src/x.rs`).
+pub(crate) fn multi_repo_changed_paths(
+    worktree_dir: &Path,
+    sub_repo_names: &[String],
+    trunk_branch: &str,
+) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for repo_name in sub_repo_names {
+        let sub_wt = worktree_dir.join(repo_name);
+        if !sub_wt.exists() {
+            continue;
+        }
+        let files =
+            crate::team::daemon::verification::changed_files_from_trunk(&sub_wt, trunk_branch)
+                .with_context(|| format!("list changed files in sub-repo {repo_name}"))?;
+        paths.extend(files.into_iter().map(|file| format!("{repo_name}/{file}")));
+    }
+    Ok(paths)
+}
+
+/// Revert out-of-scope files (paths prefixed with their sub-repo name, as
+/// from [`multi_repo_changed_paths`]) in the sub-repo each belongs to.
+/// Returns true if any sub-repo changed.
+pub(super) fn revert_multi_repo_out_of_scope_files(
+    worktree_dir: &Path,
+    sub_repo_names: &[String],
+    out_of_scope: &[String],
+    trunk_branch: &str,
+) -> Result<bool> {
+    let mut reverted = false;
+    for repo_name in sub_repo_names {
+        let prefix = format!("{repo_name}/");
+        let files: Vec<String> = out_of_scope
+            .iter()
+            .filter_map(|path| path.strip_prefix(&prefix))
+            .map(str::to_string)
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        reverted |= revert_out_of_scope_files(&worktree_dir.join(repo_name), &files, trunk_branch)
+            .with_context(|| format!("revert out-of-scope files in sub-repo {repo_name}"))?;
+    }
+    Ok(reverted)
+}
 
 /// Merge engineer branches across all sub-repos in a multi-repo project.
 ///

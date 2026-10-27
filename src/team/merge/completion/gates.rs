@@ -24,6 +24,7 @@ use super::messaging::{
 use super::multi_repo::{
     multi_repo_code_files_changed_from_trunk, multi_repo_commits_ahead_of_trunk,
     multi_repo_diff_stat_from_trunk, multi_repo_files_changed_from_trunk,
+    revert_multi_repo_out_of_scope_files,
 };
 use super::verification::{
     persist_verification_snapshot, record_verification_evidence, transition_verification_phase,
@@ -204,7 +205,16 @@ pub(super) fn enforce_scope_fence(
     daemon.record_orchestrator_action(format!(
         "scope violation: {engineer} modified fenced files outside declared scope: {violation_list} — reverting out-of-scope changes"
     ));
-    revert_out_of_scope_files(worktree_dir, &fence.out_of_scope_files, trunk_branch)?;
+    if daemon.is_multi_repo {
+        revert_multi_repo_out_of_scope_files(
+            worktree_dir,
+            &daemon.sub_repo_names,
+            &fence.out_of_scope_files,
+            trunk_branch,
+        )?;
+    } else {
+        revert_out_of_scope_files(worktree_dir, &fence.out_of_scope_files, trunk_branch)?;
+    }
     daemon.emit_event(crate::team::events::TeamEvent::scope_fence_violation(
         engineer,
         task_id,

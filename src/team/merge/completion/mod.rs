@@ -36,8 +36,9 @@ use crate::team::verification::VerificationState;
 
 pub(crate) use execute::{
     DeferredDirectMerge, append_merge_learning, enqueue_reviewed_merge,
-    poll_deferred_direct_merges, record_merge_test_timing,
+    poll_deferred_direct_merges, record_merge_test_timing, restore_deferred_direct_merges,
 };
+pub(crate) use multi_repo::multi_repo_changed_paths;
 pub(crate) use verification::{VerificationJob, poll_verification_jobs};
 
 use decision::MergeRoute;

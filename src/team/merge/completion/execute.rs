@@ -7,8 +7,12 @@
 //! the poll loop: when the merge lock is busy, a queue merge is still being
 //! verified, or the main smoke check is running, the merge is deferred (the
 //! task waits in review) and retried by [`poll_deferred_direct_merges`].
+//! Deferred merges are persisted with the daemon state, so a restart or hot
+//! reload does not lose them.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
@@ -70,6 +74,8 @@ pub(super) fn merge_directly(
         task_id: ctx.task_id,
         task_branch: verified.task_branch.to_string(),
         test_duration_ms: verified.test_duration_ms,
+        deferred_since: now_unix(),
+        escalated: false,
     };
     let DirectMergeAttempt::Deferred(reason) = attempt_direct_merge(daemon, &merge)? else {
         return Ok(());
@@ -90,6 +96,7 @@ pub(super) fn merge_directly(
     let deferred = &mut daemon.merge.deferred_direct;
     deferred.retain(|pending| pending.task_id != merge.task_id);
     deferred.push(merge);
+    daemon.persist_merge_queue_change();
     Ok(())
 }
 
@@ -142,14 +149,79 @@ pub(crate) fn enqueue_reviewed_merge(
 }
 
 /// A multi-repo direct merge waiting for the merge lock (or for a queue
-/// merge / main smoke check to finish). Held in daemon merge state and
-/// retried every poll tick; not persisted across restarts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// merge / main smoke check to finish). Held in daemon merge state, retried
+/// every poll tick, and persisted with the daemon state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DeferredDirectMerge {
-    pub(super) engineer: String,
-    pub(super) task_id: u32,
-    pub(super) task_branch: String,
-    pub(super) test_duration_ms: u64,
+    pub(crate) engineer: String,
+    pub(crate) task_id: u32,
+    pub(crate) task_branch: String,
+    pub(crate) test_duration_ms: u64,
+    /// Unix seconds when the merge was first deferred.
+    #[serde(default)]
+    pub(crate) deferred_since: u64,
+    /// Whether the long deferral has been escalated already.
+    #[serde(default)]
+    pub(crate) escalated: bool,
+}
+
+/// A deferred direct merge older than this is escalated once.
+pub(crate) const DEFERRED_DIRECT_MERGE_ESCALATE_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// True while `merge` still describes the engineer's work: their active
+/// task is this task, or (after a restart, when active tasks may not be
+/// known yet) the board still has it in review claimed by them.
+fn deferred_merge_is_current(
+    daemon: &TeamDaemon,
+    merge: &DeferredDirectMerge,
+    tasks: Option<&[crate::task::Task]>,
+) -> bool {
+    match daemon.active_task_id(&merge.engineer) {
+        Some(task_id) => task_id == merge.task_id,
+        None => tasks.is_some_and(|tasks| {
+            tasks.iter().any(|task| {
+                task.id == merge.task_id
+                    && task.status == "review"
+                    && task.claimed_by.as_deref() == Some(merge.engineer.as_str())
+            })
+        }),
+    }
+}
+
+/// Restore persisted deferred direct merges, dropping entries whose task is
+/// no longer in review or claimed by that engineer.
+pub(crate) fn restore_deferred_direct_merges(
+    daemon: &mut TeamDaemon,
+    persisted: Vec<DeferredDirectMerge>,
+) {
+    if persisted.is_empty() {
+        return;
+    }
+    let tasks = load_tasks_from_dir(&daemon.board_dir().join("tasks")).ok();
+    for merge in persisted {
+        let on_board = tasks.as_deref().is_some_and(|tasks| {
+            tasks.iter().any(|task| {
+                task.id == merge.task_id
+                    && task.status == "review"
+                    && task.claimed_by.as_deref() == Some(merge.engineer.as_str())
+            })
+        });
+        if !on_board || !deferred_merge_is_current(daemon, &merge, tasks.as_deref()) {
+            info!(
+                engineer = %merge.engineer,
+                task_id = merge.task_id,
+                "dropping restored deferred direct merge: task is no longer in review for this engineer"
+            );
+            continue;
+        }
+        let deferred = &mut daemon.merge.deferred_direct;
+        if deferred
+            .iter()
+            .all(|pending| pending.task_id != merge.task_id)
+        {
+            deferred.push(merge);
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -216,10 +288,19 @@ pub(crate) fn poll_deferred_direct_merges(daemon: &mut TeamDaemon) -> Result<()>
     if daemon.merge.deferred_direct.is_empty() {
         return Ok(());
     }
+    let before = daemon.merge.deferred_direct.clone();
     let pending = std::mem::take(&mut daemon.merge.deferred_direct);
+    let tasks = if pending
+        .iter()
+        .any(|merge| daemon.active_task_id(&merge.engineer).is_none())
+    {
+        load_tasks_from_dir(&daemon.board_dir().join("tasks")).ok()
+    } else {
+        None
+    };
     let mut first_error = None;
-    for merge in pending {
-        if daemon.active_task_id(&merge.engineer) != Some(merge.task_id) {
+    for mut merge in pending {
+        if !deferred_merge_is_current(daemon, &merge, tasks.as_deref()) {
             info!(
                 engineer = %merge.engineer,
                 task_id = merge.task_id,
@@ -234,6 +315,7 @@ pub(crate) fn poll_deferred_direct_merges(daemon: &mut TeamDaemon) -> Result<()>
                     task_id = merge.task_id,
                     reason, "direct merge still deferred"
                 );
+                escalate_long_deferral(daemon, &mut merge, reason);
                 daemon.merge.deferred_direct.push(merge);
             }
             Err(error) => {
@@ -251,7 +333,47 @@ pub(crate) fn poll_deferred_direct_merges(daemon: &mut TeamDaemon) -> Result<()>
             }
         }
     }
+    if daemon.merge.deferred_direct != before {
+        daemon.persist_merge_queue_change();
+    }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Escalate a direct merge deferred for longer than
+/// [`DEFERRED_DIRECT_MERGE_ESCALATE_AFTER`], once.
+fn escalate_long_deferral(daemon: &mut TeamDaemon, merge: &mut DeferredDirectMerge, reason: &str) {
+    if merge.escalated {
+        return;
+    }
+    let age_secs = now_unix().saturating_sub(merge.deferred_since);
+    if age_secs < DEFERRED_DIRECT_MERGE_ESCALATE_AFTER.as_secs() {
+        return;
+    }
+    merge.escalated = true;
+    let engineer = merge.engineer.as_str();
+    let task_id = merge.task_id;
+    warn!(
+        engineer,
+        task_id, age_secs, reason, "deferred direct merge is still waiting; escalating"
+    );
+    daemon.record_orchestrator_action(format!(
+        "completion merge: task #{task_id} has waited {} minutes to merge ({reason}); escalated",
+        age_secs / 60
+    ));
+    let notice = format!(
+        "ESCALATION: Task #{task_id} from {engineer} passed verification but has waited {} minutes to merge: {reason}.\nIt stays in review and Batty keeps retrying; check what holds the merge lock (.batty/merge.lock) or the main smoke check.",
+        age_secs / 60
+    );
+    if let Some(manager_name) = daemon.manager_name(engineer) {
+        if let Err(error) = daemon.queue_message("daemon", &manager_name, &notice) {
+            warn!(error = %error, "failed to deliver deferred merge escalation");
+        }
+        daemon.mark_member_working(&manager_name);
+        if let Err(error) = daemon.notify_reports_to(&manager_name, &notice) {
+            warn!(error = %error, "failed to notify reports-to of deferred merge escalation");
+        }
+    }
+    daemon.record_task_escalated(engineer, task_id.to_string(), Some("direct_merge_deferred"));
 }
 
 fn land_direct_merge(

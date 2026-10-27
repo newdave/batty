@@ -132,6 +132,9 @@ pub(super) struct PersistedDaemonState {
     /// merge on trunk.
     #[serde(default)]
     pub merge_queue: PersistedMergeQueue,
+    /// Multi-repo direct merges still waiting for the merge lock.
+    #[serde(default)]
+    pub deferred_direct_merges: Vec<crate::team::merge::DeferredDirectMerge>,
 }
 
 impl TeamDaemon {
@@ -182,7 +185,7 @@ impl TeamDaemon {
         }
         self.scheduler.pipeline_starvation_fired = state.pipeline_starvation_fired;
         self.verification.background_tests.retriggers = state.pending_verifications;
-        self.merge.queue.restore(state.merge_queue);
+        self.restore_merge_state(state.merge_queue, state.deferred_direct_merges);
         self.restore_optional_subsystem_budget_state(
             &state.optional_subsystem_backoff,
             &state.optional_subsystem_disabled_remaining_secs,
@@ -313,6 +316,7 @@ impl TeamDaemon {
             pending_verifications: self.verification.background_tests.pending_verifications(),
             running_tests: self.verification.background_tests.running_tests(),
             merge_queue: self.merge.queue.snapshot(),
+            deferred_direct_merges: self.merge.deferred_direct.clone(),
         };
         save_daemon_state(&self.config.project_root, &state)
     }

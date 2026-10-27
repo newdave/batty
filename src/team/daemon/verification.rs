@@ -70,7 +70,11 @@ pub(crate) fn run_automatic_verification_tracked(
     if let Some(conflict_failure) = active_claim_conflict_failure(worktree_dir)? {
         return Ok(conflict_failure);
     }
-    if let Some(task_mismatch_failure) = task_mismatch_validation_failure(worktree_dir)? {
+    // Branch/task checks read the worktree's own branch, which a multi-repo
+    // worktree root (not a git checkout) does not have.
+    if multi_repo_sub_repos(worktree_dir).is_none()
+        && let Some(task_mismatch_failure) = task_mismatch_validation_failure(worktree_dir)?
+    {
         return Ok(task_mismatch_failure);
     }
     if let Some(scope_failure) = scope_validation_failure(worktree_dir)? {
@@ -81,7 +85,7 @@ pub(crate) fn run_automatic_verification_tracked(
     let (failures, _failure_paths) =
         parse_test_output(&test_run.output, &test_run.results, test_run.passed);
     let file_paths =
-        changed_files_from_trunk(worktree_dir, &trunk_branch_for_worktree(worktree_dir)?)?;
+        changed_files_for_worktree(worktree_dir, &trunk_branch_for_worktree(worktree_dir)?)?;
     Ok(VerificationRunResult {
         passed: test_run.passed,
         output: test_run.output,
@@ -372,6 +376,36 @@ pub(crate) fn is_scope_ack_message(body: &str, task_id: u32) -> bool {
         .contains(&scope_ack_token(task_id).to_ascii_lowercase())
 }
 
+/// Sub-repo names when `worktree_dir` is a multi-repo worktree root: not a
+/// git checkout itself, but with git checkouts directly inside it.
+pub(crate) fn multi_repo_sub_repos(worktree_dir: &Path) -> Option<Vec<String>> {
+    if worktree_dir.join(".git").exists() {
+        return None;
+    }
+    let mut repos: Vec<String> = std::fs::read_dir(worktree_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().join(".git").exists())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect();
+    repos.sort();
+    (!repos.is_empty()).then_some(repos)
+}
+
+/// Files changed relative to trunk. For a multi-repo worktree root this
+/// covers every sub-repo, each path prefixed with its sub-repo name.
+pub(crate) fn changed_files_for_worktree(
+    worktree_dir: &Path,
+    trunk_branch: &str,
+) -> Result<Vec<String>> {
+    match multi_repo_sub_repos(worktree_dir) {
+        Some(repos) => {
+            crate::team::merge::multi_repo_changed_paths(worktree_dir, &repos, trunk_branch)
+        }
+        None => changed_files_from_trunk(worktree_dir, trunk_branch),
+    }
+}
+
 pub(crate) fn changed_files_from_trunk(
     worktree_dir: &Path,
     trunk_branch: &str,
@@ -555,8 +589,11 @@ pub(crate) fn inspect_scope_fence(worktree_dir: &Path) -> Result<Option<ScopeFen
 
     let task_text = std::fs::read_to_string(&task.source_path)
         .with_context(|| format!("failed to read {}", task.source_path.display()))?;
+    if parse_scope_fence(&task_text).is_empty() {
+        return Ok(None);
+    }
     let changed_files =
-        changed_files_from_trunk(worktree_dir, &trunk_branch_for_project(&project_root)?)?;
+        changed_files_for_worktree(worktree_dir, &trunk_branch_for_project(&project_root)?)?;
     let scope = validate_declared_scope(&task_text, &changed_files);
     if scope.declared_scope.is_empty() {
         return Ok(None);
