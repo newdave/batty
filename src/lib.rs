@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod atomic_file;
 pub mod cli;
+pub mod commands;
 pub mod console_pane;
 pub mod env_file;
 pub mod git;
