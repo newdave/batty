@@ -265,23 +265,22 @@ pub fn provision_dashboard(project_root: &Path, port: u16) -> Result<()> {
         r#"{{"name":"Batty Telemetry","uid":"batty-telemetry","type":"frser-sqlite-datasource","access":"proxy","jsonData":{{"path":"{}"}}}}"#,
         db_path.display()
     );
-    let ds_result = ProcessCommand::new("curl")
-        .args([
-            "-sf",
-            "-X",
-            "POST",
-            &format!("{base_url}/api/datasources"),
-            "-H",
-            "Content-Type: application/json",
-            "-u",
-            "admin:admin",
-            "-d",
-            &ds_body,
-        ])
-        .output();
-    match ds_result {
-        Ok(out) if out.status.success() => println!("Datasource created."),
-        _ => println!("Datasource may already exist (continuing)."),
+    let ds_url = format!("{base_url}/api/datasources");
+    match run_curl(&[
+        "-X",
+        "POST",
+        &ds_url,
+        "-H",
+        "Content-Type: application/json",
+        "-u",
+        "admin:admin",
+        "-d",
+        &ds_body,
+    ]) {
+        Ok(_) => println!("Datasource created."),
+        Err(error) => {
+            println!("Datasource not created ({error}); it may already exist (continuing).")
+        }
     }
 
     println!("Importing dashboard...");
@@ -291,33 +290,25 @@ pub fn provision_dashboard(project_root: &Path, port: u16) -> Result<()> {
     );
     let tmp_file = std::env::temp_dir().join("batty-grafana-import.json");
     std::fs::write(&tmp_file, &dashboard_payload)?;
-    let import_result = ProcessCommand::new("curl")
-        .args([
-            "-sf",
-            "-X",
-            "POST",
-            &format!("{base_url}/api/dashboards/db"),
-            "-H",
-            "Content-Type: application/json",
-            "-u",
-            "admin:admin",
-            "-d",
-            &format!("@{}", tmp_file.display()),
-        ])
-        .output();
+    let import_url = format!("{base_url}/api/dashboards/db");
+    let import_result = run_curl(&[
+        "-X",
+        "POST",
+        &import_url,
+        "-H",
+        "Content-Type: application/json",
+        "-u",
+        "admin:admin",
+        "-d",
+        &format!("@{}", tmp_file.display()),
+    ]);
     let _ = std::fs::remove_file(&tmp_file);
     match import_result {
-        Ok(out) if out.status.success() => {
-            let body = String::from_utf8_lossy(&out.stdout);
-            if body.contains("\"status\":\"success\"") {
-                println!("Dashboard imported successfully.");
-            } else {
-                println!("Dashboard import response: {body}");
-            }
+        Ok(body) if body.contains("\"status\":\"success\"") => {
+            println!("Dashboard imported successfully.");
         }
-        _ => {
-            println!("Dashboard import may have failed. Check Grafana UI.");
-        }
+        Ok(body) => println!("Dashboard import response: {body}"),
+        Err(error) => println!("Dashboard import failed ({error}). Check Grafana UI."),
     }
 
     let url = format!("{base_url}/d/batty-project");
@@ -661,26 +652,17 @@ fn format_alert_notification(body: &str) -> String {
 }
 
 fn reload_alerting_provisioning(port: u16) -> Result<()> {
-    let output = ProcessCommand::new("curl")
-        .args([
-            "-sf",
-            "-X",
-            "POST",
-            &format!(
-                "{}/api/admin/provisioning/alerting/reload",
-                grafana_url(port)
-            ),
-            "-u",
-            "admin:admin",
-        ])
-        .output()
-        .context("failed to run curl for alerting reload")?;
-    if !output.status.success() {
-        bail!(
-            "Grafana alerting reload failed with status {}",
-            output.status
-        );
-    }
+    run_curl(&[
+        "-X",
+        "POST",
+        &format!(
+            "{}/api/admin/provisioning/alerting/reload",
+            grafana_url(port)
+        ),
+        "-u",
+        "admin:admin",
+    ])
+    .context("Grafana alerting reload failed")?;
     Ok(())
 }
 
@@ -696,12 +678,52 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn check_health(url: &str) -> Result<String> {
+    run_curl(&[url])
+}
+
+/// Seconds curl may spend establishing a connection.
+const CURL_CONNECT_TIMEOUT_SECS: u32 = 5;
+/// Seconds curl may spend on the whole request.
+const CURL_MAX_TIME_SECS: u32 = 30;
+
+/// Full curl argument list: silent, fail on HTTP errors, bounded by timeouts.
+fn curl_args(extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-sf",
+        "--connect-timeout",
+        &CURL_CONNECT_TIMEOUT_SECS.to_string(),
+        "--max-time",
+        &CURL_MAX_TIME_SECS.to_string(),
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    args.extend(extra.iter().map(|arg| arg.to_string()));
+    args
+}
+
+/// Human-readable reason for a curl exit code.
+fn describe_curl_exit(code: Option<i32>) -> String {
+    match code {
+        Some(6) => "could not resolve host".to_string(),
+        Some(7) => "connection refused or failed".to_string(),
+        Some(22) => "server returned an HTTP error".to_string(),
+        Some(28) => format!(
+            "timed out (connect limit {CURL_CONNECT_TIMEOUT_SECS}s, total limit {CURL_MAX_TIME_SECS}s)"
+        ),
+        Some(code) => format!("curl exited with code {code}"),
+        None => "curl was terminated by a signal".to_string(),
+    }
+}
+
+/// Run curl with timeouts and return the response body on success.
+fn run_curl(extra: &[&str]) -> Result<String> {
     let output = ProcessCommand::new("curl")
-        .args(["-sf", url])
+        .args(curl_args(extra))
         .output()
-        .context("failed to run curl")?;
+        .context("failed to run curl - is it installed?")?;
     if !output.status.success() {
-        bail!("HTTP request failed (status {})", output.status);
+        bail!("{}", describe_curl_exit(output.status.code()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -720,6 +742,33 @@ fn open_browser(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curl_args_put_timeouts_before_caller_args() {
+        let args = curl_args(&["-X", "POST", "http://localhost:3000/x"]);
+        assert_eq!(
+            args,
+            [
+                "-sf",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "30",
+                "-X",
+                "POST",
+                "http://localhost:3000/x"
+            ]
+        );
+    }
+
+    #[test]
+    fn describe_curl_exit_names_common_failures() {
+        assert!(describe_curl_exit(Some(28)).contains("timed out"));
+        assert!(describe_curl_exit(Some(7)).contains("connection"));
+        assert!(describe_curl_exit(Some(22)).contains("HTTP"));
+        assert!(describe_curl_exit(Some(99)).contains("99"));
+        assert!(describe_curl_exit(None).contains("signal"));
+    }
 
     #[test]
     fn dashboard_json_valid() {

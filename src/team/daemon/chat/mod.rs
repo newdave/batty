@@ -2,6 +2,7 @@
 //!
 //! `commands` holds the command dispatcher shared by both bridges.
 
+mod bridge;
 mod commands;
 pub(super) mod discord;
 pub(super) mod telegram;

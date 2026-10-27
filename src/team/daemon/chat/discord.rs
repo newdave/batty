@@ -5,17 +5,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Utc};
-use tracing::{info, warn};
+use tracing::warn;
 
+use super::super::integrations::Integrations;
 use super::super::*;
 use super::TelegramCommand;
+use super::bridge::{ChatInbound, ChatPlatform};
 use crate::task::{Task, load_tasks_from_dir};
 use crate::team::config::{ChannelConfig, RoleType, TeamConfig};
 use crate::team::discord::{
     DiscordBot, EmbedField, RichEmbed, Severity, role_author_label, severity_for_event,
 };
 use crate::team::events::{TeamEvent, read_events};
-use crate::team::inbox;
+use crate::team::integration_health::PollHealth;
 
 const DISCORD_BOARD_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const DISCORD_BOARD_SYNC_KEY: &str = "discord::board_sync";
@@ -41,114 +43,63 @@ pub(in crate::team::daemon) fn build_discord_bot(team_config: &TeamConfig) -> Op
         .and_then(DiscordBot::from_config)
 }
 
-impl TeamDaemon {
-    pub(in crate::team::daemon) fn process_discord_queue(&mut self) -> Result<()> {
-        self.poll_discord()?;
-        self.sync_discord_events()?;
-        self.sync_discord_board();
-        self.deliver_user_channel_inbox()
+impl ChatPlatform for DiscordBot {
+    const NAME: &'static str = "discord";
+
+    fn slot(integrations: &mut Integrations) -> (&mut Option<Self>, &mut PollHealth) {
+        (
+            &mut integrations.discord_bot,
+            &mut integrations.discord_health,
+        )
     }
 
-    fn poll_discord(&mut self) -> Result<()> {
-        if self.integrations.discord_bot.is_none() {
-            return Ok(());
-        }
+    fn poll(&mut self) -> Result<Vec<ChatInbound>> {
+        Ok(self
+            .poll_commands()?
+            .into_iter()
+            .map(|msg| ChatInbound {
+                from_user_id: msg.from_user_id,
+                text: msg.text,
+                reply_to: background_tests::ChatReplyTarget::Discord,
+            })
+            .collect())
+    }
 
-        let messages = match self
-            .integrations
-            .discord_bot
-            .as_mut()
-            .expect("checked discord bot presence")
-            .poll_commands()
-        {
-            Ok(messages) => {
-                if let Some(transition) = self.integrations.discord_health.record_success() {
-                    self.report_integration_health("discord", transition, "");
-                }
-                messages
-            }
-            Err(error) => {
-                warn!(error = %error, "discord poll failed");
-                if let Some(transition) = self.integrations.discord_health.record_failure() {
-                    self.report_integration_health("discord", transition, &error.to_string());
-                }
-                return Ok(());
-            }
-        };
+    fn take_fault(&mut self) -> Option<String> {
+        self.take_message_content_fault()
+            .map(|fault| fault.status_message())
+    }
 
-        if let Some(fault) = self
-            .integrations
-            .discord_bot
-            .as_mut()
-            .and_then(|bot| bot.take_message_content_fault())
-        {
-            let message = fault.status_message();
-            warn!(message = %message, "discord message-content configuration fault");
-            self.record_loop_step_error("process_discord_queue", &message);
-        }
+    fn log_poll_failure(error: &anyhow::Error) {
+        warn!(error = %error, "discord poll failed");
+    }
 
-        if messages.is_empty() {
-            return Ok(());
-        }
+    fn parse_command(text: &str) -> Result<Option<TelegramCommand>> {
+        parse_discord_command(text)
+    }
 
-        let root = inbox::inboxes_root(&self.config.project_root);
-        let targets: Vec<String> = self
-            .config
-            .team_config
+    fn send_reply(&self, _to: &background_tests::ChatReplyTarget, text: &str) -> Result<()> {
+        self.send_command_reply(text)
+    }
+
+    fn inbox_targets(team_config: &TeamConfig) -> Vec<String> {
+        team_config
             .roles
             .iter()
             .filter(|role| {
                 role.role_type == RoleType::User && role.channel.as_deref() == Some("discord")
             })
             .flat_map(|role| role.talks_to.iter().cloned())
-            .collect();
-
-        for msg in messages {
-            info!(
-                from_user = msg.from_user_id,
-                text_len = msg.text.len(),
-                "discord inbound"
-            );
-
-            if let Some(reply) = self.handle_discord_command(&msg.text) {
-                if let Some(bot) = self.integrations.discord_bot.as_ref() {
-                    if let Err(error) = bot.send_command_reply(&reply) {
-                        warn!(error = %error, "failed to send discord command reply");
-                    }
-                }
-                continue;
-            }
-
-            for target in &targets {
-                let inbox_msg = inbox::InboxMessage::new_send("human", target, &msg.text);
-                if let Err(error) = inbox::deliver_to_inbox(&root, &inbox_msg) {
-                    warn!(
-                        to = %target,
-                        error = %error,
-                        "failed to deliver discord message to inbox"
-                    );
-                }
-            }
-
-            self.record_message_routed("human", "discord");
-        }
-
-        Ok(())
+            .collect()
     }
+}
 
-    fn handle_discord_command(&mut self, text: &str) -> Option<String> {
-        let command = match parse_discord_command(text) {
-            Ok(Some(command)) => command,
-            Ok(None) => return None,
-            Err(error) => return Some(error.to_string()),
-        };
-
-        Some(
-            match self.execute_chat_command(command, background_tests::ChatReplyTarget::Discord) {
-                Ok(reply) => reply,
-                Err(error) => format!("Command failed: {error}"),
-            },
-        )
+impl TeamDaemon {
+    pub(in crate::team::daemon) fn process_discord_queue(&mut self) -> Result<()> {
+        self.poll_chat_platform::<DiscordBot>()?;
+        self.sync_discord_events()?;
+        self.sync_discord_board();
+        self.deliver_user_channel_inbox()
     }
 
     fn sync_discord_events(&mut self) -> Result<()> {

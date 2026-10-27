@@ -1,10 +1,14 @@
-//! Telegram bridge orchestration for the daemon poll loop.
+//! Telegram bridge: platform specifics for the shared chat bridge flow.
 
 use anyhow::{Result, anyhow, bail};
-use tracing::{debug, info, warn};
 
+use super::super::background_tests::ChatReplyTarget;
+use super::super::integrations::Integrations;
 use super::super::*;
 use super::TelegramCommand;
+use super::bridge::{ChatInbound, ChatPlatform};
+use crate::team::integration_health::PollHealth;
+use crate::team::telegram::TelegramBot;
 
 pub(in crate::team::daemon) fn build_telegram_bot(
     team_config: &TeamConfig,
@@ -19,107 +23,55 @@ pub(in crate::team::daemon) fn build_telegram_bot(
         .and_then(crate::team::telegram::TelegramBot::from_config)
 }
 
-impl TeamDaemon {
-    pub(in crate::team::daemon) fn process_telegram_queue(&mut self) -> Result<()> {
-        self.poll_telegram()?;
-        self.deliver_user_channel_inbox()
+impl ChatPlatform for TelegramBot {
+    const NAME: &'static str = "telegram";
+
+    fn slot(integrations: &mut Integrations) -> (&mut Option<Self>, &mut PollHealth) {
+        (
+            &mut integrations.telegram_bot,
+            &mut integrations.telegram_health,
+        )
     }
 
-    fn poll_telegram(&mut self) -> Result<()> {
-        if self.integrations.telegram_bot.is_none() {
-            return Ok(());
+    fn poll(&mut self) -> Result<Vec<ChatInbound>> {
+        Ok(self
+            .poll_updates()?
+            .into_iter()
+            .map(|msg| ChatInbound {
+                from_user_id: msg.from_user_id,
+                text: msg.text,
+                reply_to: ChatReplyTarget::Telegram {
+                    chat_id: msg.chat_id,
+                },
+            })
+            .collect())
+    }
+
+    fn parse_command(text: &str) -> Result<Option<TelegramCommand>> {
+        parse_telegram_command(text)
+    }
+
+    fn send_reply(&self, to: &ChatReplyTarget, text: &str) -> Result<()> {
+        match to {
+            ChatReplyTarget::Telegram { chat_id } => self.send_message(&chat_id.to_string(), text),
+            _ => Ok(()),
         }
+    }
 
-        let messages = match self
-            .integrations
-            .telegram_bot
-            .as_mut()
-            .expect("checked telegram bot presence")
-            .poll_updates()
-        {
-            Ok(msgs) => {
-                if let Some(transition) = self.integrations.telegram_health.record_success() {
-                    self.report_integration_health("telegram", transition, "");
-                }
-                msgs
-            }
-            Err(error) => {
-                debug!(error = %error, "telegram poll failed");
-                if let Some(transition) = self.integrations.telegram_health.record_failure() {
-                    self.report_integration_health("telegram", transition, &error.to_string());
-                }
-                return Ok(());
-            }
-        };
-
-        if messages.is_empty() {
-            return Ok(());
-        }
-
-        let root = inbox::inboxes_root(&self.config.project_root);
-        let targets: Vec<String> = self
-            .config
-            .team_config
+    fn inbox_targets(team_config: &TeamConfig) -> Vec<String> {
+        team_config
             .roles
             .iter()
             .find(|role| role.role_type == RoleType::User)
             .map(|role| role.talks_to.clone())
-            .unwrap_or_default();
-
-        for msg in messages {
-            info!(
-                from_user = msg.from_user_id,
-                text_len = msg.text.len(),
-                "telegram inbound"
-            );
-
-            if let Some(reply) = self.handle_telegram_command(&msg) {
-                if let Some(bot) = self.integrations.telegram_bot.as_ref() {
-                    if let Err(error) = bot.send_message(&msg.chat_id.to_string(), &reply) {
-                        warn!(chat_id = msg.chat_id, error = %error, "failed to send telegram reply");
-                    }
-                }
-                continue;
-            }
-
-            for target in &targets {
-                let inbox_msg = inbox::InboxMessage::new_send("human", target, &msg.text);
-                if let Err(error) = inbox::deliver_to_inbox(&root, &inbox_msg) {
-                    warn!(
-                        to = %target,
-                        error = %error,
-                        "failed to deliver telegram message to inbox"
-                    );
-                }
-            }
-
-            self.record_message_routed("human", "telegram");
-        }
-
-        Ok(())
+            .unwrap_or_default()
     }
+}
 
-    fn handle_telegram_command(
-        &mut self,
-        msg: &crate::team::telegram::InboundMessage,
-    ) -> Option<String> {
-        let command = match parse_telegram_command(&msg.text) {
-            Ok(Some(command)) => command,
-            Ok(None) => return None,
-            Err(error) => return Some(error.to_string()),
-        };
-
-        Some(
-            match self.execute_chat_command(
-                command,
-                background_tests::ChatReplyTarget::Telegram {
-                    chat_id: msg.chat_id,
-                },
-            ) {
-                Ok(reply) => reply,
-                Err(error) => format!("Command failed: {error}"),
-            },
-        )
+impl TeamDaemon {
+    pub(in crate::team::daemon) fn process_telegram_queue(&mut self) -> Result<()> {
+        self.poll_chat_platform::<TelegramBot>()?;
+        self.deliver_user_channel_inbox()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -128,89 +80,6 @@ impl TeamDaemon {
         command: TelegramCommand,
     ) -> Result<String> {
         self.execute_chat_command(command, background_tests::ChatReplyTarget::None)
-    }
-
-    /// Warn and emit a team event when a chat integration's poll health flips.
-    pub(in crate::team::daemon) fn report_integration_health(
-        &mut self,
-        integration: &str,
-        transition: crate::team::integration_health::HealthTransition,
-        error: &str,
-    ) {
-        use crate::team::integration_health::HealthTransition;
-        match transition {
-            HealthTransition::BecameUnhealthy { failures } => {
-                warn!(integration, failures, error, "chat integration unhealthy");
-                self.emit_event(TeamEvent::integration_unhealthy(
-                    integration,
-                    failures,
-                    error,
-                ));
-            }
-            HealthTransition::Recovered { failures } => {
-                info!(integration, failures, "chat integration recovered");
-                self.emit_event(TeamEvent::integration_recovered(integration, failures));
-            }
-        }
-    }
-
-    pub(in crate::team::daemon) fn deliver_user_channel_inbox(&mut self) -> Result<()> {
-        let root = inbox::inboxes_root(&self.config.project_root);
-        let user_roles: Vec<String> = self
-            .config
-            .team_config
-            .roles
-            .iter()
-            .filter(|role| role.role_type == RoleType::User)
-            .map(|role| role.name.clone())
-            .collect();
-
-        for user_name in &user_roles {
-            let messages = match inbox::pending_messages(&root, user_name) {
-                Ok(msgs) => msgs,
-                Err(error) => {
-                    debug!(user = %user_name, error = %error, "failed to read user inbox");
-                    continue;
-                }
-            };
-
-            if messages.is_empty() {
-                continue;
-            }
-
-            for msg in &messages {
-                debug!(from = %msg.from, to = %user_name, id = %msg.id, "delivering to user channel");
-
-                let formatted = format!("--- Message from {} ---\n{}", msg.from, msg.body);
-                let send_result = match self.delivery.channels.get(user_name) {
-                    Some(channel) => channel.send(&formatted),
-                    None => {
-                        debug!(user = %user_name, "no channel for user role");
-                        break;
-                    }
-                };
-                if let Err(error) = send_result {
-                    // The channel logs real failures and backs off; leave the rest of
-                    // this inbox for a later poll instead of hammering a broken channel.
-                    debug!(to = %user_name, error = %error, "user channel send failed; deferring inbox");
-                    break;
-                }
-
-                info!(from = %msg.from, to = %user_name, id = %msg.id, "delivered to user channel");
-                let marked = inbox::mark_delivered(&root, user_name, &msg.id);
-                self.record_message_routed(&msg.from, user_name);
-                if let Err(error) = marked {
-                    // The message was sent but stays pending. Stop here so this
-                    // poll does not deliver further messages (and compound the
-                    // duplicates); the channel's recent-send dedup suppresses
-                    // the resend on the next poll.
-                    warn!(user = %user_name, id = %msg.id, error = %error, "failed to mark delivered; stopping delivery for this poll");
-                    break;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub(crate) fn automation_sender_for(&self, recipient: &str) -> String {
