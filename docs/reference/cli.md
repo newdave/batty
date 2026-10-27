@@ -20,7 +20,7 @@ Commands:
   retro                    Generate a run retrospective
   start                    Start the team daemon and tmux session
   stop                     Stop the team daemon and kill the tmux session
-  attach                   Attach to the running team tmux session
+  attach                   Attach to the running team tmux session, optionally jumping to a member
   status                   Show all team members and their states
   daemon-restart-if-stale  Safely rebuild and restart the daemon only when its binary is stale
   bench                    Prevent an engineer from receiving new auto-dispatch work
@@ -174,12 +174,16 @@ Options:
 
 ## `batty attach`
 
-Attach to the running team tmux session
+Attach to the running team tmux session, optionally jumping to a member
 
 ```text
-Attach to the running team tmux session
+Attach to the running team tmux session, optionally jumping to a member
 
-Usage: batty attach [OPTIONS]
+Usage: batty attach [OPTIONS] [MEMBER]
+
+Arguments:
+  [MEMBER]
+          Member whose window/pane to select (e.g. `architect`, `eng-1-1`)
 
 Options:
   -v, --verbose...
