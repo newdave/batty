@@ -149,6 +149,11 @@ The small rises in `thread::sleep`, `unsafe` and `let _` come from new process-g
 
 ## New issues found in this run
 
+> **Hotfix status (after this run):**
+> - N1 fixed in `d856ca5`, with a windows-mode lookup test that fails without the fix.
+> - N5 fixed in `9ae3e05`.
+> - N2 mitigated in `dee89ae`: `layout.mode` defaults to `panes` and `layout.keys` to `false`, so no batty key table is installed unless opted in. N2 affected every layout mode, not only windows. The key-table rework itself is still open.
+
 Ranked by severity. All were checked in code. N1 and the integration failure were also reproduced.
 
 | # | Severity | Issue | Evidence | Fix | Effort |
