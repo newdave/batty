@@ -59,10 +59,19 @@ pub(super) trait ChatPlatform: Sized {
     fn inbox_targets(team_config: &TeamConfig) -> Vec<String>;
 }
 
-/// Reply text telling a user that `count` of their messages were skipped.
+/// Counts at or above this are shown as "100+": the first poll only reads a
+/// bounded window of the backlog.
+const BACKLOG_DISPLAY_CAP: usize = 100;
+
+/// Reply text telling a user how many messages were skipped.
 fn offline_backlog_notice(count: usize) -> String {
+    let shown = if count >= BACKLOG_DISPLAY_CAP {
+        format!("{BACKLOG_DISPLAY_CAP}+")
+    } else {
+        count.to_string()
+    };
     format!(
-        "Batty restarted; ignored {count} message(s) sent while it was offline. \
+        "Batty restarted; ignored {shown} message(s) sent while it was offline. \
          Resend any commands you still need."
     )
 }
@@ -334,6 +343,13 @@ mod tests {
             "Batty restarted; ignored 3 message(s) sent while it was offline. \
              Resend any commands you still need."
         );
+    }
+
+    #[test]
+    fn large_backlog_notice_is_capped_at_100_plus() {
+        assert!(offline_backlog_notice(99).contains("ignored 99 message(s)"));
+        assert!(offline_backlog_notice(100).contains("ignored 100+ message(s)"));
+        assert!(offline_backlog_notice(4321).contains("ignored 100+ message(s)"));
     }
 
     #[test]

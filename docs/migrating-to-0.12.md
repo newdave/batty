@@ -33,7 +33,18 @@ a later release fixes the key table.
 ### `batty status`
 
 The default view is a summary plus a compact table. Use `batty status --wide`
-for every column. Scripts should use `batty status --json`, which is unchanged.
+for every column; when stdout is not a terminal, `--wide` prints full rows with
+no fitting or truncation. `batty status --watch` exits with a non-zero status on
+the first error when stdout is not a terminal (on a terminal it keeps retrying
+and shows the error). Scripts should use `batty status --json`, which is
+unchanged.
+
+### `batty init`
+
+`batty init --agent X` keeps the template's comments and any valid `model` and
+`effort` pins, and reports the pins it drops. This applies to `--agent` only:
+choosing an agent through the interactive prompts rewrites the file and drops
+comments.
 
 ### `batty config --json`
 
@@ -77,9 +88,17 @@ telemetry:
 ### Chat integrations
 
 - Commands sent while the daemon was down are still ignored, but batty now
-  replies once per chat to say how many were skipped.
+  replies once per chat with the number it skipped (the first poll counts the
+  real backlog, shown as `100+` at 100 or more).
+- `batty start` no longer refuses an unknown `channel:` or an empty Telegram
+  `target`; it prints a warning and starts. `batty validate` still reports both
+  as errors. `batty start` never runs the provider `--version` probe; only
+  `batty validate` does (5 second timeout, once per process).
 - The openclaw provider is called with `--channel telegram --target <id>`. Older
-  openclaw releases that only accept `--to` are handled by an automatic fallback.
+  openclaw releases, or any provider that rejects `--channel`/`--target`
+  ("unknown", "unrecognized", "unexpected" or "invalid" naming either flag), are
+  handled by an automatic fallback to `--to`. Batty tries the modern form again
+  once a day, so an upgraded provider is picked up without a restart.
 
 ### Task status moves
 
@@ -91,7 +110,7 @@ the manager.
 
 These keys still load but have no effect, and `batty validate` warns about them:
 `automation.commit_before_reset`, `workflow_policy.narration_threshold`,
-`workflow_policy.narration_nudge_max`, `replenishment_threshold`,
+`workflow_policy.narration_nudge_max`, `automation.replenishment_threshold`,
 `auto_respawn_on_crash`, `capability_overrides` and role `owns`. Remove them when
 convenient.
 

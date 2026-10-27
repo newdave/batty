@@ -940,6 +940,11 @@ pub fn start_team(project_root: &Path, attach: bool) -> Result<String> {
     let team_config = config::TeamConfig::load(&config_path)?;
     team_config.validate()?;
     team_config.validate_project_refs(project_root)?;
+    // Channel problems are reported but never block start (use `batty validate`
+    // for the strict check); no provider process is spawned here.
+    for diagnostic in team_config.channel_start_diagnostics() {
+        eprintln!("warning: {diagnostic}");
+    }
 
     if team_config.workflow_policy.verification.auto_run_tests {
         super::task_loop::resolve_test_command(

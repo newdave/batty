@@ -22,6 +22,11 @@ pub struct InboundMessage {
     pub text: String,
 }
 
+/// Updates requested per `getUpdates` call (the Bot API maximum).
+const UPDATES_PAGE_LIMIT: usize = 100;
+/// Pages read while draining the startup backlog (bounds the first poll).
+const MAX_BACKLOG_PAGES: usize = 20;
+
 /// Blocking Telegram Bot API client.
 pub struct TelegramBot {
     bot_token: String,
@@ -219,38 +224,64 @@ impl TelegramBot {
     ///
     /// Unauthorized messages are silently dropped (logged at debug level).
     pub fn poll_updates(&mut self) -> Result<Vec<InboundMessage>> {
-        // The first poll after startup uses offset=-1, which returns only the
-        // newest update and acknowledges everything before it. Its messages
-        // are skipped so commands handled by a previous run (and replayed by
-        // Telegram until acknowledged) are not executed again.
-        let offset = if self.seeded {
-            self.last_update_offset
-        } else {
-            -1
-        };
-        let url = format!(
-            "https://api.telegram.org/bot{}/getUpdates?offset={offset}&timeout=0",
-            self.bot_token
-        );
-
-        let resp = super::http::agent().get(&url).call();
-
-        let body: serde_json::Value = match resp {
-            Ok(r) => r.into_json()?,
-            Err(e) => {
-                let e = redact_token(&e.to_string(), &self.bot_token);
-                warn!(error = %e, "getUpdates failed");
-                bail!("Telegram getUpdates failed: {e}");
-            }
-        };
-
+        if !self.seeded {
+            let token = self.bot_token.clone();
+            return self.seed_from_backlog(|offset| Self::get_updates(&token, offset));
+        }
+        let body = Self::get_updates(&self.bot_token, self.last_update_offset)?;
         let (messages, new_offset) =
             parse_updates_response(&body, &self.allowed_user_ids, self.last_update_offset);
         Ok(self.advance_update_cursor(messages, new_offset))
     }
 
+    fn get_updates(bot_token: &str, offset: i64) -> Result<serde_json::Value> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/getUpdates?offset={offset}&limit={UPDATES_PAGE_LIMIT}&timeout=0",
+            bot_token
+        );
+        match super::http::agent().get(&url).call() {
+            Ok(r) => Ok(r.into_json()?),
+            Err(e) => {
+                let e = redact_token(&e.to_string(), bot_token);
+                warn!(error = %e, "getUpdates failed");
+                bail!("Telegram getUpdates failed: {e}");
+            }
+        }
+    }
+
+    /// First poll after startup: read the pending updates from offset 0 (the
+    /// Bot API returns every unacknowledged update, oldest first, up to the
+    /// limit), count the authorized messages, and acknowledge past the last
+    /// one by advancing the offset. Nothing is processed, so commands handled
+    /// by a previous run (and replayed by Telegram until acknowledged) are
+    /// not executed again. A full page means more may be pending, so keep
+    /// reading (bounded) until the backlog is drained.
+    fn seed_from_backlog(
+        &mut self,
+        mut fetch: impl FnMut(i64) -> Result<serde_json::Value>,
+    ) -> Result<Vec<InboundMessage>> {
+        let mut skipped = Vec::new();
+        let mut offset = 0;
+        for _ in 0..MAX_BACKLOG_PAGES {
+            let body = fetch(offset)?;
+            let raw = body
+                .get("result")
+                .and_then(|r| r.as_array())
+                .map_or(0, Vec::len);
+            let (messages, new_offset) =
+                parse_updates_response(&body, &self.allowed_user_ids, offset);
+            skipped.extend(messages);
+            let advanced = new_offset > offset;
+            offset = new_offset;
+            if raw < UPDATES_PAGE_LIMIT || !advanced {
+                break;
+            }
+        }
+        Ok(self.advance_update_cursor(skipped, offset))
+    }
+
     /// Chats that sent messages while Batty was offline, with how many were
-    /// skipped. Returns each entry once; empty after the first call.
+    /// skipped (the real count, which the bridge notice caps at "100+"). Returns each entry once; empty after the first call.
     pub fn take_skipped_backlog(&mut self) -> Vec<(i64, usize)> {
         std::mem::take(&mut self.skipped_backlog)
     }
@@ -684,6 +715,37 @@ mod tests {
         let second = bot.advance_update_cursor(vec![message("/status")], 102);
         assert_eq!(second.len(), 1);
         assert_eq!(bot.last_update_offset, 102);
+    }
+
+    fn update(id: i64, chat: i64, text: &str) -> serde_json::Value {
+        serde_json::json!({"update_id": id, "message": {
+            "from": {"id": 42}, "chat": {"id": chat}, "text": text}})
+    }
+
+    #[test]
+    fn first_poll_counts_real_backlog_across_pages_and_acknowledges() {
+        let mut bot = TelegramBot::new("token".to_string(), vec![42]);
+        let mut offsets = Vec::new();
+        let result = bot.seed_from_backlog(|offset| {
+            offsets.push(offset);
+            // Page 1 is full (100 updates, chat 7); page 2 holds 5 more.
+            let (from, n) = if offset == 0 { (1, 100) } else { (101, 5) };
+            Ok(serde_json::json!({"ok": true, "result":
+                (from..from + n).map(|i| update(i, 7, "/status")).collect::<Vec<_>>()}))
+        });
+        assert!(result.unwrap().is_empty());
+        assert_eq!(offsets, vec![0, 101], "must start at 0 and ack page one");
+        assert_eq!(bot.last_update_offset, 106);
+        assert_eq!(bot.take_skipped_backlog(), vec![(7, 105)]);
+    }
+
+    #[test]
+    fn first_poll_with_empty_backlog_reports_nothing() {
+        let mut bot = TelegramBot::new("token".to_string(), vec![42]);
+        bot.seed_from_backlog(|_| Ok(serde_json::json!({"ok": true, "result": []})))
+            .unwrap();
+        assert!(bot.take_skipped_backlog().is_empty());
+        assert_eq!(bot.last_update_offset, 0);
     }
 
     #[test]

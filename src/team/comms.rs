@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
@@ -154,9 +154,12 @@ pub struct TelegramChannel {
     provider: String,
     recent_sends: RecentTelegramSends,
     backoff: SendBackoff,
-    /// Set once the provider has rejected `--channel`/`--target`; later sends
-    /// go straight to the legacy `--to` form.
-    use_legacy_args: AtomicBool,
+    /// Unix seconds when the provider last rejected `--channel`/`--target` and
+    /// the legacy `--to` form worked (0 = never). Later sends use the legacy
+    /// form until `legacy_reprobe_after` has passed, then try the modern form
+    /// once more so an upgraded provider is picked up without a restart.
+    legacy_since: AtomicU64,
+    legacy_reprobe_after: Duration,
 }
 
 impl TelegramChannel {
@@ -184,7 +187,8 @@ impl TelegramChannel {
             provider,
             recent_sends: RecentTelegramSends::new(ttl, capacity),
             backoff: SendBackoff::default(),
-            use_legacy_args: AtomicBool::new(false),
+            legacy_since: AtomicU64::new(0),
+            legacy_reprobe_after: LEGACY_REPROBE_INTERVAL,
         }
     }
 }
@@ -225,7 +229,9 @@ impl TelegramChannel {
                 .output()
         };
 
-        let legacy = self.use_legacy_args.load(Ordering::Relaxed);
+        let now = unix_now_secs();
+        let since = self.legacy_since.load(Ordering::Relaxed);
+        let legacy = since != 0 && now.saturating_sub(since) < self.legacy_reprobe_after.as_secs();
         let mut output = run(legacy);
         if !legacy
             && let Ok(out) = &output
@@ -235,7 +241,7 @@ impl TelegramChannel {
             debug!(provider = %self.provider, "provider rejected --target; retrying with legacy --to form");
             let retry = run(true);
             if matches!(&retry, Ok(out) if out.status.success()) {
-                self.use_legacy_args.store(true, Ordering::Relaxed);
+                self.legacy_since.store(now.max(1), Ordering::Relaxed);
             }
             output = retry;
         }
@@ -284,12 +290,28 @@ fn provider_send_args_legacy<'a>(target: &'a str, message: &'a str) -> [&'a str;
     ["message", "send", "--to", target, "--message", message]
 }
 
-/// True when stderr says the provider does not know `--channel` or `--target`.
+/// How long the legacy `--to` form is remembered before the modern form is
+/// probed again.
+const LEGACY_REPROBE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// True when stderr rejects `--channel` or `--target`: it names one of those
+/// flags together with a rejection word ("unknown", "unrecognized",
+/// "unexpected" or "invalid"), whatever argument parser the provider uses.
 fn is_unknown_modern_flag(stderr: &str) -> bool {
-    ["--channel", "--target"].iter().any(|flag| {
-        stderr.contains(&format!("unknown option '{flag}'"))
-            || stderr.contains(&format!("unknown option \"{flag}\""))
-    })
+    let text = stderr.to_ascii_lowercase();
+    let rejected = ["unknown", "unrecognized", "unexpected", "invalid"]
+        .iter()
+        .any(|word| text.contains(word));
+    rejected
+        && ["--channel", "--target"]
+            .iter()
+            .any(|flag| text.contains(flag))
 }
 
 /// Native Telegram channel using the Bot API directly (no CLI provider).
@@ -732,6 +754,31 @@ mod tests {
         ));
         assert!(!is_unknown_modern_flag("error: unknown option '--to'"));
         assert!(!is_unknown_modern_flag("network unreachable"));
+        assert!(is_unknown_modern_flag(
+            "error: unrecognized arguments: --target 1"
+        ));
+        assert!(is_unknown_modern_flag(
+            "Error: Unexpected argument '--channel' found"
+        ));
+        assert!(is_unknown_modern_flag("invalid option --target"));
+        assert!(!is_unknown_modern_flag("unknown chat id 12345"));
+        assert!(!is_unknown_modern_flag("unknown option '--to'"));
+    }
+
+    #[test]
+    fn telegram_send_reprobes_modern_form_after_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("provider.log");
+        let provider = write_legacy_only_provider(tmp.path(), &log_path);
+        let mut ch = TelegramChannel::new("12345".into(), provider);
+        ch.legacy_reprobe_after = Duration::ZERO;
+
+        ch.send("one").unwrap();
+        ch.send("two").unwrap();
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        let modern_attempts = log.lines().filter(|l| l.contains("--target")).count();
+        assert_eq!(modern_attempts, 2, "modern form must be re-probed:\n{log}");
     }
 
     #[test]

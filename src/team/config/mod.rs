@@ -454,10 +454,17 @@ impl TeamConfig {
             }
         }
 
+        Ok(())
+    }
+
+    /// `validate()` plus channel configuration errors (unknown channel, empty
+    /// Telegram target). Used by `batty validate`; `batty start` only warns
+    /// about these so existing configs keep starting.
+    pub fn validate_strict(&self) -> Result<()> {
+        self.validate()?;
         if let Some(error) = self.channel_error() {
             bail!("{error}");
         }
-
         Ok(())
     }
 

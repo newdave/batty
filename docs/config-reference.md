@@ -83,6 +83,7 @@ workflow_policy:
     auto_run_tests: true
     require_evidence: true
     test_command: cargo test
+    timeout_secs: 3600   # background verification/post-merge test limit; 0 disables
   claim_ttl:
     default_secs: 1800
     critical_secs: 900
@@ -226,12 +227,22 @@ These toggles turn runtime recovery systems on or off.
 - `manager_dispatch_interventions` and `architect_utilization_interventions`
   keep the hierarchy moving when reports go idle
 - `failure_pattern_detection` feeds long-running reliability analysis
+- `replenishment_threshold` has no effect; remove `automation.replenishment_threshold`
+  (see the migration guide)
+
+## `telemetry`
+
+- `retention_days` (default 90): telemetry rows older than this are deleted,
+  first on daemon startup and then every 24 hours. `0` keeps everything.
 
 ## `workflow_policy`
 
 This block controls execution quality and merge safety.
 
-- `verification`: completion retry limits and test command policy
+- `verification`: completion retry limits and test command policy.
+  `verification.timeout_secs` (default 3600) kills a background verification or
+  post-merge test job that runs longer and counts it as a failure; `0` disables
+  the limit
 - `claim_ttl`: stale-ownership reclaim timings
 - `allocation`: scored assignment weights
 - `main_smoke`: periodic `main` smoke test and dispatch-gate policy
@@ -269,11 +280,21 @@ Common fields:
 
 With `provider: openclaw` and no bot token, Batty runs
 `openclaw message send --channel telegram --target <id> --message <text>`.
-If the provider rejects `--channel` or `--target` (`unknown option`), Batty retries
-once with the legacy `--to <id>` form and uses that form for the rest of the run.
+If the provider rejects `--channel` or `--target` (stderr names the flag together
+with "unknown", "unrecognized", "unexpected" or "invalid"), Batty retries once
+with the legacy `--to <id>` form and uses it for later sends. It tries the modern
+form again after 24 hours.
 The `--target` form was verified against openclaw 2026.5.26; the exact first
 release that introduced it is not documented. `batty validate` warns (never errors)
-when `<provider> --version` reports something older than 2026.5.26.
+when `<provider> --version` reports something older than 2026.5.26. The version
+probe runs only in `batty validate`, with a 5 second timeout, once per process.
+
+### Channel validation
+
+`batty validate` reports an unknown `channel:` or an empty Telegram `target` as
+an error. `batty start` only prints a warning for the same problems and starts
+anyway (the integration cannot deliver until you fix it), and never runs the
+provider version probe.
 
 ## Recommended Defaults For Unattended Teams
 

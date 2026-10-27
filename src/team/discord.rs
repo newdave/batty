@@ -443,19 +443,7 @@ impl DiscordBot {
     }
 
     pub fn poll_commands(&mut self) -> Result<Vec<InboundMessage>> {
-        // With no cursor yet (fresh daemon start), only fetch the newest
-        // message to seed the cursor. Processing the backlog would re-run old
-        // commands such as $merge or $assign on every restart.
-        let url = match &self.last_message_id {
-            Some(last_id) => format!(
-                "{DISCORD_API_BASE}/channels/{}/messages?limit=100&after={last_id}",
-                self.commands_channel_id
-            ),
-            None => format!(
-                "{DISCORD_API_BASE}/channels/{}/messages?limit=1",
-                self.commands_channel_id
-            ),
-        };
+        let url = self.poll_url();
 
         let response = super::http::agent()
             .get(&url)
@@ -484,6 +472,24 @@ impl DiscordBot {
             parse_messages_response(&json, &self.allowed_user_ids)?;
         self.last_message_content_fault = message_content_fault;
         Ok(self.advance_command_cursor(messages, latest_message_id))
+    }
+
+    /// With no cursor yet (fresh daemon start), fetch the 100 most recent
+    /// messages (Discord returns the latest ones when `after` is absent) to
+    /// seed the cursor and count what was sent while offline. Processing them
+    /// would re-run old commands such as $merge or $assign on every restart.
+    /// (`after=0` would return the *oldest* messages, so it is not used.)
+    fn poll_url(&self) -> String {
+        match &self.last_message_id {
+            Some(last_id) => format!(
+                "{DISCORD_API_BASE}/channels/{}/messages?limit=100&after={last_id}",
+                self.commands_channel_id
+            ),
+            None => format!(
+                "{DISCORD_API_BASE}/channels/{}/messages?limit=100",
+                self.commands_channel_id
+            ),
+        }
     }
 
     /// Advance the command cursor and return the messages to process. The
@@ -1460,6 +1466,19 @@ mod tests {
         let second = bot.advance_command_cursor(vec![message("1002")], Some("1002".to_string()));
         assert_eq!(second, vec![message("1002")]);
         assert_eq!(bot.last_message_id.as_deref(), Some("1002"));
+    }
+
+    #[test]
+    fn first_poll_url_fetches_recent_window_and_later_polls_use_cursor() {
+        let mut bot = DiscordBot::new("token".to_string(), vec![42], "55".to_string());
+        let first = bot.poll_url();
+        assert!(
+            first.ends_with("/channels/55/messages?limit=100"),
+            "{first}"
+        );
+        assert!(!first.contains("after="));
+        bot.last_message_id = Some("77".to_string());
+        assert!(bot.poll_url().ends_with("limit=100&after=77"));
     }
 
     #[test]

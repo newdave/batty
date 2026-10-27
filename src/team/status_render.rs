@@ -31,6 +31,9 @@ pub(crate) struct RenderOptions {
     pub(crate) width: usize,
     pub(crate) color: bool,
     pub(crate) wide: bool,
+    /// Print member rows at full natural width, with no fitting or truncation
+    /// (`--wide` when stdout is not a terminal, so pipes get complete rows).
+    pub(crate) unfitted: bool,
 }
 
 /// One thing the operator should look at, in plain language.
@@ -708,7 +711,14 @@ pub(crate) fn render_members(view: &StatusView<'_>, opts: &RenderOptions) -> Str
         return "No team members configured.\n".to_string();
     }
     let cols = build_columns(view, opts.wide);
-    let widths = fit_widths(&cols, opts.width);
+    let widths = fit_widths(
+        &cols,
+        if opts.unfitted {
+            usize::MAX
+        } else {
+            opts.width
+        },
+    );
     let gap = " ".repeat(COLUMN_GAP);
     let last = cols.len() - 1;
     let pad = |text: &str, w: usize, right: bool, is_last: bool| {
@@ -887,6 +897,7 @@ mod tests {
             width,
             color: false,
             wide: false,
+            unfitted: false,
         }
     }
 
@@ -976,6 +987,29 @@ eng-1-3    engineer   ○ idle     -                        -  -
         for header in ["MEMBER", "ROLE", "AGENT", "STATE", "INBOX", "SIGNAL"] {
             assert!(out.contains(header), "{header} missing:\n{out}");
         }
+    }
+
+    #[test]
+    fn wide_unfitted_prints_full_rows_without_truncation() {
+        let mut f = fixture();
+        f.rows[4].signal = Some("nudged-with-a-very-long-signal-name-that-would-be-cut".into());
+        let narrow = RenderOptions {
+            wide: true,
+            ..opts(40)
+        };
+        let fitted = render_members(&view(&f, true), &narrow);
+        assert!(!fitted.contains("nudged-with-a-very-long-signal-name-that-would-be-cut"));
+        let full = render_members(
+            &view(&f, true),
+            &RenderOptions {
+                unfitted: true,
+                ..narrow
+            },
+        );
+        assert!(
+            full.contains("nudged-with-a-very-long-signal-name-that-would-be-cut"),
+            "{full}"
+        );
     }
 
     #[test]

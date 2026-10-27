@@ -1,8 +1,9 @@
 //! Validation of per-role chat channel configuration.
 //!
-//! Unknown channels and missing targets are errors (the daemon could never
-//! deliver). Missing credentials are warnings: the daemon degrades to a
-//! disabled integration instead of refusing to start.
+//! Unknown channels and missing targets are errors for `batty validate` (the
+//! daemon could never deliver), but `batty start` only warns about them so an
+//! existing config keeps starting. Missing credentials are warnings: the
+//! daemon degrades to a disabled integration instead of refusing to start.
 
 use std::path::{Path, PathBuf};
 
@@ -64,15 +65,70 @@ fn parse_version(text: &str) -> Option<Vec<u64>> {
     })
 }
 
-/// Run `<provider> --version`; `None` when it fails or prints nothing.
-fn provider_version_output(path: &Path) -> Option<String> {
-    let out = std::process::Command::new(path)
+/// Longest a `<provider> --version` probe may run.
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `<provider> --version` with a timeout; `None` when it fails, times out
+/// or prints nothing. The child is killed on timeout.
+fn run_version_probe(path: &Path, timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(path)
         .arg("--version")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    let mut stdout = child.stdout.take()?;
+    // Read on a helper thread so a child that never exits cannot block us.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let remaining = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(std::time::Duration::from_millis(200));
+    let bytes = rx.recv_timeout(remaining).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Cached per process, keyed by provider path, so repeated validation never
+/// re-spawns a provider.
+fn provider_version_output(path: &Path) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().ok()?.get(path) {
+        return hit.clone();
+    }
+    let result = run_version_probe(path, VERSION_PROBE_TIMEOUT);
+    cache
+        .lock()
+        .ok()?
+        .insert(path.to_path_buf(), result.clone());
+    result
 }
 
 fn env_token_present(var: &str) -> bool {
@@ -81,8 +137,32 @@ fn env_token_present(var: &str) -> bool {
 
 impl TeamConfig {
     /// Check every role that configures a channel.
+    ///
+    /// Runs the (cached, time-bounded) provider `--version` probe, so only
+    /// `batty validate` should call this.
     pub fn channel_checks(&self) -> Vec<ChannelCheck> {
         self.channel_checks_with(&find_binary, &env_token_present, &provider_version_output)
+    }
+
+    /// Like [`Self::channel_checks`] but never spawns a provider process.
+    pub fn channel_checks_no_probe(&self) -> Vec<ChannelCheck> {
+        self.channel_checks_with(&find_binary, &env_token_present, &|_| None)
+    }
+
+    /// Messages `batty start` shows for channel problems: errors that
+    /// `batty validate` would reject plus warnings. Start never refuses on
+    /// these and never probes providers.
+    pub fn channel_start_diagnostics(&self) -> Vec<String> {
+        self.channel_checks_no_probe()
+            .into_iter()
+            .filter(|check| check.level != ChannelCheckLevel::Pass)
+            .map(|check| match check.level {
+                ChannelCheckLevel::Error => {
+                    format!("{} (batty validate reports this as an error)", check.detail)
+                }
+                _ => check.detail,
+            })
+            .collect()
     }
 
     fn channel_checks_with(
@@ -241,7 +321,7 @@ impl TeamConfig {
         checks
     }
 
-    /// First channel configuration error, if any.
+    /// First channel configuration error, if any (probes providers).
     pub fn channel_error(&self) -> Option<String> {
         self.channel_checks()
             .into_iter()
@@ -283,6 +363,61 @@ mod tests {
             commands_channel_id: Some("9".to_string()),
             ..Default::default()
         }
+    }
+
+    #[cfg(unix)]
+    fn script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("provider.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_times_out_and_kills_hung_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(dir.path(), "sleep 30");
+        let started = std::time::Instant::now();
+        let out = run_version_probe(&path, std::time::Duration::from_millis(300));
+        assert!(out.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_returns_output_and_is_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("count");
+        let path = script(
+            dir.path(),
+            &format!("echo x >> {}; echo 2026.5.26", counter.display()),
+        );
+        assert_eq!(
+            provider_version_output(&path).as_deref().map(str::trim),
+            Some("2026.5.26")
+        );
+        provider_version_output(&path);
+        assert_eq!(std::fs::read_to_string(counter).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn start_diagnostics_include_errors_and_never_probe() {
+        let config = team(Some("slack"), None);
+        let diagnostics = config.channel_start_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("unknown channel 'slack'"))
+        );
+        let config = team(Some("telegram"), Some(cc("", "", None)));
+        assert!(
+            config
+                .channel_start_diagnostics()
+                .iter()
+                .any(|d| d.contains("empty target"))
+        );
     }
 
     fn run(config: &TeamConfig, bin: Option<&str>, env: bool) -> Vec<ChannelCheck> {
@@ -447,7 +582,10 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_channel_and_empty_telegram_target() {
         let unknown = parse(&BASE.replace("CHANNEL", "slack").replace("TARGET", "\"1\""));
-        let error = unknown.validate().unwrap_err().to_string();
+        unknown
+            .validate()
+            .expect("start-path validate must not refuse");
+        let error = unknown.validate_strict().unwrap_err().to_string();
         assert!(error.contains("unknown channel 'slack'"), "{error}");
 
         let empty = parse(
@@ -455,7 +593,10 @@ mod tests {
                 .replace("CHANNEL", "telegram")
                 .replace("TARGET", "\"\""),
         );
-        let error = empty.validate().unwrap_err().to_string();
+        empty
+            .validate()
+            .expect("start-path validate must not refuse");
+        let error = empty.validate_strict().unwrap_err().to_string();
         assert!(error.contains("empty target"), "{error}");
 
         let ok = parse(
@@ -463,7 +604,7 @@ mod tests {
                 .replace("CHANNEL", "telegram")
                 .replace("TARGET", "\"1\""),
         );
-        ok.validate().unwrap();
+        ok.validate_strict().unwrap();
     }
 
     #[test]

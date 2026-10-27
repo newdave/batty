@@ -9,13 +9,14 @@ intent enabled in the Discord Developer Portal.
 
 Batty never replays `#commands` messages that were posted while the daemon was
 down, so an old `$merge` or `$assign` is not executed again after a restart. On
-the first poll after startup Batty reads only the newest message to set its
-cursor and ignores it. If that skipped an authorized command, Batty posts one
-reply in `#commands`:
+the first poll after startup Batty reads the 100 most recent messages in
+`#commands`, counts the authorized ones, sets its cursor past them and ignores
+them. If that skipped anything, Batty posts one reply in `#commands`:
 
 > Batty restarted; ignored N message(s) sent while it was offline. Resend any
 > commands you still need.
 
-Because only the newest message is read on that first poll, `N` is a lower
-bound. Messages from the bot itself and from users outside `allowed_user_ids`
-are not counted.
+`N` counts authorized messages among those 100, shown as `100+` when it reaches
+100; if the channel had more than 100 newer messages the count is a lower bound.
+Messages from the bot itself and from users outside `allowed_user_ids` are not
+counted.

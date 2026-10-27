@@ -371,10 +371,10 @@ pub fn team_status(project_root: &Path, options: StatusOptions) -> Result<()> {
     loop {
         let (cols, rows) = status_render::tty_size().unzip();
         let width = status_render::resolve_width(std::env::var("COLUMNS").ok().as_deref(), cols);
-        let mut frame = match render_team_status(project_root, options, width, color, true) {
-            Ok(frame) => frame,
-            Err(error) => format!("status unavailable: {error:#}\n"),
-        };
+        let mut frame = watch_frame(
+            render_team_status(project_root, options, width, color, true),
+            is_tty,
+        )?;
         frame.push_str(&format!(
             "Updated {} · refreshing every {interval}s\n",
             chrono::Local::now().format("%H:%M:%S")
@@ -397,6 +397,17 @@ pub fn team_status(project_root: &Path, options: StatusOptions) -> Result<()> {
         }
         std::io::stdout().flush().ok();
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+/// Turn one render result into a watch frame. On a terminal an error is shown
+/// in place and the loop keeps retrying; when piped there is nobody to watch,
+/// so the first error ends the command with a failure status.
+fn watch_frame(result: Result<String>, is_tty: bool) -> Result<String> {
+    match result {
+        Ok(frame) => Ok(frame),
+        Err(error) if is_tty => Ok(format!("status unavailable: {error:#}\n")),
+        Err(error) => Err(error),
     }
 }
 
@@ -542,7 +553,12 @@ fn render_team_status(
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&report)?)?;
     } else {
-        let render_opts = status_render::RenderOptions { width, color, wide };
+        let render_opts = status_render::RenderOptions {
+            width,
+            color,
+            wide,
+            unfitted: wide && !std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        };
         let view = status_render::StatusView {
             team: &team_config.name,
             session: &session,
@@ -775,7 +791,7 @@ pub fn validate_team(project_root: &Path, verbose: bool) -> Result<()> {
             bail!("validation failed — see FAIL checks above");
         }
     } else {
-        team_config.validate()?;
+        team_config.validate_strict()?;
         for warning in team_config.channel_warnings() {
             println!("[WARN] {warning}");
         }
@@ -824,6 +840,16 @@ pub fn validate_team(project_root: &Path, verbose: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_frame_exits_on_error_when_piped_and_retries_on_tty() {
+        let err = || Err(anyhow::anyhow!("no team config"));
+        let piped = watch_frame(err(), false).unwrap_err().to_string();
+        assert!(piped.contains("no team config"));
+        let tty = watch_frame(err(), true).unwrap();
+        assert!(tty.contains("status unavailable: no team config"), "{tty}");
+        assert_eq!(watch_frame(Ok("ok\n".into()), false).unwrap(), "ok\n");
+    }
     use crate::team::TRIAGE_RESULT_FRESHNESS_SECONDS;
     use crate::team::config::RoleType;
     use crate::team::hierarchy;
