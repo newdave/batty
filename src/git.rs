@@ -441,9 +441,11 @@ impl GitCommand {
             Ok(None) => {
                 terminate_child(&mut child, grouped, KILL_GRACE);
                 if !self.skip_lock_cleanup
+                    && grouped
+                    && writes_index(subcommand_of(&self.args).as_deref())
                     && let Some(repo) = &self.repo
                 {
-                    remove_stale_index_lock(repo, spawned_at, grouped.then_some(pid));
+                    remove_stale_index_lock(repo, spawned_at, SystemTime::now(), Some(pid));
                 }
                 let streams = collect(&rx, pending, Instant::now() + DRAIN_GRACE);
                 return Err(GitError::Timeout {
@@ -688,18 +690,52 @@ fn kill_group_by_pid(pid: u32, grouped: bool) {
     }
 }
 
-/// After a killed command, remove `index.lock` if it is a leftover of that
-/// command: modified at or after `spawned_at`, with no process left in the
-/// command's group (`pgid`, when it ran in its own group). A lock that
-/// predates the command, or one a live process in the group may still own, is
-/// left alone. Returns whether a lock was removed.
-fn remove_stale_index_lock(repo: &Path, spawned_at: SystemTime, pgid: Option<u32>) -> bool {
+/// Subcommands that take `index.lock`. A timed-out `fetch`, `push`, `clone`
+/// and the like never own it, so a lock found after one is someone else's.
+const INDEX_WRITING_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "commit",
+    "reset",
+    "checkout",
+    "switch",
+    "restore",
+    "merge",
+    "rebase",
+    "stash",
+    "cherry-pick",
+    "revert",
+    "apply",
+    "rm",
+    "mv",
+    "pull",
+];
+
+fn writes_index(subcommand: Option<&str>) -> bool {
+    subcommand.is_some_and(|sub| INDEX_WRITING_SUBCOMMANDS.contains(&sub))
+}
+
+/// How long the lock must stay unchanged before it is removed.
+const LOCK_RECHECK: Duration = Duration::from_millis(300);
+
+/// After a killed index-writing command, remove `index.lock` only when it is
+/// clearly that command's leftover: the command ran in its own process group
+/// (`pgid`) and that group is gone, the lock was last modified within the
+/// command's run (`spawned_at..=ended_at`), and it is unchanged (size and
+/// mtime) after a short recheck, so a live writer is not mistaken for a
+/// leftover. Otherwise warn and leave it. Returns whether a lock was removed.
+fn remove_stale_index_lock(
+    repo: &Path,
+    spawned_at: SystemTime,
+    ended_at: SystemTime,
+    pgid: Option<u32>,
+) -> bool {
+    let Some(_pgid) = pgid else {
+        return false;
+    };
     #[cfg(unix)]
-    if pgid.is_some_and(group_alive) {
+    if group_alive(_pgid) {
         return false;
     }
-    #[cfg(not(unix))]
-    let _ = pgid;
     let mut probe = cmd(repo).args(["rev-parse", "--git-path", "index.lock"]);
     probe.skip_lock_cleanup = true;
     let Ok(raw) = probe.timeout(Duration::from_secs(10)).stdout() else {
@@ -709,10 +745,27 @@ fn remove_stale_index_lock(repo: &Path, spawned_at: SystemTime, pgid: Option<u32
         return false;
     }
     let lock = repo.join(raw);
-    let Ok(modified) = std::fs::metadata(&lock).and_then(|meta| meta.modified()) else {
+    let stamp = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| Ok((meta.len(), meta.modified()?)))
+            .ok()
+    };
+    let Some(first) = stamp(&lock) else {
         return false;
     };
-    if modified < spawned_at {
+    if first.1 < spawned_at || first.1 > ended_at {
+        tracing::warn!(
+            lock = %lock.display(),
+            "index.lock was not modified during the timed-out git command; leaving it"
+        );
+        return false;
+    }
+    std::thread::sleep(LOCK_RECHECK);
+    if stamp(&lock) != Some(first) {
+        tracing::warn!(
+            lock = %lock.display(),
+            "index.lock is still changing after a timed-out git command; leaving it"
+        );
         return false;
     }
     match std::fs::remove_file(&lock) {
@@ -1080,6 +1133,7 @@ mod tests {
         assert!(remove_stale_index_lock(
             tmp.path(),
             spawned_at,
+            SystemTime::now() + Duration::from_secs(5),
             Some(dead_pid)
         ));
         assert!(!lock.exists());
@@ -1087,16 +1141,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn index_lock_owned_by_a_live_process_or_older_than_the_command_is_kept() {
+    fn index_lock_is_kept_unless_clearly_ours() {
         let tmp = init_repo();
         let lock = tmp.path().join(".git/index.lock");
         std::fs::write(&lock, "").unwrap();
+        let past = SystemTime::now() - Duration::from_secs(5);
+        let future = SystemTime::now() + Duration::from_secs(60);
 
         // A live process remains in the group: do not touch the lock.
         let mut live = spawn_grouped("sleep 30");
         assert!(!remove_stale_index_lock(
             tmp.path(),
-            SystemTime::now() - Duration::from_secs(5),
+            past,
+            future,
             Some(live.id())
         ));
         assert!(lock.exists());
@@ -1107,25 +1164,101 @@ mod tests {
         assert!(!remove_stale_index_lock(
             tmp.path(),
             SystemTime::now() + Duration::from_secs(60),
-            None
+            future + Duration::from_secs(60),
+            Some(i32::MAX as u32)
         ));
         assert!(lock.exists());
+
+        // The lock was modified after the command ended.
+        assert!(!remove_stale_index_lock(
+            tmp.path(),
+            past - Duration::from_secs(60),
+            past,
+            Some(i32::MAX as u32)
+        ));
+        assert!(lock.exists());
+
+        // No process group of our own: ownership cannot be established.
+        assert!(!remove_stale_index_lock(tmp.path(), past, future, None));
+        assert!(lock.exists());
+    }
+
+    /// A repo whose `pre-commit` hook runs `body`, so `git commit` hangs (or
+    /// not) deterministically inside git's own process group.
+    #[cfg(unix)]
+    fn repo_with_pre_commit(body: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = init_repo();
+        let hook = tmp.path().join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tmp
     }
 
     #[cfg(unix)]
     #[test]
     fn timeout_removes_index_lock_created_by_the_killed_command() {
-        let tmp = init_repo();
-        let lock = tmp.path().join(".git/index.lock");
-        // The aliased "git" creates the lock then hangs, like a killed `add`.
-        let script = format!("!f() {{ touch '{}'; sleep 30; }}; f", lock.display());
+        let lock_path = |tmp: &tempfile::TempDir| tmp.path().join(".git/index.lock");
+        let tmp = repo_with_pre_commit("touch .git/index.lock; sleep 30");
+        let lock = lock_path(&tmp);
         let error = cmd(tmp.path())
-            .args(["-c", &format!("alias.hang={script}"), "hang"])
-            .timeout(Duration::from_millis(500))
+            .args(["commit", "-q", "--allow-empty", "-m", "x"])
+            .timeout(Duration::from_millis(800))
             .run()
             .unwrap_err();
         assert!(matches!(error, GitError::Timeout { .. }), "{error:?}");
         assert!(!lock.exists(), "stale index.lock left behind after kill");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_keeps_index_lock_written_by_a_concurrent_process() {
+        let tmp = repo_with_pre_commit("sleep 30");
+        let lock = tmp.path().join(".git/index.lock");
+        // A separate process (not in git's group) takes the lock during the
+        // run and keeps writing to it, like a live editor integration.
+        let mut other = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 0.2; while :; do echo x >> '{}'; sleep 0.05; done",
+                lock.display()
+            ))
+            .spawn()
+            .unwrap();
+        let error = cmd(tmp.path())
+            .args(["commit", "-q", "--allow-empty", "-m", "x"])
+            .timeout(Duration::from_millis(800))
+            .run()
+            .unwrap_err();
+        let kept = lock.exists();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(matches!(error, GitError::Timeout { .. }), "{error:?}");
+        assert!(kept, "another process's index.lock was removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_fetch_never_touches_index_lock() {
+        let tmp = init_repo();
+        let lock = tmp.path().join(".git/index.lock");
+        let script = tmp.path().join("fake-remote.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", lock.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let remote = format!("ext::{}", script.display());
+        let error = cmd(tmp.path())
+            .args(["-c", "protocol.ext.allow=always", "fetch", &remote])
+            .timeout(Duration::from_millis(800))
+            .run()
+            .unwrap_err();
+        assert!(matches!(error, GitError::Timeout { .. }), "{error:?}");
+        assert!(lock.exists(), "fetch timeout must not remove index.lock");
     }
 
     #[test]

@@ -268,6 +268,36 @@ pub(crate) fn archive_branch(repo: &Path, source_rev: &str, label: &str) -> Resu
     Ok(archive)
 }
 
+/// [`archive_branch`], but reuse an existing `preserved/<label-slug>-*`
+/// branch that already points at the same commit. Used when trunk is missing
+/// and every recovery retry would otherwise add another identical archive.
+pub(crate) fn archive_branch_reusing(repo: &Path, source_rev: &str, label: &str) -> Result<String> {
+    let slug = label.replace('/', "-");
+    let tip = crate::git::cmd(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{source_rev}^{{commit}}"))
+        .stdout()
+        .with_context(|| format!("failed to resolve '{source_rev}' in {}", repo.display()))?;
+    let existing = crate::git::cmd(repo)
+        .args(["for-each-ref", "--format=%(objectname) %(refname:short)"])
+        .arg(format!("refs/heads/preserved/{slug}-*"))
+        .stdout()
+        .with_context(|| format!("failed to list archive branches in {}", repo.display()))?;
+    // `preserved/a-*` also matches `preserved/a-b-123`; the tail after the
+    // slug must be the stamp (digits) plus an optional numeric suffix.
+    let prefix = format!("preserved/{slug}-");
+    let reusable = existing.lines().find_map(|line| {
+        let (oid, name) = line.split_once(' ')?;
+        let tail = name.strip_prefix(&prefix)?;
+        let numeric = !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c == '-');
+        (oid == tip && numeric).then(|| name.to_string())
+    });
+    match reusable {
+        Some(name) => Ok(name),
+        None => archive_branch(repo, source_rev, label),
+    }
+}
+
 /// Archive `branch_name` (see [`archive_branch`]) when it has commits ahead
 /// of `base_ref`. Returns `Ok(None)` when the branch is missing or has no
 /// commits ahead. Fails closed: if the ahead count cannot be determined the
@@ -343,7 +373,7 @@ fn archive_checked_out_work_except(
             }
             (Some(branch), false) => {
                 if ref_exists(&repo, &format!("refs/heads/{branch}"))? {
-                    let archive = archive_branch(&repo, branch, branch)?;
+                    let archive = archive_branch_reusing(&repo, branch, branch)?;
                     warn!(
                         subsystem,
                         repo = %repo.display(),
@@ -362,7 +392,7 @@ fn archive_checked_out_work_except(
             }
             (None, true) => None,
             (None, false) if commit_resolves(&repo, "HEAD")? => {
-                let archive = archive_branch(&repo, "HEAD", detached_label)?;
+                let archive = archive_branch_reusing(&repo, "HEAD", detached_label)?;
                 warn!(
                     subsystem,
                     repo = %repo.display(),
@@ -1187,6 +1217,34 @@ mod tests {
             .unwrap()
             .expect("detached HEAD archived unconditionally");
         assert!(detached.starts_with("preserved/detached-"), "{detached}");
+    }
+
+    #[test]
+    fn missing_trunk_recovery_retries_reuse_the_identical_archive() {
+        let (_container, sub) = mainline_container();
+        let first = archive_checked_out_work(&sub, "test", "develop", "detached")
+            .unwrap()
+            .expect("archived");
+        let second = archive_checked_out_work(&sub, "test", "develop", "detached")
+            .unwrap()
+            .expect("archive reused");
+        assert_eq!(first, second);
+        assert_eq!(archives(&sub), [first]);
+
+        // New work on the branch is a different commit: a new archive.
+        run(&sub, &["commit", "-q", "--allow-empty", "-m", "more"]);
+        let third = archive_checked_out_work(&sub, "test", "develop", "detached")
+            .unwrap()
+            .expect("archived");
+        assert_ne!(third, second);
+        assert_eq!(archives(&sub).len(), 2);
+
+        // Detached HEAD: same reuse.
+        run(&sub, &["checkout", "-q", "--detach"]);
+        let d1 = archive_checked_out_work(&sub, "test", "develop", "detached").unwrap();
+        let d2 = archive_checked_out_work(&sub, "test", "develop", "detached").unwrap();
+        assert_eq!(d1, d2);
+        assert_eq!(archives(&sub).len(), 3);
     }
 
     #[test]
