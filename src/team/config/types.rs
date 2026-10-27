@@ -680,6 +680,10 @@ pub struct AutoMergePolicy {
     pub require_tests_pass: bool,
     #[serde(default = "default_post_merge_verify")]
     pub post_merge_verify: bool,
+    /// Escalate when merges have waited this long for a busy merge lock
+    /// (then hourly while it stays busy).
+    #[serde(default = "default_lock_busy_escalate_after_secs")]
+    pub lock_busy_escalate_after_secs: u64,
 }
 
 fn default_max_diff_lines() -> usize {
@@ -715,6 +719,9 @@ fn default_require_tests_pass() -> bool {
 fn default_post_merge_verify() -> bool {
     true
 }
+fn default_lock_busy_escalate_after_secs() -> u64 {
+    600
+}
 
 impl Default for AutoMergePolicy {
     fn default() -> Self {
@@ -727,6 +734,7 @@ impl Default for AutoMergePolicy {
             confidence_threshold: default_confidence_threshold(),
             require_tests_pass: default_require_tests_pass(),
             post_merge_verify: default_post_merge_verify(),
+            lock_busy_escalate_after_secs: default_lock_busy_escalate_after_secs(),
         }
     }
 }

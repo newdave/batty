@@ -24,6 +24,9 @@ pub(crate) struct StatusView<'a> {
     pub(crate) active_tasks: &'a [StatusTaskEntry],
     pub(crate) review_queue: &'a [StatusTaskEntry],
     pub(crate) rows: &'a [TeamStatusRow],
+    /// Task id of a merge left in post-merge verification by a daemon that
+    /// is no longer running.
+    pub(crate) stale_in_flight_merge: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +288,16 @@ pub(crate) fn attention_items(view: &StatusView<'_>) -> Vec<AttentionItem> {
             None,
             "Nudges and standups are paused.".into(),
             Some("batty resume".into()),
+        );
+    }
+
+    if let Some(task_id) = view.stale_in_flight_merge {
+        push(
+            None,
+            format!(
+                "The merge of #{task_id} is stuck in post-merge verification with no daemon running; it blocks `batty merge` (`batty start` resumes it)."
+            ),
+            Some("batty merge --force-clear-stale".into()),
         );
     }
 
@@ -889,6 +902,7 @@ mod tests {
             active_tasks: &f.tasks,
             review_queue: &[],
             rows: &f.rows,
+            stale_in_flight_merge: None,
         }
     }
 
@@ -1078,6 +1092,21 @@ eng-1-3    engineer   ○ idle     -                        -  -
         assert!(cmds.contains(&"batty resume"));
         assert!(cmds.contains(&"batty doctor"));
         assert!(cmds.contains(&"batty backend-reset eng-1-3"));
+    }
+
+    #[test]
+    fn stale_in_flight_merge_is_an_attention_item() {
+        let f = fixture();
+        let mut v = view(&f, false);
+        v.stale_in_flight_merge = Some(42);
+        let items = attention_items(&v);
+        let item = items
+            .iter()
+            .find(|i| i.command.as_deref() == Some("batty merge --force-clear-stale"))
+            .expect("stale merge must be listed");
+        assert!(item.text.contains("#42"), "{}", item.text);
+        let out = render_summary(&v, &opts(200));
+        assert!(out.contains("--force-clear-stale"), "{out}");
     }
 
     #[test]

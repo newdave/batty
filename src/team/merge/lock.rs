@@ -11,9 +11,14 @@
 //!   a waiter that locked an inode which is no longer at the lock path
 //!   retries instead of holding a lock nobody else can see.
 //! - **Compatibility with older binaries:** those use exclusive create plus
-//!   a PID marker and never `flock`. A file that is not flocked but carries
-//!   a live foreign PID (or is empty or unparseable and young, i.e. being
-//!   written) is therefore treated as held.
+//!   a PID marker and never `flock`; some keep the file *empty* for the whole
+//!   merge, verification included. A file that is not flocked but carries a
+//!   live foreign PID, or is empty or unparseable and younger than
+//!   [`UNOWNED_LOCK_STALE_AFTER`] (1h), is therefore treated as held. An
+//!   older binary that crashes while holding the lock can block merges for up
+//!   to that hour; the merge queue escalates a lock that stays busy. Mixed
+//!   old and new binaries should still not merge in the same project at the
+//!   same time: stop old daemons before upgrading.
 //! - **Fallback mode:** on filesystems without `flock` support (`ENOLCK`,
 //!   `ENOTSUP`), the lock falls back to that same exclusive-create scheme
 //!   with dead-PID reclaim.
@@ -31,12 +36,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-/// A non-empty lock file without a readable PID (written by an older batty
-/// or another tool) is treated as held until it is this old.
-const UNOWNED_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
-/// An empty, unlocked lock file younger than this may belong to an older
-/// binary that created it and has not written its PID yet.
-const EMPTY_LOCK_GRACE: Duration = Duration::from_secs(5);
+/// An unlocked lock file without a readable PID (empty, as some older batty
+/// binaries keep it through a whole merge and verification, or written by
+/// another tool) is treated as held until it is this old.
+pub(crate) const UNOWNED_LOCK_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 /// Attempts to lock the file currently at the lock path before giving up
 /// for this call (another holder unlinked it between our open and flock).
 const ACQUIRE_ATTEMPTS: usize = 4;
@@ -91,6 +94,17 @@ pub(crate) fn merge_lock_is_held(project_root: &Path) -> bool {
     marker_is_live(&path)
 }
 
+/// PID recorded in the merge lock file, if it has a readable one. Used to
+/// name the holder when a busy lock is escalated.
+pub(crate) fn merge_lock_holder_pid(project_root: &Path) -> Option<u32> {
+    std::fs::read_to_string(merge_lock_path(project_root))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
 fn fallback_held_in_process(path: &Path) -> bool {
     FALLBACK_HELD
         .lock()
@@ -117,9 +131,6 @@ fn marker_content_is_live(path: &Path, content: &str) -> bool {
             .ok()
             .and_then(|modified| modified.elapsed().ok())
     };
-    if content.is_empty() {
-        return age().is_none_or(|age| age <= EMPTY_LOCK_GRACE);
-    }
     match content.parse::<u32>().ok().filter(|pid| *pid > 0) {
         Some(pid) if pid == std::process::id() => false,
         Some(pid) => crate::team::daemon_mgmt::process_exists(pid),
@@ -506,9 +517,47 @@ mod tests {
         let path = merge_lock_path(tmp.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "").unwrap();
-        age_file(&path, Duration::from_secs(60));
+        age_file(&path, UNOWNED_LOCK_STALE_AFTER + Duration::from_secs(60));
         assert!(!merge_lock_is_held(tmp.path()));
         assert!(acquire_eventually_for_test(tmp.path()).is_some());
+    }
+
+    #[test]
+    fn empty_lock_file_held_through_an_old_binarys_verify_blocks_for_minutes() {
+        // Older binaries keep an empty, unflocked merge.lock through minutes
+        // of synchronous verification; it must not look free after seconds.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = merge_lock_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        age_file(&path, Duration::from_secs(10 * 60));
+        assert!(merge_lock_is_held(tmp.path()));
+        assert!(MergeLock::try_acquire(tmp.path()).unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "", "untouched");
+    }
+
+    #[test]
+    fn unparseable_marker_is_held_for_minutes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = merge_lock_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "active merge\n").unwrap();
+        age_file(&path, Duration::from_secs(5 * 60));
+        assert!(merge_lock_is_held(tmp.path()));
+        age_file(&path, UNOWNED_LOCK_STALE_AFTER + Duration::from_secs(60));
+        assert!(!merge_lock_is_held(tmp.path()));
+    }
+
+    #[test]
+    fn holder_pid_is_read_from_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(merge_lock_holder_pid(tmp.path()), None);
+        let lock = MergeLock::try_acquire(tmp.path()).unwrap().unwrap();
+        assert_eq!(merge_lock_holder_pid(tmp.path()), Some(std::process::id()));
+        drop(lock);
+        let path = merge_lock_path(tmp.path());
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(merge_lock_holder_pid(tmp.path()), None);
     }
 
     #[test]

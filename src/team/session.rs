@@ -273,6 +273,11 @@ pub fn stop_team(project_root: &Path) -> Result<()> {
         warn!("daemon did not stop gracefully; forcing shutdown");
         force_kill_daemon(project_root);
     }
+    // No daemon is verifying any more; drop the post-merge verify checkout
+    // (an interrupted verification recreates it after restart).
+    if let Err(error) = super::daemon::remove_verify_worktree(project_root) {
+        warn!(error = %format!("{error:#}"), "failed to remove the verify worktree");
+    }
 
     // Kill only the session belonging to this project
     if tmux::session_exists(&primary_session) {
@@ -570,6 +575,7 @@ fn render_team_status(
             active_tasks: &active_tasks,
             review_queue: &review_queue,
             rows: &rows,
+            stale_in_flight_merge: super::daemon::stale_in_flight_merge(project_root),
         };
         out.push_str(&status_render::render_summary(&view, &render_opts));
         let running_tests = status::load_running_test_summaries(project_root);

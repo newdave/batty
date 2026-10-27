@@ -190,9 +190,7 @@ pub(crate) fn run_tests_in_worktree_tracked(
     };
     let command_text = resolved.as_str();
     let mut command = std::process::Command::new("sh");
-    let cargo_home = engineer_worktree_project_root(worktree_dir)
-        .map(|project_root| project_root.join(".batty").join("cargo-home"))
-        .unwrap_or_else(|| worktree_dir.join(".batty").join("cargo-home"));
+    let (cargo_home, cargo_target_dir) = test_cargo_env(worktree_dir);
     std::fs::create_dir_all(&cargo_home)
         .with_context(|| format!("failed to create {}", cargo_home.display()))?;
     // Use `sh -c` (not `sh -lc`): a login shell re-sources profile files and
@@ -205,15 +203,8 @@ pub(crate) fn run_tests_in_worktree_tracked(
         .arg(command_text)
         .current_dir(worktree_dir);
     command.env("CARGO_HOME", &cargo_home);
-    if let Some(project_root) = engineer_worktree_project_root(worktree_dir) {
-        let wt_name = worktree_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "default".to_string());
-        command.env(
-            "CARGO_TARGET_DIR",
-            shared_cargo_target_dir(&project_root).join(&wt_name),
-        );
+    if let Some(target_dir) = cargo_target_dir {
+        command.env("CARGO_TARGET_DIR", target_dir);
     }
     let output = match child_pgid {
         None => command.output(),
@@ -274,6 +265,51 @@ pub(crate) fn run_tests_in_worktree_tracked(
 
 pub(crate) fn shared_cargo_target_dir(project_root: &Path) -> PathBuf {
     project_root.join(".batty").join("shared-target")
+}
+
+/// Directory name of the post-merge verify worktree under `.batty/`.
+pub(crate) const VERIFY_WORKTREE_NAME: &str = "verify-worktree";
+/// Subdirectory of the shared target dir used by the verify worktree.
+const VERIFY_TARGET_NAME: &str = "verify";
+
+/// `CARGO_HOME` and `CARGO_TARGET_DIR` for a test run in `worktree_dir`.
+/// Engineer worktrees (`.batty/worktrees/<name>`) and the post-merge verify
+/// worktree (`.batty/verify-worktree`) share the project's cargo home and
+/// get their own subdirectory of the shared target dir, so they build warm
+/// and work offline. Any other directory (the root checkout) keeps its own
+/// target dir.
+fn test_cargo_env(worktree_dir: &Path) -> (PathBuf, Option<PathBuf>) {
+    let shared = engineer_worktree_project_root(worktree_dir)
+        .map(|project_root| {
+            let name = worktree_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "default".to_string());
+            (project_root, name)
+        })
+        .or_else(|| {
+            verify_worktree_project_root(worktree_dir)
+                .map(|project_root| (project_root, VERIFY_TARGET_NAME.to_string()))
+        });
+    match shared {
+        Some((project_root, target_name)) => (
+            project_root.join(".batty").join("cargo-home"),
+            Some(shared_cargo_target_dir(&project_root).join(target_name)),
+        ),
+        None => (worktree_dir.join(".batty").join("cargo-home"), None),
+    }
+}
+
+/// Project root of the post-merge verify worktree `<root>/.batty/verify-worktree`.
+fn verify_worktree_project_root(worktree_dir: &Path) -> Option<PathBuf> {
+    if worktree_dir.file_name()? != VERIFY_WORKTREE_NAME {
+        return None;
+    }
+    let batty_dir = worktree_dir.parent()?;
+    if batty_dir.file_name()? != ".batty" {
+        return None;
+    }
+    batty_dir.parent().map(Path::to_path_buf)
 }
 
 pub(crate) fn validate_review_ready_worktree(
@@ -2532,6 +2568,37 @@ mod tests {
             run.output
                 .contains(shared_cargo_target_dir(&repo).to_string_lossy().as_ref())
         );
+    }
+
+    #[test]
+    fn verify_worktree_tests_use_shared_cargo_home_and_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let verify_dir = root.join(".batty").join(VERIFY_WORKTREE_NAME);
+        std::fs::create_dir_all(&verify_dir).unwrap();
+
+        let run = run_tests_in_worktree(
+            &verify_dir,
+            Some("printf '%s\\n%s\\n' \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\""),
+        )
+        .unwrap();
+        assert!(run.passed, "{}", run.output);
+        let lines: Vec<&str> = run.output.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                root.join(".batty").join("cargo-home").to_string_lossy(),
+                shared_cargo_target_dir(root)
+                    .join("verify")
+                    .to_string_lossy(),
+            ]
+        );
+        assert!(
+            !verify_dir.join(".batty").exists(),
+            "no private cargo home inside the verify worktree"
+        );
+        // Any other directory keeps its own cargo home and target dir.
+        assert_eq!(test_cargo_env(root), (root.join(".batty/cargo-home"), None));
     }
 
     #[test]

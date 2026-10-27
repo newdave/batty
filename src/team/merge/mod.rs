@@ -26,8 +26,8 @@ pub(crate) use completion::{
 #[cfg(test)]
 pub(crate) use lock::acquire_eventually_for_test;
 pub(crate) use lock::{
-    MergeLock, MergeMode, MergeOutcome, infer_merge_mode_from_failure, merge_lock_is_held,
-    merge_lock_path,
+    MergeLock, MergeMode, MergeOutcome, infer_merge_mode_from_failure, merge_lock_holder_pid,
+    merge_lock_is_held, merge_lock_path,
 };
 pub(crate) use operations::{
     RootCheckoutDirty, RootDirtyState, inspect_root_dirty_state, merge_engineer_branch_into_trunk,

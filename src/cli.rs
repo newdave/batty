@@ -211,7 +211,14 @@ pub enum Command {
     /// Merge an engineer's worktree branch into main
     Merge {
         /// Engineer instance name (e.g., "eng-1-1")
-        engineer: String,
+        #[arg(required_unless_present = "force_clear_stale")]
+        engineer: Option<String>,
+
+        /// Clear a merge that a stopped or crashed daemon left in post-merge
+        /// verification (it blocks `batty merge`). Refused while the daemon
+        /// runs. The merge itself stays on trunk, unverified
+        #[arg(long)]
+        force_clear_stale: bool,
     },
 
     /// Manage workflow task state and metadata
@@ -1830,7 +1837,28 @@ mod tests {
     fn merge_subcommand_parses_engineer() {
         let cli = Cli::parse_from(["batty", "merge", "eng-1-1"]);
         match cli.command {
-            Command::Merge { engineer } => assert_eq!(engineer, "eng-1-1"),
+            Command::Merge {
+                engineer,
+                force_clear_stale,
+            } => {
+                assert_eq!(engineer.as_deref(), Some("eng-1-1"));
+                assert!(!force_clear_stale);
+            }
+            other => panic!("expected merge command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_force_clear_stale_needs_no_engineer() {
+        let cli = Cli::parse_from(["batty", "merge", "--force-clear-stale"]);
+        match cli.command {
+            Command::Merge {
+                engineer,
+                force_clear_stale,
+            } => {
+                assert_eq!(engineer, None);
+                assert!(force_clear_stale);
+            }
             other => panic!("expected merge command, got {other:?}"),
         }
     }

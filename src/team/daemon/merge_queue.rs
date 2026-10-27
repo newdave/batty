@@ -17,9 +17,9 @@ use crate::team::merge::{
     infer_merge_mode_from_failure, inspect_root_dirty_state, merge_engineer_branch_into_trunk,
 };
 use crate::team::task_loop::{
-    current_worktree_branch, read_task_title, run_tests_in_worktree_tracked,
+    VERIFY_WORKTREE_NAME, current_worktree_branch, read_task_title, run_tests_in_worktree_tracked,
 };
-use crate::team::test_job::TestJob;
+use crate::team::test_job::{TestJob, TestSetupFailed};
 
 /// A request whose merge attempt fails before anything lands on trunk (lock
 /// I/O, git inspection, board reads, ...) is retried with backoff and
@@ -39,9 +39,20 @@ const MERGE_LOCK_FAILURE_RETRY: Duration = Duration::from_secs(300);
 /// [`DIRTY_ROOT_ESCALATE_AFTER_AGE`], whichever comes first.
 pub(crate) const DIRTY_ROOT_ESCALATE_AFTER_DEFERRALS: u32 = 3;
 pub(crate) const DIRTY_ROOT_ESCALATE_AFTER_AGE: Duration = Duration::from_secs(30 * 60);
+/// A merge lock that stays busy this long while merges wait for it is
+/// escalated (default for `workflow_policy.auto_merge.lock_busy_escalate_after_secs`),
+/// then again every [`MERGE_LOCK_BUSY_REESCALATE_EVERY`] while it stays busy.
+pub(crate) const MERGE_LOCK_BUSY_REESCALATE_EVERY: Duration = Duration::from_secs(60 * 60);
+/// Consecutive failures to prepare the post-merge verification checkout
+/// before escalating. Setup failures never revert the merge; they are
+/// retried with backoff.
+pub(crate) const VERIFY_SETUP_ESCALATE_AFTER: u32 = 3;
+
 /// Checkout used for post-merge verification when the root checkout is not
-/// on trunk (relative to the project root).
-const VERIFY_WORKTREE_DIR: &str = ".batty/verify-worktree";
+/// on trunk.
+pub(crate) fn verify_worktree_path(project_root: &std::path::Path) -> PathBuf {
+    project_root.join(".batty").join(VERIFY_WORKTREE_NAME)
+}
 
 fn merge_retry_delay(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(16);
@@ -165,6 +176,10 @@ pub(crate) struct InFlightMerge {
     /// The revert is waiting for the root checkout to be cleaned and that
     /// has been escalated already.
     pub dirty_revert_escalated: bool,
+    /// Consecutive failures to prepare the verification checkout.
+    pub setup_failures: u32,
+    /// Do not retry a failed verification setup before this instant.
+    pub setup_retry_at: Option<Instant>,
 }
 
 impl InFlightMerge {
@@ -186,6 +201,8 @@ impl InFlightMerge {
             verify,
             lock,
             dirty_revert_escalated: false,
+            setup_failures: 0,
+            setup_retry_at: None,
         }
     }
 }
@@ -256,6 +273,13 @@ pub(crate) enum MergeQueueStep {
     },
 }
 
+/// How long the merge lock has been busy for waiting merges.
+#[derive(Debug, Clone, Copy)]
+struct LockBusy {
+    since: Instant,
+    last_escalated: Option<Instant>,
+}
+
 /// Deferrals of one request because the root checkout was dirty.
 #[derive(Debug, Clone, Copy)]
 struct DirtyRootDeferrals {
@@ -272,8 +296,16 @@ pub(crate) struct MergeQueue {
     active: Option<MergeRequest>,
     in_flight: Option<InFlightMerge>,
     attempts: HashMap<u32, u32>,
-    /// Backoff for the request at the head of the queue.
+    /// Position the active request was taken from, so a retry goes back
+    /// where it was.
+    active_pos: usize,
+    /// Backoff for the whole queue (the merge lock is busy).
     not_before: Option<Instant>,
+    /// Per-request backoff after a failed or deferred attempt. A request in
+    /// backoff does not hold up unrelated requests behind it.
+    retry_at: HashMap<u32, Instant>,
+    /// Set while waiting merges find the merge lock busy.
+    lock_busy: Option<LockBusy>,
     last_result: Option<MergeQueueLastResult>,
     last_reported_status: Option<String>,
     /// Dirty-root deferrals per task id (not persisted: the count restarts
@@ -356,10 +388,55 @@ impl MergeQueue {
         if self.not_before.is_some_and(|not_before| now < not_before) {
             return None;
         }
-        let request = self.queue.pop_front()?;
+        // The first request not in its own backoff, in FIFO order.
+        let pos = self.queue.iter().position(|request| {
+            self.retry_at
+                .get(&request.task_id)
+                .is_none_or(|retry_at| now >= *retry_at)
+        })?;
+        let request = self.queue.remove(pos)?;
         self.not_before = None;
+        self.active_pos = pos;
         self.active = Some(request.clone());
         Some(request)
+    }
+
+    /// Put a request back where [`MergeQueue::begin_next`] took it from.
+    fn requeue_active(&mut self, request: MergeRequest) {
+        let pos = self.active_pos.min(self.queue.len());
+        self.queue.insert(pos, request);
+    }
+
+    /// Record that a waiting merge found the merge lock busy at `now`.
+    /// Returns how long it has been busy when that should be escalated:
+    /// first after `escalate_after`, then every
+    /// [`MERGE_LOCK_BUSY_REESCALATE_EVERY`].
+    pub(crate) fn note_lock_busy(
+        &mut self,
+        now: Instant,
+        escalate_after: Duration,
+    ) -> Option<Duration> {
+        let busy = self.lock_busy.get_or_insert(LockBusy {
+            since: now,
+            last_escalated: None,
+        });
+        let busy_for = now.saturating_duration_since(busy.since);
+        if busy_for < escalate_after {
+            return None;
+        }
+        let due = busy.last_escalated.is_none_or(|last| {
+            now.saturating_duration_since(last) >= MERGE_LOCK_BUSY_REESCALATE_EVERY
+        });
+        if !due {
+            return None;
+        }
+        busy.last_escalated = Some(now);
+        Some(busy_for)
+    }
+
+    /// The merge lock was taken (or nothing waits for it any more).
+    fn clear_lock_busy(&mut self) {
+        self.lock_busy = None;
     }
 
     pub(crate) fn finish(
@@ -375,6 +452,10 @@ impl MergeQueue {
         ) {
             self.dirty_root_deferrals.remove(&request.task_id);
         }
+        if !matches!(result, Ok(MergeAttempt::LockBusy)) {
+            self.clear_lock_busy();
+        }
+        self.retry_at.remove(&request.task_id);
         match result {
             Ok(MergeAttempt::DirtyRootDeferred(dirty)) => {
                 let record = self.dirty_root_deferrals.entry(request.task_id).or_insert(
@@ -392,8 +473,8 @@ impl MergeQueue {
                 record.escalated |= escalate;
                 let deferrals = record.count;
                 let delay = merge_retry_delay(deferrals);
-                self.queue.push_front(request.clone());
-                self.not_before = Some(now + delay);
+                self.requeue_active(request.clone());
+                self.retry_at.insert(request.task_id, now + delay);
                 MergeQueueStep::DirtyRootDeferred {
                     request,
                     deferrals,
@@ -412,7 +493,7 @@ impl MergeQueue {
                 })
             }
             Ok(MergeAttempt::LockBusy) => {
-                self.queue.push_front(request);
+                self.requeue_active(request);
                 self.not_before = Some(now + MERGE_LOCK_BUSY_DELAY);
                 MergeQueueStep::Deferred
             }
@@ -438,8 +519,8 @@ impl MergeQueue {
                     };
                 }
                 let delay = merge_retry_delay(attempt);
-                self.queue.push_front(request.clone());
-                self.not_before = Some(now + delay);
+                self.requeue_active(request.clone());
+                self.retry_at.insert(request.task_id, now + delay);
                 MergeQueueStep::RetryScheduled {
                     request,
                     attempt,
@@ -652,7 +733,12 @@ impl TeamDaemon {
         if let Some(step) = self.merge.queue.recover_interrupted_attempt(now) {
             self.handle_merge_queue_step(step);
         }
-        self.advance_in_flight_merge();
+        if self.merge.queue.queue.is_empty() && self.merge.queue.in_flight.is_none() {
+            // Nothing waits for the merge lock: a later busy lock is a new
+            // episode.
+            self.merge.queue.clear_lock_busy();
+        }
+        self.advance_in_flight_merge(now);
         if self.merge.queue.is_verifying() {
             return;
         }
@@ -669,9 +755,60 @@ impl TeamDaemon {
             queued = self.merge.queue.queued_len(),
             "processing merge queue"
         );
+        let waiting = (request.task_id, request.engineer.clone());
         let result = self.execute_queued_merge(&request);
         let step = self.merge.queue.finish(request, result, now);
+        if matches!(step, MergeQueueStep::Deferred) {
+            self.note_merge_lock_busy(waiting.0, &waiting.1, now);
+        }
         self.handle_merge_queue_step(step);
+    }
+
+    fn merge_lock_busy_escalate_after(&self) -> Duration {
+        Duration::from_secs(
+            self.config
+                .team_config
+                .workflow_policy
+                .auto_merge
+                .lock_busy_escalate_after_secs,
+        )
+    }
+
+    /// A merge (queued, or the in-flight verification/revert) found the
+    /// merge lock busy. Escalate once it has been busy too long, naming the
+    /// holder PID from the lock file, then hourly while it stays busy.
+    fn note_merge_lock_busy(&mut self, task_id: u32, engineer: &str, now: Instant) {
+        let escalate_after = self.merge_lock_busy_escalate_after();
+        let Some(busy_for) = self.merge.queue.note_lock_busy(now, escalate_after) else {
+            return;
+        };
+        let lock_path = crate::team::merge::merge_lock_path(self.project_root());
+        let holder = match crate::team::merge::merge_lock_holder_pid(self.project_root()) {
+            Some(pid) => format!("held by PID {pid} (from the lock file)"),
+            None => "holder unknown (the lock file has no PID; possibly an older batty binary)"
+                .to_string(),
+        };
+        let minutes = busy_for.as_secs() / 60;
+        warn!(
+            task_id,
+            busy_secs = busy_for.as_secs(),
+            holder = %holder,
+            "merge lock has been busy too long; escalating"
+        );
+        self.record_orchestrator_action(format!(
+            "merge queue: merge lock busy for {minutes} minutes ({holder}); task #{task_id} waiting; escalated"
+        ));
+        let notice = format!(
+            "ESCALATION: The merge lock ({}) has been busy for {minutes} minutes, {holder}. Task #{task_id} from {engineer} is waiting to merge or finish its post-merge verification.\nIf no merge is running, stop the holder (a hung `batty merge` or an older batty daemon) or remove the lock file. Batty keeps retrying and reminds you every {} minutes while it stays busy.",
+            lock_path.display(),
+            MERGE_LOCK_BUSY_REESCALATE_EVERY.as_secs() / 60
+        );
+        if let Some(manager_name) = self.manager_name(engineer) {
+            self.notify_best_effort("daemon", &manager_name, &notice);
+            self.mark_member_working(&manager_name);
+            self.notify_reports_to_best_effort(&manager_name, &notice);
+        }
+        self.record_task_escalated(engineer, task_id.to_string(), Some("merge_lock_busy"));
     }
 
     fn handle_merge_queue_step(&mut self, step: MergeQueueStep) {
@@ -889,6 +1026,7 @@ impl TeamDaemon {
                 }
                 self.merge.queue.lock_failures = 0;
                 self.merge.queue.lock_retry_at = None;
+                self.merge.queue.clear_lock_busy();
                 true
             }
             Ok(None) => {
@@ -896,6 +1034,7 @@ impl TeamDaemon {
                     task_id,
                     "merge lock busy; in-flight merge waits for it on a later tick"
                 );
+                self.note_merge_lock_busy(task_id, &engineer, now);
                 false
             }
             Err(error) => {
@@ -989,38 +1128,51 @@ impl TeamDaemon {
     ) -> TestJob<VerificationRunResult> {
         let project_root = self.project_root().to_path_buf();
         let trunk_branch = self.config.team_config.trunk_branch().to_string();
+        let setup_trunk = trunk_branch.clone();
         let test_command = self.post_merge_test_command();
-        TestJob::spawn(format!("post-merge-{task_id}"), move |child_pgid| {
-            let dir = post_merge_verification_dir(&project_root, &trunk_branch, post.as_deref())
-                .with_context(|| {
-                    format!(
-                        "failed to prepare a {trunk_branch} checkout for post-merge verification"
-                    )
-                })?;
-            run_post_merge_tests(&dir, test_command.as_deref(), child_pgid.as_ref()).with_context(
-                || format!("post-merge verification on {trunk_branch} failed to execute"),
-            )
-        })
+        // Preparing the checkout is setup: it does not count against the
+        // test timeout, and its failures are retried instead of reverting.
+        TestJob::spawn_with_setup(
+            format!("post-merge-{task_id}"),
+            self.test_job_timeout(),
+            move || {
+                post_merge_verification_dir(&project_root, &setup_trunk, post.as_deref())
+                    .with_context(|| {
+                        format!(
+                            "failed to prepare a {setup_trunk} checkout for post-merge verification"
+                        )
+                    })
+            },
+            move |dir, child_pgid| {
+                run_post_merge_tests(&dir, test_command.as_deref(), child_pgid.as_ref())
+                    .with_context(|| {
+                        format!("post-merge verification on {trunk_branch} failed to execute")
+                    })
+            },
+        )
     }
 
     /// Phase 2 of a verified merge: start an interrupted verification, apply
     /// a finished one, or retry a pending revert.
-    fn advance_in_flight_merge(&mut self) {
+    fn advance_in_flight_merge(&mut self, now: Instant) {
         enum Next {
             Wait,
             Start(u32, Option<String>),
             Passed,
             Failed(String),
+            SetupFailed(String),
             RetryRevert,
         }
-        if !self.ensure_in_flight_merge_lock(Instant::now()) {
+        if !self.ensure_in_flight_merge_lock(now) {
             return;
         }
         let next = match self.merge.queue.in_flight.as_ref() {
             None => return,
             Some(merge) => match &merge.verify {
                 PostMergeVerify::Pending => {
-                    if self.verification.background_tests.main_smoke.is_some() {
+                    if self.verification.background_tests.main_smoke.is_some()
+                        || merge.setup_retry_at.is_some_and(|retry_at| now < retry_at)
+                    {
                         Next::Wait
                     } else {
                         Next::Start(merge.request.task_id, merge.post_merge_head.clone())
@@ -1030,8 +1182,15 @@ impl TeamDaemon {
                     None => Next::Wait,
                     Some(Ok(run)) if run.passed => Next::Passed,
                     Some(Ok(run)) => Next::Failed(run.output),
-                    // Spawn failures, worker panics and cancellations all
-                    // count as failed verification: never land unverified.
+                    // The verification checkout could not be prepared
+                    // (worktree add/checkout failed, index.lock, ...):
+                    // nothing was tested, so retry instead of reverting.
+                    Some(Err(error)) if error.downcast_ref::<TestSetupFailed>().is_some() => {
+                        Next::SetupFailed(format!("{error:#}"))
+                    }
+                    // Spawn failures, worker panics, cancellations and
+                    // timeouts count as failed verification: never land
+                    // unverified.
                     Some(Err(error)) => {
                         Next::Failed(format!("post-merge verification could not run: {error:#}"))
                     }
@@ -1041,8 +1200,12 @@ impl TeamDaemon {
         };
         match next {
             Next::Wait => {}
+            Next::SetupFailed(error) => self.handle_verify_setup_failure(&error, now),
             Next::Start(task_id, post) => {
                 let job = self.spawn_post_merge_verification(task_id, post);
+                if let Some(merge) = self.merge.queue.in_flight.as_mut() {
+                    merge.setup_retry_at = None;
+                }
                 if let Some(merge) = self.merge.queue.in_flight.as_mut() {
                     merge.verify = PostMergeVerify::Running(job);
                 }
@@ -1072,6 +1235,50 @@ impl TeamDaemon {
             }
             Next::RetryRevert => self.revert_failed_in_flight_merge(),
         }
+    }
+
+    /// Preparing the post-merge verification checkout failed. Keep the merge
+    /// in flight (and the lock held), retry with backoff, and escalate once
+    /// after [`VERIFY_SETUP_ESCALATE_AFTER`] failures in a row.
+    fn handle_verify_setup_failure(&mut self, error: &str, now: Instant) {
+        let trunk_branch = self.config.team_config.trunk_branch().to_string();
+        let Some(merge) = self.merge.queue.in_flight.as_mut() else {
+            return;
+        };
+        merge.verify = PostMergeVerify::Pending;
+        merge.setup_failures = merge.setup_failures.saturating_add(1);
+        let failures = merge.setup_failures;
+        let delay = merge_retry_delay(failures);
+        merge.setup_retry_at = Some(now + delay);
+        let request = merge.request.clone();
+        warn!(
+            task_id = request.task_id,
+            failures, error, "could not prepare post-merge verification; will retry"
+        );
+        self.record_orchestrator_action(format!(
+            "merge queue: post-merge verification setup for task #{} failed ({failures}x: {error}); retrying in {}s",
+            request.task_id,
+            delay.as_secs()
+        ));
+        if failures != VERIFY_SETUP_ESCALATE_AFTER {
+            return;
+        }
+        let notice = format!(
+            "ESCALATION: Batty could not prepare a {trunk_branch} checkout to verify task #{} from {} ({failures} attempts): {error}\nThe merge stays on {trunk_branch}, unverified and not reverted; Batty keeps retrying. Check {} and the repository's .git/index.lock.",
+            request.task_id,
+            request.engineer,
+            verify_worktree_path(self.project_root()).display()
+        );
+        if let Some(manager_name) = self.manager_name(&request.engineer) {
+            self.notify_best_effort("daemon", &manager_name, &notice);
+            self.mark_member_working(&manager_name);
+            self.notify_reports_to_best_effort(&manager_name, &notice);
+        }
+        self.record_task_escalated(
+            &request.engineer,
+            request.task_id.to_string(),
+            Some("post_merge_verify_setup_failed"),
+        );
     }
 
     /// Undo a merge whose post-merge verification failed. Runs under the
@@ -1111,7 +1318,7 @@ impl TeamDaemon {
             request.task_id,
             Some(false),
             "failed",
-            Some("post-merge verification on main failed"),
+            Some(&format!("post-merge verification on {trunk_branch} failed")),
         );
 
         let manager_name = self.manager_name(&request.engineer);
@@ -1254,7 +1461,7 @@ impl TeamDaemon {
                 request.task_id,
                 Some(true),
                 "passed",
-                Some("post-merge verification on main passed"),
+                Some(&format!("post-merge verification on {trunk_branch} passed")),
             ),
             _ => self.record_auto_merge_post_verify_result(
                 &request.engineer,
@@ -1443,14 +1650,14 @@ impl TeamDaemon {
         if let Some(block_detail) = dirty_main_review_merge_block_detail(&root_dirty) {
             drop(lock);
             let notice = format!(
-                "merge queue: blocked auto-merge for task #{} because main has source edits. {block_detail}",
+                "merge queue: blocked auto-merge for task #{} because the root checkout has source edits. {block_detail}",
                 request.task_id
             );
             self.record_orchestrator_action(notice.clone());
             mark_review_merge_blocked(&board_dir, request.task_id, &block_detail);
 
             let manager_notice = format!(
-                "Task #{} from {} passed tests but cannot be auto-merged while main has dirty source edits.\nTitle: {}\n{}\nLeave the task in review and clean, commit, or stash the root changes before retrying.",
+                "Task #{} from {} passed tests but cannot be auto-merged into {trunk_branch} while the root checkout has dirty source edits.\nTitle: {}\n{}\nLeave the task in review and clean, commit, or stash the root changes before retrying.",
                 request.task_id, request.engineer, task_title, block_detail
             );
             if let Some(ref manager_name) = manager_name {
@@ -1460,7 +1667,7 @@ impl TeamDaemon {
             }
 
             let engineer_notice = format!(
-                "Your task passed tests, but Batty paused the merge because main has dirty source edits.\n{}\nWait for lead direction before making more changes.",
+                "Your task passed tests, but Batty paused the merge into {trunk_branch} because the root checkout has dirty source edits.\n{}\nWait for lead direction before making more changes.",
                 block_detail
             );
             self.notify_best_effort("daemon", &request.engineer, &engineer_notice);
@@ -1469,15 +1676,21 @@ impl TeamDaemon {
                 engineer = request.engineer,
                 task_id = request.task_id,
                 dirty_paths = %root_dirty.source_paths.join(", "),
-                "merge queue blocked by dirty main source changes"
+                trunk = %trunk_branch,
+                "merge queue blocked by dirty root checkout source changes"
             );
             return Ok(MergeAttempt::Done(MergeQueueOutcome::Skipped));
         }
         if root_dirty.is_runtime_only() {
-            match snapshot_runtime_dirty_main(self.project_root(), request, &task_title, &root_dirty)
-            {
+            match snapshot_runtime_dirty_main(
+                self.project_root(),
+                &trunk_branch,
+                request,
+                &task_title,
+                &root_dirty,
+            ) {
                 Ok(Some(snapshot_path)) => self.record_orchestrator_action(format!(
-                    "merge queue: preserved runtime-only dirty main state before task #{} merge ({snapshot_path})",
+                    "merge queue: preserved runtime-only dirty root checkout state before task #{} merge into {trunk_branch} ({snapshot_path})",
                     request.task_id
                 )),
                 Ok(None) => {}
@@ -1485,10 +1698,10 @@ impl TeamDaemon {
                     warn!(
                         task_id = request.task_id,
                         error = %error,
-                        "failed to snapshot runtime-only dirty main state before merge"
+                        "failed to snapshot runtime-only dirty root checkout state before merge"
                     );
                     self.record_orchestrator_action(format!(
-                        "merge queue: runtime-only dirty main snapshot failed before task #{} merge ({error})",
+                        "merge queue: runtime-only dirty root checkout snapshot failed before task #{} merge ({error})",
                         request.task_id
                     ));
                 }
@@ -1674,6 +1887,87 @@ pub(crate) fn persisted_in_flight_merge(project_root: &std::path::Path) -> Optio
         .map(|merge| merge.request.task_id)
 }
 
+/// PID of a live batty daemon (or its watchdog) for this project, if any.
+pub(crate) fn running_daemon_pid(project_root: &std::path::Path) -> Option<u32> {
+    [
+        crate::team::daemon_mgmt::daemon_child_pid_path(project_root),
+        crate::team::daemon_mgmt::watchdog_pid_path(project_root),
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|content| content.trim().parse::<u32>().ok())
+    .find(|pid| *pid > 0 && crate::team::daemon_mgmt::process_exists(*pid))
+}
+
+/// Task id of a persisted in-flight merge that no daemon is driving: the
+/// daemon stopped or crashed mid-verification. `batty start` resumes it;
+/// until then it blocks `batty merge`.
+pub(crate) fn stale_in_flight_merge(project_root: &std::path::Path) -> Option<u32> {
+    let task_id = persisted_in_flight_merge(project_root)?;
+    running_daemon_pid(project_root)
+        .is_none()
+        .then_some(task_id)
+}
+
+/// Drop a persisted in-flight merge left by a daemon that is gone, so
+/// `batty merge` can run again. Refuses while a daemon runs or the merge
+/// lock is held. Returns the cleared record (`None` if there was nothing to
+/// clear). The merge itself stays on trunk, unverified.
+pub(crate) fn clear_stale_in_flight_merge(
+    project_root: &std::path::Path,
+) -> Result<Option<PersistedInFlightMerge>> {
+    if let Some(pid) = running_daemon_pid(project_root) {
+        bail!(
+            "the batty daemon is running (PID {pid}); it owns the in-flight merge. Stop it with `batty stop` first"
+        );
+    }
+    // Holding the lock keeps a daemon that starts meanwhile from restoring
+    // the record and resuming it underneath us.
+    let Some(_lock) = MergeLock::try_acquire(project_root)? else {
+        bail!("another merge holds the merge lock; retry once it finishes");
+    };
+    let Some(mut state) = super::state::load_daemon_state(project_root) else {
+        return Ok(None);
+    };
+    let Some(cleared) = state.merge_queue.in_flight.take() else {
+        return Ok(None);
+    };
+    super::state::save_daemon_state(project_root, &state)
+        .context("failed to save the daemon state without the in-flight merge")?;
+    Ok(Some(cleared))
+}
+
+/// Remove the post-merge verify worktree (and its git admin entry). Its
+/// build output lives in the shared target dir, so only the checkout goes.
+/// Returns whether anything was removed. Callers must make sure no
+/// verification is using it.
+pub(crate) fn remove_verify_worktree(project_root: &std::path::Path) -> Result<bool> {
+    let path = verify_worktree_path(project_root);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let path_arg = path.to_string_lossy().into_owned();
+    if let Err(error) = crate::git::cmd(project_root)
+        .args(["worktree", "remove", "--force", &path_arg])
+        .allow_fail()
+        .run()
+    {
+        warn!(error = %error, "git worktree remove failed for the verify worktree");
+    }
+    if path.exists() {
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    if let Err(error) = crate::git::cmd(project_root)
+        .args(["worktree", "prune"])
+        .allow_fail()
+        .run()
+    {
+        warn!(error = %error, "git worktree prune failed after removing the verify worktree");
+    }
+    Ok(true)
+}
+
 fn merge_request_skip_reason(
     project_root: &std::path::Path,
     request: &MergeRequest,
@@ -1835,6 +2129,7 @@ fn mark_review_merge_blocked(board_dir: &std::path::Path, task_id: u32, block_de
 
 fn snapshot_runtime_dirty_main(
     project_root: &std::path::Path,
+    trunk_branch: &str,
     request: &MergeRequest,
     task_title: &str,
     root_dirty: &RootDirtyState,
@@ -1854,16 +2149,21 @@ fn snapshot_runtime_dirty_main(
     .find(|task| task.id == request.task_id)
     .unwrap_or_else(|| fallback_snapshot_task(request, task_title));
     let source_head = git_head(project_root).ok();
+    // The root checkout's branch (the trunk, unless the root is on another
+    // branch and merges run isolated).
+    let root_branch =
+        current_worktree_branch(project_root).unwrap_or_else(|_| trunk_branch.to_string());
     let reason = format!(
-        "runtime-only dirty main before review merge; paths: {}",
+        "runtime-only dirty root checkout ({root_branch}) before review merge into {trunk_branch}; paths: {}",
         root_dirty.runtime_paths.join(", ")
     );
+    // The lane record key stays "main" (the root checkout's lane).
     let snapshot_path = crate::team::checkpoint::write_dirty_lane_snapshot(
         project_root,
         project_root,
         "main",
         &task,
-        "main",
+        &root_branch,
         &request.branch,
         &reason,
         source_head.as_deref(),
@@ -1876,7 +2176,7 @@ fn snapshot_runtime_dirty_main(
     let record = crate::team::checkpoint::PreservedLaneRecord::snapshot(
         "main",
         &task,
-        "main",
+        &root_branch,
         &request.branch,
         &reason,
         source_head,
@@ -2263,7 +2563,7 @@ fn post_merge_verification_dir(
 /// Check out `target` (detached) in `.batty/verify-worktree`, reusing the
 /// worktree (and its build cache) when possible and recreating it otherwise.
 fn prepare_verify_worktree(project_root: &std::path::Path, target: &str) -> Result<PathBuf> {
-    let path = project_root.join(VERIFY_WORKTREE_DIR);
+    let path = verify_worktree_path(project_root);
     if path.join(".git").exists() {
         let checkout = crate::git::cmd(&path)
             .args(["checkout", "--detach", "--force", target])
@@ -2576,10 +2876,86 @@ mod tests {
         }
         assert_eq!(queue.active_task_id(), None);
         assert_eq!(queue.queued_len(), 2, "failed request must not be lost");
-        // Backoff holds the head of the queue (keeps merges in FIFO order).
-        assert!(queue.begin_next(now).is_none());
+        // The failed request waits out its backoff without holding up the
+        // unrelated request behind it.
+        let next = queue.begin_next(now).unwrap();
+        assert_eq!(next.task_id, 100);
+        queue.finish(next, done(MergeQueueOutcome::Success), now);
+        assert!(queue.begin_next(now).is_none(), "99 is still backing off");
         let later = now + MERGE_RETRY_BASE_DELAY;
         assert_eq!(queue.begin_next(later).unwrap().task_id, 99);
+    }
+
+    #[test]
+    fn retried_request_keeps_its_place_in_line() {
+        let mut queue = MergeQueue::default();
+        for task_id in [1, 2, 3] {
+            queue.enqueue(request(task_id));
+        }
+        let now = Instant::now();
+        let first = queue.begin_next(now).unwrap();
+        queue.finish(first, Err(anyhow!("transient")), now);
+        let later = now + MERGE_RETRY_MAX_DELAY;
+        // Once its backoff passed, 1 is first again (FIFO kept).
+        assert_eq!(queue.begin_next(later).unwrap().task_id, 1);
+    }
+
+    #[test]
+    fn dirty_root_deferral_does_not_block_unrelated_requests() {
+        let mut queue = MergeQueue::default();
+        queue.enqueue(request(5));
+        queue.enqueue(request(6));
+        let now = Instant::now();
+        let first = queue.begin_next(now).unwrap();
+        queue.finish(
+            first,
+            Ok(MergeAttempt::DirtyRootDeferred(dirty_root(&["a.txt"]))),
+            now,
+        );
+        assert_eq!(queue.begin_next(now).unwrap().task_id, 6);
+    }
+
+    #[test]
+    fn busy_lock_escalates_after_threshold_then_hourly() {
+        let mut queue = MergeQueue::default();
+        let start = Instant::now();
+        let after = Duration::from_secs(600);
+        assert_eq!(queue.note_lock_busy(start, after), None);
+        assert_eq!(
+            queue.note_lock_busy(start + Duration::from_secs(599), after),
+            None
+        );
+        assert_eq!(
+            queue.note_lock_busy(start + after, after),
+            Some(after),
+            "escalated once the threshold passes"
+        );
+        assert_eq!(
+            queue.note_lock_busy(start + after + Duration::from_secs(60), after),
+            None,
+            "not again within the hour"
+        );
+        let next = start + after + MERGE_LOCK_BUSY_REESCALATE_EVERY;
+        assert_eq!(
+            queue.note_lock_busy(next, after),
+            Some(after + MERGE_LOCK_BUSY_REESCALATE_EVERY)
+        );
+        // Taking the lock starts a new episode.
+        queue.clear_lock_busy();
+        assert_eq!(queue.note_lock_busy(next, after), None);
+    }
+
+    #[test]
+    fn acquired_lock_resets_the_busy_clock() {
+        let mut queue = MergeQueue::default();
+        queue.enqueue(request(3));
+        let start = Instant::now();
+        let after = Duration::from_secs(600);
+        queue.note_lock_busy(start, after);
+        let taken = queue.begin_next(start).unwrap();
+        queue.finish(taken, done(MergeQueueOutcome::Success), start);
+        assert!(queue.lock_busy.is_none());
+        assert_eq!(queue.note_lock_busy(start + after, after), None);
     }
 
     #[test]
@@ -2696,7 +3072,7 @@ mod tests {
     #[test]
     fn suspend_in_flight_kills_job_and_marks_pending() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let job = TestJob::spawn("suspend", move |_| {
+        let job = TestJob::spawn_with_timeout("suspend", None, move |_| {
             let _ = release_rx.recv();
             Err(anyhow!("cancelled"))
         });
@@ -3062,7 +3438,7 @@ mod tests {
         let repo = init_git_repo(&tmp, "batty-merge-queue-smoke-wait");
         let mut daemon = make_test_daemon(&repo, vec![manager_member("manager", None)]);
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let job = TestJob::spawn("smoke", move |_| {
+        let job = TestJob::spawn_with_timeout("smoke", None, move |_| {
             let _ = release_rx.recv();
             Err(anyhow!("released"))
         });
@@ -3653,7 +4029,7 @@ mod tests {
         assert!(daemon.merge.queue.is_verifying());
         // Replace the running job with one whose worker died without a result.
         let job: TestJob<VerificationRunResult> =
-            TestJob::spawn("dies", |_| panic!("worker crashed"));
+            TestJob::spawn_with_timeout("dies", None, |_| panic!("worker crashed"));
         daemon.merge.queue.in_flight.as_mut().unwrap().verify = PostMergeVerify::Running(job);
 
         drain_merge_queue(&mut daemon);
@@ -3879,7 +4255,7 @@ mod tests {
             "merged"
         );
         assert_eq!(task_status(&repo), "done");
-        assert!(repo.join(VERIFY_WORKTREE_DIR).join("trigger.txt").exists());
+        assert!(verify_worktree_path(&repo).join("trigger.txt").exists());
     }
 
     #[test]
@@ -4165,6 +4541,237 @@ mod tests {
         assert!(!daemon.merge.queue.is_verifying());
     }
 
+    fn manager_inbox_containing(repo: &Path, needle: &str) -> Vec<String> {
+        manager_inbox(repo)
+            .into_iter()
+            .filter(|body| body.contains(needle))
+            .collect()
+    }
+
+    #[test]
+    fn busy_merge_lock_is_escalated_with_the_holder_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, mut daemon) = queued_verified_merge(&tmp, "true");
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .auto_merge
+            .lock_busy_escalate_after_secs = 600;
+        let held = MergeLock::try_acquire(&repo).unwrap().unwrap();
+        let start = Instant::now();
+        daemon.process_merge_queue_step(start);
+        assert!(manager_inbox_containing(&repo, "merge lock").is_empty());
+
+        // Ten minutes later (past the lock-busy backoff) it escalates once.
+        let later = start + Duration::from_secs(600);
+        daemon.process_merge_queue_step(later);
+        daemon.process_merge_queue_step(later + Duration::from_secs(5));
+        let escalations = manager_inbox_containing(&repo, "merge lock");
+        assert_eq!(escalations.len(), 1, "{escalations:?}");
+        assert!(
+            escalations[0].contains(&format!("PID {}", std::process::id())),
+            "{}",
+            escalations[0]
+        );
+        assert!(escalations[0].contains("Task #42"));
+
+        // And again an hour later while it stays busy.
+        daemon.process_merge_queue_step(later + MERGE_LOCK_BUSY_REESCALATE_EVERY);
+        assert_eq!(manager_inbox_containing(&repo, "merge lock").len(), 2);
+        drop(held);
+    }
+
+    #[test]
+    fn busy_merge_lock_blocking_an_in_flight_merge_is_escalated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-merge-lock-busy-in-flight");
+        let head = current_head(&repo);
+        let members = vec![
+            manager_member("manager", None),
+            engineer_member("eng-1", Some("manager"), true),
+        ];
+        let mut daemon = make_test_daemon(&repo, members);
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .auto_merge
+            .lock_busy_escalate_after_secs = 0;
+        daemon.merge.queue.in_flight = Some(InFlightMerge::new(
+            request(42),
+            head.clone(),
+            Some(head),
+            MergeMode::DirectRoot,
+            None,
+            PostMergeVerify::Failed("boom".to_string()),
+            None,
+        ));
+        // An older binary's empty marker: the holder is unknown.
+        let lock_path = crate::team::merge::merge_lock_path(&repo);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, "").unwrap();
+
+        daemon.process_merge_queue().unwrap();
+        daemon.process_merge_queue().unwrap();
+        let escalations = manager_inbox_containing(&repo, "merge lock");
+        assert_eq!(escalations.len(), 1, "{escalations:?}");
+        assert!(
+            escalations[0].contains("holder unknown"),
+            "{}",
+            escalations[0]
+        );
+        assert!(daemon.merge.queue.is_verifying(), "revert still pending");
+    }
+
+    #[test]
+    fn verify_setup_failure_retries_and_escalates_without_reverting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, mut daemon, pre) = queued_develop_merge(&tmp, "true");
+        // A file where the verify worktree belongs: preparing it fails.
+        let verify_dir = verify_worktree_path(&repo);
+        std::fs::create_dir_all(verify_dir.parent().unwrap()).unwrap();
+        std::fs::write(&verify_dir, "not a directory\n").unwrap();
+
+        daemon.process_merge_queue().unwrap();
+        let merged = crate::team::test_support::git_stdout(&repo, &["rev-parse", "develop"]);
+        assert_ne!(merged, pre, "merge landed");
+        for failure in 1..=VERIFY_SETUP_ESCALATE_AFTER {
+            poll_until(&mut daemon, "setup failure", |daemon| {
+                daemon
+                    .merge
+                    .queue
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|merge| merge.setup_failures == failure)
+            });
+            let merge = daemon.merge.queue.in_flight.as_mut().unwrap();
+            assert!(matches!(merge.verify, PostMergeVerify::Pending));
+            assert!(merge.setup_retry_at.is_some(), "retried with backoff");
+            merge.setup_retry_at = Some(Instant::now());
+        }
+        assert_eq!(
+            crate::team::test_support::git_stdout(&repo, &["rev-parse", "develop"]),
+            merged,
+            "a setup failure must never revert the merge"
+        );
+        let escalations = manager_inbox_containing(&repo, "could not prepare");
+        assert_eq!(escalations.len(), 1, "{escalations:?}");
+        assert!(merged_task_still_in_review(&repo));
+
+        // Once setup works again, verification runs and the merge lands.
+        std::fs::remove_file(&verify_dir).unwrap();
+        poll_until(&mut daemon, "verification", |daemon| {
+            !daemon.merge.queue.is_verifying()
+        });
+        assert_eq!(task_status(&repo), "done");
+        assert_eq!(
+            crate::team::test_support::git_stdout(&repo, &["rev-parse", "develop"]),
+            merged
+        );
+    }
+
+    fn merged_task_still_in_review(repo: &Path) -> bool {
+        task_status(repo) == "review"
+    }
+
+    #[test]
+    fn post_merge_verification_uses_the_configured_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, mut daemon) = queued_verified_merge(&tmp, "sleep 30");
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .verification
+            .timeout_secs = 1;
+        let pre = current_head(&repo);
+        let started = Instant::now();
+        drain_merge_queue(&mut daemon);
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "the 1s limit must stop the 30s test"
+        );
+        assert_eq!(current_head(&repo), pre, "timed-out verification reverts");
+        assert_eq!(task_status(&repo), "review");
+    }
+
+    #[test]
+    fn verify_worktree_is_removed_when_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, mut daemon, _pre) = queued_develop_merge(&tmp, "true");
+        drain_merge_queue(&mut daemon);
+        let verify_dir = verify_worktree_path(&repo);
+        assert!(verify_dir.join(".git").exists(), "verification used it");
+
+        assert!(daemon.remove_idle_verify_worktree());
+        assert!(!verify_dir.exists());
+        let worktrees = crate::team::test_support::git_stdout(&repo, &["worktree", "list"]);
+        assert!(!worktrees.contains("verify-worktree"), "{worktrees}");
+        assert!(!daemon.remove_idle_verify_worktree(), "nothing left");
+    }
+
+    #[test]
+    fn verify_worktree_is_kept_while_verifying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-verify-keep");
+        let mut daemon = make_test_daemon(&repo, Vec::new());
+        let verify_dir = verify_worktree_path(&repo);
+        std::fs::create_dir_all(&verify_dir).unwrap();
+        daemon.merge.queue.mark_in_flight_for_test(request(1));
+        assert!(!daemon.remove_idle_verify_worktree());
+        assert!(verify_dir.exists());
+    }
+
+    fn persist_in_flight(repo: &Path, task_id: u32) {
+        let mut daemon = make_test_daemon(repo, Vec::new());
+        daemon.merge.queue.mark_in_flight_for_test(request(task_id));
+        daemon.persist_merge_queue_change();
+    }
+
+    #[test]
+    fn stale_in_flight_merge_is_reported_and_cleared_without_a_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-stale-in-flight");
+        persist_in_flight(&repo, 77);
+        assert_eq!(persisted_in_flight_merge(&repo), Some(77));
+        assert_eq!(stale_in_flight_merge(&repo), Some(77));
+
+        let cleared = clear_stale_in_flight_merge(&repo).unwrap().unwrap();
+        assert_eq!(cleared.request.task_id, 77);
+        assert_eq!(persisted_in_flight_merge(&repo), None);
+        assert_eq!(stale_in_flight_merge(&repo), None);
+        assert!(clear_stale_in_flight_merge(&repo).unwrap().is_none());
+    }
+
+    #[test]
+    fn in_flight_merge_of_a_running_daemon_is_not_stale_or_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-live-in-flight");
+        persist_in_flight(&repo, 78);
+        // A live process stands in for the daemon.
+        std::fs::write(
+            crate::team::daemon_mgmt::daemon_child_pid_path(&repo),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        assert_eq!(stale_in_flight_merge(&repo), None);
+        let error = clear_stale_in_flight_merge(&repo).unwrap_err();
+        assert!(error.to_string().contains("daemon is running"), "{error}");
+        assert_eq!(persisted_in_flight_merge(&repo), Some(78));
+    }
+
+    #[test]
+    fn clearing_a_stale_merge_waits_for_the_merge_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "batty-stale-locked");
+        persist_in_flight(&repo, 79);
+        let held = MergeLock::try_acquire(&repo).unwrap().unwrap();
+        assert!(clear_stale_in_flight_merge(&repo).is_err());
+        assert_eq!(persisted_in_flight_merge(&repo), Some(79));
+        drop(held);
+    }
+
     fn dirty_root(paths: &[&str]) -> RootCheckoutDirty {
         RootCheckoutDirty {
             trunk_branch: "main".to_string(),
@@ -4179,7 +4786,7 @@ mod tests {
         queue.enqueue(request(9));
         let now = Instant::now();
         for deferral in 1..=4 {
-            queue.not_before = None;
+            queue.retry_at.clear();
             let next = queue.begin_next(now).unwrap();
             let step = queue.finish(
                 next,
@@ -4200,13 +4807,13 @@ mod tests {
                 other => panic!("expected a dirty-root deferral, got {other:?}"),
             }
             assert_eq!(queue.queued_len(), 1, "deferred requests stay queued");
-            assert!(queue.not_before.is_some(), "retried on the backoff");
+            assert!(queue.retry_at.contains_key(&9), "retried on the backoff");
         }
         assert!(
             queue.snapshot().attempts.is_empty(),
             "deferrals do not use up merge attempts"
         );
-        queue.not_before = None;
+        queue.retry_at.clear();
         let next = queue.begin_next(now).unwrap();
         queue.finish(next, done(MergeQueueOutcome::Success), now);
         assert!(queue.dirty_root_deferrals.is_empty());
@@ -4259,7 +4866,7 @@ mod tests {
         daemon.merge.queue.enqueue(request(11));
         let now = Instant::now();
         for _ in 0..4 {
-            daemon.merge.queue.not_before = None;
+            daemon.merge.queue.retry_at.clear();
             let next = daemon.merge.queue.begin_next(now).unwrap();
             let step = daemon.merge.queue.finish(
                 next,

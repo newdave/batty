@@ -932,13 +932,16 @@ Merge an engineer's worktree branch into main
 ```text
 Merge an engineer's worktree branch into main
 
-Usage: batty merge [OPTIONS] <ENGINEER>
+Usage: batty merge [OPTIONS] [ENGINEER]
 
 Arguments:
-  <ENGINEER>
+  [ENGINEER]
           Engineer instance name (e.g., "eng-1-1")
 
 Options:
+      --force-clear-stale
+          Clear a merge that a stopped or crashed daemon left in post-merge verification (it blocks `batty merge`). Refused while the daemon runs. The merge itself stays on trunk, unverified
+
   -v, --verbose...
           Verbosity level (-v, -vv, -vvv)
 

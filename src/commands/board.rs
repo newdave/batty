@@ -149,8 +149,17 @@ pub(super) fn run_review(
     Ok(())
 }
 
-pub(super) fn run_merge(root: &Path, engineer: String) -> Result<()> {
-    team::merge_worktree(root, &engineer)?;
+pub(super) fn run_merge(
+    root: &Path,
+    engineer: Option<String>,
+    force_clear_stale: bool,
+) -> Result<()> {
+    if force_clear_stale {
+        println!("{}", team::clear_stale_merge(root)?);
+    }
+    if let Some(engineer) = engineer {
+        team::merge_worktree(root, &engineer)?;
+    }
     Ok(())
 }
 

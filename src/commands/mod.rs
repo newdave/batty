@@ -79,7 +79,10 @@ pub fn dispatch(root: &Path, command: Command) -> Result<()> {
             feedback,
             reviewer,
         } => board::run_review(root, task_id, disposition, feedback, reviewer)?,
-        Command::Merge { engineer } => board::run_merge(root, engineer)?,
+        Command::Merge {
+            engineer,
+            force_clear_stale,
+        } => board::run_merge(root, engineer, force_clear_stale)?,
         Command::Task { command } => board::run_task(root, command)?,
         Command::Activity { command } => board::run_activity(root, command)?,
         Command::Metrics => metrics::run_metrics(root)?,

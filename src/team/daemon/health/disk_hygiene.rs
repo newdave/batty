@@ -20,6 +20,8 @@ pub(crate) struct HygieneReport {
     pub inbox_messages_rotated: usize,
     pub git_gc_ran: bool,
     pub branches_pruned: Vec<String>,
+    /// The idle post-merge verify worktree was removed.
+    pub verify_worktree_removed: bool,
 }
 
 impl HygieneReport {
@@ -29,6 +31,7 @@ impl HygieneReport {
             || self.inbox_messages_rotated > 0
             || self.git_gc_ran
             || !self.branches_pruned.is_empty()
+            || self.verify_worktree_removed
     }
 
     pub fn summary(&self) -> String {
@@ -53,6 +56,9 @@ impl HygieneReport {
         }
         if !self.branches_pruned.is_empty() {
             parts.push(format!("branches: {} pruned", self.branches_pruned.len()));
+        }
+        if self.verify_worktree_removed {
+            parts.push("verify worktree: removed".to_string());
         }
         if parts.is_empty() {
             "no cleanup needed".to_string()
@@ -81,7 +87,8 @@ impl TeamDaemon {
         self.health.last_disk_hygiene_check = Some(Instant::now());
 
         let project_root = self.project_root().to_path_buf();
-        let report = run_disk_hygiene(&project_root, config)?;
+        let mut report = run_disk_hygiene(&project_root, config)?;
+        report.verify_worktree_removed = self.remove_idle_verify_worktree();
 
         if report.any_action_taken() {
             let summary = report.summary();
@@ -93,6 +100,24 @@ impl TeamDaemon {
         }
 
         Ok(())
+    }
+}
+
+impl TeamDaemon {
+    /// Remove `.batty/verify-worktree` unless a post-merge verification is
+    /// using it (its build output stays in the shared target dir). Returns
+    /// whether it was removed.
+    pub(in super::super) fn remove_idle_verify_worktree(&self) -> bool {
+        if self.merge.queue.is_verifying() {
+            return false;
+        }
+        match crate::team::daemon::remove_verify_worktree(self.project_root()) {
+            Ok(removed) => removed,
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "failed to remove the idle verify worktree");
+                false
+            }
+        }
     }
 }
 
@@ -448,6 +473,7 @@ mod tests {
             inbox_messages_rotated: 10,
             git_gc_ran: true,
             branches_pruned: vec!["eng-1/42".to_string()],
+            verify_worktree_removed: true,
         };
         assert!(report.any_action_taken());
         let summary = report.summary();
@@ -456,6 +482,7 @@ mod tests {
         assert!(summary.contains("inbox: 10 messages rotated"));
         assert!(summary.contains("git gc: ran"));
         assert!(summary.contains("branches: 1 pruned"));
+        assert!(summary.contains("verify worktree: removed"));
     }
 
     #[test]

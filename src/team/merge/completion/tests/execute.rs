@@ -787,3 +787,34 @@ fn long_deferred_direct_merge_escalates_once() {
     assert!(daemon.merge.deferred_direct[0].escalated);
     assert_eq!(daemon.merge.deferred_direct.len(), 1, "still retried");
 }
+
+#[test]
+fn failing_deferred_direct_merge_is_kept_with_backoff() {
+    let (_tmp, project, sub_repo, mut daemon, held) = deferred_multi_repo_merge();
+    let main_before = head_of(&sub_repo, "main");
+    drop(held);
+    // A directory where the lock file belongs: taking the lock errors.
+    let lock_path = crate::team::merge::merge_lock_path(&project);
+    std::fs::create_dir_all(&lock_path).unwrap();
+
+    assert!(poll_deferred_direct_merges(&mut daemon).is_err());
+    assert_eq!(daemon.merge.deferred_direct.len(), 1, "entry must be kept");
+    let entry = &daemon.merge.deferred_direct[0];
+    assert_eq!(entry.failed_attempts, 1);
+    assert!(entry.retry_after > crate::team::merge::git_ops::now_unix());
+    // Persisted too, so a restart keeps it.
+    let mut restarted = restarted_multi_repo_daemon(&project);
+    restarted.restore_merge_queue_state();
+    assert_eq!(restarted.merge.deferred_direct.len(), 1);
+
+    // In backoff: the next tick does not retry.
+    poll_deferred_direct_merges(&mut daemon).unwrap();
+    assert_eq!(daemon.merge.deferred_direct[0].failed_attempts, 1);
+
+    // Once the cause is gone and the backoff passed, the merge lands.
+    std::fs::remove_dir(&lock_path).unwrap();
+    daemon.merge.deferred_direct[0].retry_after = 0;
+    poll_deferred_direct_merges(&mut daemon).unwrap();
+    assert!(daemon.merge.deferred_direct.is_empty());
+    assert_ne!(head_of(&sub_repo, "main"), main_before);
+}

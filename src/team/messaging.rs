@@ -523,6 +523,11 @@ pub fn merge_worktree(project_root: &Path, engineer: &str) -> Result<()> {
     let engineer = resolve_member_name(project_root, engineer)?;
     let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
     if let Some(task_id) = crate::team::daemon::persisted_in_flight_merge(project_root) {
+        if crate::team::daemon::stale_in_flight_merge(project_root).is_some() {
+            bail!(
+                "the merge of task #{task_id} on {trunk_branch} is still marked in post-merge verification, but no daemon is running; `batty start` resumes it, or `batty merge --force-clear-stale` clears it"
+            );
+        }
         bail!(
             "merge queue is still verifying the merge of task #{task_id} on {trunk_branch}; retry once it finishes"
         );
@@ -537,6 +542,31 @@ pub fn merge_worktree(project_root: &Path, engineer: &str) -> Result<()> {
         }
         merge::MergeOutcome::MergeFailure(stderr) => bail!("merge failed: {stderr}"),
     }
+}
+
+/// `batty merge --force-clear-stale`: drop an in-flight merge left by a
+/// daemon that is no longer running. Returns what was cleared, for printing.
+pub fn clear_stale_merge(project_root: &Path) -> Result<String> {
+    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
+    let Some(cleared) = crate::team::daemon::clear_stale_in_flight_merge(project_root)? else {
+        return Ok("No in-flight merge to clear.".to_string());
+    };
+    let request = &cleared.request;
+    let state = if cleared.failure_output.is_some() {
+        "its post-merge verification had FAILED and the revert was still pending"
+    } else {
+        "its post-merge verification had not finished"
+    };
+    Ok(format!(
+        "Cleared the in-flight merge of task #{} ({}, branch {}): {state}.\n\
+         The merge is still on {trunk_branch}, unverified. Pre-merge commit: {}; merge result: {}.\n\
+         Check {trunk_branch} yourself and revert to the pre-merge commit if it is broken.",
+        request.task_id,
+        request.engineer,
+        request.branch,
+        cleared.pre_merge_head,
+        cleared.post_merge_head.as_deref().unwrap_or("not recorded"),
+    ))
 }
 
 /// Run the interactive Telegram setup wizard.

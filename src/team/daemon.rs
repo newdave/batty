@@ -121,7 +121,8 @@ use self::launcher::{
     duplicate_claude_session_ids, load_launch_state, member_session_tracker_config,
 };
 pub(crate) use self::merge_queue::{
-    MergeOrigin, MergeQueue, MergeRequest, persisted_in_flight_merge,
+    MergeOrigin, MergeQueue, MergeRequest, clear_stale_in_flight_merge, persisted_in_flight_merge,
+    remove_verify_worktree, stale_in_flight_merge,
 };
 pub use self::state::load_dispatch_queue_snapshot;
 #[cfg(test)]
@@ -486,9 +487,6 @@ impl TeamDaemon {
 
     /// Create a new daemon from resolved config and layout.
     pub fn new(config: DaemonConfig) -> Result<Self> {
-        crate::team::test_job::set_default_timeout_secs(
-            config.team_config.workflow_policy.verification.timeout_secs,
-        );
         let is_git_repo = super::git_cmd::is_git_repo(&config.project_root);
         let (is_multi_repo, sub_repo_names) = if is_git_repo {
             (false, Vec::new())

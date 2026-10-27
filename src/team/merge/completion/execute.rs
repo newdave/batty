@@ -76,6 +76,8 @@ pub(super) fn merge_directly(
         test_duration_ms: verified.test_duration_ms,
         deferred_since: now_unix(),
         escalated: false,
+        failed_attempts: 0,
+        retry_after: 0,
     };
     let DirectMergeAttempt::Deferred(reason) = attempt_direct_merge(daemon, &merge)? else {
         return Ok(());
@@ -163,10 +165,28 @@ pub(crate) struct DeferredDirectMerge {
     /// Whether the long deferral has been escalated already.
     #[serde(default)]
     pub(crate) escalated: bool,
+    /// Consecutive attempts that failed with an error before merging.
+    #[serde(default)]
+    pub(crate) failed_attempts: u32,
+    /// Unix seconds before which a failed merge is not retried.
+    #[serde(default)]
+    pub(crate) retry_after: u64,
 }
 
 /// A deferred direct merge older than this is escalated once.
 pub(crate) const DEFERRED_DIRECT_MERGE_ESCALATE_AFTER: Duration = Duration::from_secs(30 * 60);
+/// A direct merge whose attempts keep failing with an error is escalated
+/// once after this many in a row (it is still retried, with backoff).
+pub(crate) const DIRECT_MERGE_FAILURE_ESCALATE_AFTER: u32 = 5;
+
+/// Backoff after `failures` failed direct merge attempts: 5s doubling, at
+/// most 5 minutes.
+fn direct_merge_retry_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(6);
+    Duration::from_secs(5)
+        .saturating_mul(1u32 << shift)
+        .min(Duration::from_secs(300))
+}
 
 /// True while `merge` still describes the engineer's work: their active
 /// task is this task, or (after a restart, when active tasks may not be
@@ -267,16 +287,31 @@ fn attempt_direct_merge(
         &trunk_branch,
     );
     drop(lock);
-    match outcome? {
+    // Errors up to here happened before anything landed: the caller retries.
+    // From here on the merge has run, so a failing follow-up (board update,
+    // notifications) is reported but must not trigger another merge.
+    let handled = match outcome? {
         MergeOutcome::Success(success) => {
-            land_direct_merge(daemon, merge, &trunk_branch, success.mode, success.reason)?
+            land_direct_merge(daemon, merge, &trunk_branch, success.mode, success.reason)
         }
         MergeOutcome::RebaseConflict(conflict_info) => {
-            handle_direct_merge_conflict(daemon, merge, &trunk_branch, &conflict_info)?
+            handle_direct_merge_conflict(daemon, merge, &trunk_branch, &conflict_info)
         }
         MergeOutcome::MergeFailure(merge_info) => {
-            handle_direct_merge_failure(daemon, merge, &trunk_branch, &merge_info)?
+            handle_direct_merge_failure(daemon, merge, &trunk_branch, &merge_info)
         }
+    };
+    if let Err(error) = handled {
+        warn!(
+            engineer = %merge.engineer,
+            task_id = merge.task_id,
+            error = %format!("{error:#}"),
+            "direct merge ran but its follow-up failed"
+        );
+        daemon.record_orchestrator_action(format!(
+            "completion merge: task #{} merge ran but its follow-up failed ({error:#}); check the board",
+            merge.task_id
+        ));
     }
     Ok(DirectMergeAttempt::Finished)
 }
@@ -299,6 +334,7 @@ pub(crate) fn poll_deferred_direct_merges(daemon: &mut TeamDaemon) -> Result<()>
         None
     };
     let mut first_error = None;
+    let now = now_unix();
     for mut merge in pending {
         if !deferred_merge_is_current(daemon, &merge, tasks.as_deref()) {
             info!(
@@ -306,6 +342,10 @@ pub(crate) fn poll_deferred_direct_merges(daemon: &mut TeamDaemon) -> Result<()>
                 task_id = merge.task_id,
                 "dropping deferred direct merge: task is no longer active for this engineer"
             );
+            continue;
+        }
+        if now < merge.retry_after {
+            daemon.merge.deferred_direct.push(merge);
             continue;
         }
         match attempt_direct_merge(daemon, &merge) {
@@ -319,16 +359,26 @@ pub(crate) fn poll_deferred_direct_merges(daemon: &mut TeamDaemon) -> Result<()>
                 daemon.merge.deferred_direct.push(merge);
             }
             Err(error) => {
+                // Nothing landed: keep the entry and retry with backoff.
+                merge.failed_attempts = merge.failed_attempts.saturating_add(1);
+                let delay = direct_merge_retry_delay(merge.failed_attempts);
+                merge.retry_after = now_unix() + delay.as_secs();
                 warn!(
                     engineer = %merge.engineer,
                     task_id = merge.task_id,
+                    attempts = merge.failed_attempts,
                     error = %format!("{error:#}"),
                     "deferred direct merge failed before merging; task stays in review"
                 );
                 daemon.record_orchestrator_action(format!(
-                    "completion merge: deferred merge of task #{} failed ({error:#}); task stays in review",
-                    merge.task_id
+                    "completion merge: deferred merge of task #{} failed ({error:#}); task stays in review, retrying in {}s",
+                    merge.task_id,
+                    delay.as_secs()
                 ));
+                if merge.failed_attempts == DIRECT_MERGE_FAILURE_ESCALATE_AFTER {
+                    escalate_failing_direct_merge(daemon, &merge, &error);
+                }
+                daemon.merge.deferred_direct.push(merge);
                 first_error.get_or_insert(error);
             }
         }
@@ -337,6 +387,30 @@ pub(crate) fn poll_deferred_direct_merges(daemon: &mut TeamDaemon) -> Result<()>
         daemon.persist_merge_queue_change();
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Escalate a direct merge whose attempts keep failing before merging.
+fn escalate_failing_direct_merge(
+    daemon: &mut TeamDaemon,
+    merge: &DeferredDirectMerge,
+    error: &anyhow::Error,
+) {
+    let engineer = merge.engineer.as_str();
+    let task_id = merge.task_id;
+    let notice = format!(
+        "ESCALATION: Task #{task_id} from {engineer} passed verification but its merge failed {} times in a row before merging: {error:#}\nIt stays in review and Batty keeps retrying with backoff; fix the cause or merge it manually.",
+        merge.failed_attempts
+    );
+    if let Some(manager_name) = daemon.manager_name(engineer) {
+        if let Err(error) = daemon.queue_message("daemon", &manager_name, &notice) {
+            warn!(error = %error, "failed to deliver direct merge failure escalation");
+        }
+        daemon.mark_member_working(&manager_name);
+        if let Err(error) = daemon.notify_reports_to(&manager_name, &notice) {
+            warn!(error = %error, "failed to notify reports-to of direct merge failures");
+        }
+    }
+    daemon.record_task_escalated(engineer, task_id.to_string(), Some("direct_merge_failing"));
 }
 
 /// Escalate a direct merge deferred for longer than
@@ -599,7 +673,8 @@ fn handle_direct_merge_failure(
         engineer,
         task_id,
         error = %merge_info,
-        "merge into main failed after passing tests; escalated without exiting daemon"
+        trunk = %trunk_branch,
+        "merge into trunk failed after passing tests; escalated without exiting daemon"
     );
     Ok(())
 }

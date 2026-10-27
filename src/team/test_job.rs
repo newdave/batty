@@ -5,12 +5,12 @@
 //! reload), so the daemon runs them on a worker thread and checks for the
 //! result on later polls.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 /// Process-group id of the test command a job is currently running (0 when
 /// no command is running). The worker spawns the command in its own process
@@ -20,22 +20,6 @@ pub(crate) type ChildPgid = Arc<AtomicU32>;
 /// Slot value meaning the job was killed. A command spawned after the kill
 /// sees it and is killed at once instead of running as an orphan.
 const CANCELLED: u32 = u32::MAX;
-
-/// Default wall-clock limit for a test job, in seconds (0 disables the
-/// limit). The daemon mirrors `workflow_policy.verification.timeout_secs`
-/// here so every spawn site, including the merge queue, is bounded.
-static DEFAULT_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(3600);
-
-pub(crate) fn set_default_timeout_secs(secs: u64) {
-    DEFAULT_TIMEOUT_SECS.store(secs, Ordering::Relaxed);
-}
-
-fn default_timeout() -> Option<Duration> {
-    match DEFAULT_TIMEOUT_SECS.load(Ordering::Relaxed) {
-        0 => None,
-        secs => Some(Duration::from_secs(secs)),
-    }
-}
 
 /// Record a freshly spawned child's process group. Returns `false` (and
 /// kills the group) if the job was already cancelled.
@@ -80,6 +64,18 @@ impl std::fmt::Display for TestTimedOut {
 
 impl std::error::Error for TestTimedOut {}
 
+/// Context attached by [`TestJob::spawn_with_setup`] when the setup step
+/// failed, so callers can tell "could not prepare the run" (retryable) from
+/// "the tests failed". Check with `error.downcast_ref::<TestSetupFailed>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TestSetupFailed;
+
+impl std::fmt::Display for TestSetupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not prepare the test run")
+    }
+}
+
 /// A running job as persisted for `batty status`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RunningTestInfo {
@@ -101,37 +97,69 @@ pub(crate) struct TestJob<T> {
     child_pgid: ChildPgid,
     started_at: Instant,
     started_unix_secs: u64,
-    /// Wall-clock limit measured from spawn; `None` means unbounded.
+    /// When the timeout clock started: at spawn, or after the setup step
+    /// for [`TestJob::spawn_with_setup`]. Unset while setup runs.
+    clock_start: Arc<OnceLock<Instant>>,
+    /// Wall-clock limit for the test work (setup excluded); `None` means
+    /// unbounded.
     timeout: Option<Duration>,
 }
 
 impl<T: Send + 'static> TestJob<T> {
-    /// Run `work` on a background thread. `work` receives the pgid slot to
-    /// hand to the tracked test runner.
-    pub(crate) fn spawn(
-        label: impl Into<String>,
-        work: impl FnOnce(&ChildPgid) -> Result<T> + Send + 'static,
-    ) -> Self {
-        Self::spawn_with_timeout(label, default_timeout(), work)
-    }
-
-    /// Like [`spawn`](Self::spawn) with an explicit wall-clock limit. Once it
-    /// is exceeded, `try_take` kills the command's process group and reports
-    /// a "timed out" error.
+    /// Run `work` on a background thread with an explicit wall-clock limit
+    /// (`None` for none; every caller passes its configured limit). `work`
+    /// receives the pgid slot to hand to the tracked test runner. Once the
+    /// limit is exceeded, `try_take` kills the command's process group and
+    /// reports a "timed out" error.
     pub(crate) fn spawn_with_timeout(
         label: impl Into<String>,
         timeout: Option<Duration>,
         work: impl FnOnce(&ChildPgid) -> Result<T> + Send + 'static,
     ) -> Self {
-        let label = label.into();
+        let clock_start = Arc::new(OnceLock::new());
+        let _ = clock_start.set(Instant::now());
+        Self::spawn_inner(label.into(), timeout, clock_start, move |pgid, _| {
+            work(pgid)
+        })
+    }
+
+    /// Run `setup` and then `work` on a background thread. The timeout
+    /// clock starts only once `setup` succeeds, so slow preparation (such as
+    /// checking out a worktree) never counts against the test limit. A
+    /// `setup` error is reported with [`TestSetupFailed`] context.
+    pub(crate) fn spawn_with_setup<S>(
+        label: impl Into<String>,
+        timeout: Option<Duration>,
+        setup: impl FnOnce() -> Result<S> + Send + 'static,
+        work: impl FnOnce(S, &ChildPgid) -> Result<T> + Send + 'static,
+    ) -> Self {
+        Self::spawn_inner(
+            label.into(),
+            timeout,
+            Arc::new(OnceLock::new()),
+            move |pgid, clock_start| {
+                let prepared = setup().context(TestSetupFailed)?;
+                let _ = clock_start.set(Instant::now());
+                work(prepared, pgid)
+            },
+        )
+    }
+
+    fn spawn_inner(
+        label: String,
+        timeout: Option<Duration>,
+        clock_start: Arc<OnceLock<Instant>>,
+        work: impl FnOnce(&ChildPgid, &OnceLock<Instant>) -> Result<T> + Send + 'static,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let child_pgid: ChildPgid = Arc::new(AtomicU32::new(0));
         let worker_pgid = Arc::clone(&child_pgid);
+        let worker_clock = Arc::clone(&clock_start);
         let thread_name = format!("batty-test-{label}");
         let spawn_result = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let _ = tx.send(work(&worker_pgid));
+                let _ = tx.send(work(&worker_pgid, &worker_clock));
             });
         if let Err(error) = spawn_result {
             // The closure (and its sender) was dropped, so `try_take` reports
@@ -146,6 +174,7 @@ impl<T: Send + 'static> TestJob<T> {
             started_unix_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
+            clock_start,
             timeout,
         }
     }
@@ -158,9 +187,8 @@ impl<T> TestJob<T> {
         match self.rx.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => {
-                let limit = self
-                    .timeout
-                    .filter(|limit| self.started_at.elapsed() >= *limit)?;
+                let started = *self.clock_start.get()?;
+                let limit = self.timeout.filter(|limit| started.elapsed() >= *limit)?;
                 tracing::warn!(
                     label = %self.label,
                     timeout_secs = limit.as_secs(),
@@ -222,7 +250,7 @@ mod tests {
     #[test]
     fn try_take_is_none_while_running_then_returns_result() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let job = TestJob::spawn("unit", move |_| {
+        let job = TestJob::spawn_with_timeout("unit", None, move |_| {
             release_rx.recv().unwrap();
             Ok(7)
         });
@@ -233,7 +261,7 @@ mod tests {
 
     #[test]
     fn panicking_worker_reports_error_instead_of_hanging() {
-        let job: TestJob<u32> = TestJob::spawn("panics", |_| panic!("boom"));
+        let job: TestJob<u32> = TestJob::spawn_with_timeout("panics", None, |_| panic!("boom"));
         let result = job.wait(Duration::from_secs(5)).expect("job should finish");
         assert!(result.unwrap_err().to_string().contains("without a result"));
     }
@@ -312,6 +340,63 @@ mod tests {
     }
 
     #[test]
+    fn setup_time_does_not_count_against_the_timeout() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let job = TestJob::spawn_with_setup(
+            "setup",
+            Some(Duration::from_millis(50)),
+            move || {
+                release_rx.recv().unwrap();
+                Ok(3)
+            },
+            |prepared, _| Ok(prepared * 2),
+        );
+        // Setup is still running well past the limit: not a timeout.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(job.try_take().is_none(), "setup must not time out");
+        release_tx.send(()).unwrap();
+        assert_eq!(job.wait(Duration::from_secs(5)).unwrap().unwrap(), 6);
+    }
+
+    #[test]
+    fn work_after_setup_is_still_bounded() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let job = TestJob::spawn_with_setup(
+            "bounded",
+            Some(Duration::from_millis(50)),
+            || Ok(()),
+            move |(), _| {
+                let _ = release_rx.recv();
+                Ok(1)
+            },
+        );
+        let mut outcome = None;
+        assert!(
+            crate::team::test_support::wait_until(Duration::from_secs(10), || {
+                outcome = job.try_take();
+                outcome.is_some()
+            }),
+            "work past the limit must time out"
+        );
+        let error = outcome.unwrap().unwrap_err();
+        assert!(error.downcast_ref::<TestTimedOut>().is_some(), "{error:#}");
+        drop(release_tx);
+    }
+
+    #[test]
+    fn setup_errors_are_marked_as_setup_failures() {
+        let job: TestJob<u32> = TestJob::spawn_with_setup(
+            "setup-fails",
+            None,
+            || -> Result<()> { anyhow::bail!("index.lock exists") },
+            |(), _| Ok(1),
+        );
+        let error = job.wait(Duration::from_secs(5)).unwrap().unwrap_err();
+        assert!(error.downcast_ref::<TestSetupFailed>().is_some());
+        assert!(format!("{error:#}").contains("index.lock exists"));
+    }
+
+    #[test]
     fn running_test_summary_shows_elapsed_minutes_and_seconds() {
         let info = RunningTestInfo {
             label: "verify-eng-1".into(),
@@ -336,7 +421,7 @@ mod tests {
         let marker = dir.join("ran");
         let command = format!("touch '{}'", marker.display());
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let job = TestJob::spawn("early-kill", move |pgid| {
+        let job = TestJob::spawn_with_timeout("early-kill", None, move |pgid| {
             release_rx.recv().unwrap();
             crate::team::task_loop::run_tests_in_worktree_tracked(&dir, Some(&command), Some(pgid))
         });

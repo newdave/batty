@@ -6,9 +6,10 @@ This guide covers changes you may need to act on when upgrading from batty 0.11.
 
 ## Upgrade steps
 
-1. Stop running teams with `batty stop` before installing the new binary. The
-   merge lock is compatible with older binaries, but stopping first avoids a
-   daemon hot-reloading in the middle of a merge.
+1. Stop running teams with `batty stop` before installing the new binary, and
+   don't let old and new binaries merge in the same project at the same time.
+   An older binary's empty `merge.lock` is treated as held for up to an hour,
+   so a mixed setup can stall merges rather than corrupt them.
 2. Install the new binary and run `batty validate` in each project. Fix any
    errors it reports about channels; review its warnings about unused keys.
 3. Start the team with `batty start`. The tmux layout is unchanged (tiled

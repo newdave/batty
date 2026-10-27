@@ -106,6 +106,7 @@ workflow_policy:
     confidence_threshold: 0.8
     require_tests_pass: true
     post_merge_verify: true
+    lock_busy_escalate_after_secs: 600  # escalate once the merge lock stays busy this long, then hourly
 
 grafana:
   enabled: true

@@ -101,15 +101,6 @@ impl TeamDaemon {
     /// Poll-loop step: re-run interrupted verifications and apply results of
     /// finished background test jobs.
     pub(crate) fn poll_background_tests(&mut self) -> Result<()> {
-        // Keep the default used by spawn sites we do not control (the merge
-        // queue) in step with the live config.
-        crate::team::test_job::set_default_timeout_secs(
-            self.config
-                .team_config
-                .workflow_policy
-                .verification
-                .timeout_secs,
-        );
         self.retrigger_pending_verifications();
         let result = merge::poll_verification_jobs(self);
         self.poll_chat_merge_jobs();
