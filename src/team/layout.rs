@@ -64,7 +64,10 @@ pub fn build_layout(
 
     // Create session with the first member
     tmux::create_session(session, "bash", &[], &work_dir)?;
-    for cmd in layout_ui::session_option_commands(session, version, mode, keys) {
+    let status_format0 = global_option("status-format[0]");
+    for cmd in
+        layout_ui::session_option_commands(session, version, mode, keys, status_format0.as_deref())
+    {
         run_best_effort(session, &cmd);
     }
     let initial_pane = tmux::pane_id(session)?;
@@ -108,15 +111,14 @@ pub fn build_layout(
         )?,
     };
 
-    finish_ui(
-        session,
-        project_root,
-        mode,
-        version,
-        keys,
-        &pane_members,
-        &pane_map,
-    );
+    let ordered: Vec<(String, String)> = pane_members
+        .iter()
+        .filter_map(|m| pane_map.get(&m.name).map(|p| (m.name.clone(), p.clone())))
+        .collect();
+    if keys {
+        install_keys(session, project_root, mode, version, &ordered);
+    }
+    select_first(session, mode, &ordered);
     info!(session, panes = pane_map.len(), "team layout created");
     Ok(pane_map)
 }
@@ -138,16 +140,11 @@ fn apply_window_options(session: &str, pane: &str) {
     }
 }
 
-/// Install key bindings and the help file; select the first window/pane.
-fn finish_ui(
-    session: &str,
-    project_root: &Path,
+/// Jump targets and help labels for members in hierarchy order.
+fn jump_targets(
     mode: layout_ui::ResolvedMode,
-    version: Option<layout_ui::TmuxVersion>,
-    keys: bool,
-    pane_members: &[&MemberInstance],
-    pane_map: &HashMap<String, String>,
-) {
+    ordered: &[(String, String)],
+) -> (Vec<String>, Vec<layout_ui::JumpTarget>) {
     use layout_ui::{JumpTarget, ResolvedMode};
     let mut labels: Vec<String> = Vec::new();
     let mut jumps: Vec<JumpTarget> = Vec::new();
@@ -155,45 +152,146 @@ fn finish_ui(
         labels.push("dashboard".to_string());
         jumps.push(JumpTarget::Window(1));
     }
-    for member in pane_members {
-        let Some(pane) = pane_map.get(&member.name) else {
-            continue;
-        };
-        labels.push(member.name.clone());
+    for (name, pane) in ordered {
         match mode {
-            ResolvedMode::Windows => {
-                if let Ok(idx) = tmux::window_index_of_pane(pane) {
-                    jumps.push(JumpTarget::Window(idx));
-                }
-            }
+            ResolvedMode::Windows => match tmux::window_index_of_pane(pane) {
+                Ok(idx) => jumps.push(JumpTarget::Window(idx)),
+                Err(_) => continue,
+            },
             _ => jumps.push(JumpTarget::Pane(pane.clone())),
         }
+        labels.push(name.clone());
     }
-    if keys {
-        let help_file = project_root.join(".batty").join("tmux-help.txt");
-        if let Some(parent) = help_file.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&help_file, layout_ui::help_text(mode, &labels));
-        for cmd in layout_ui::key_binding_commands(session, &jumps, mode, &help_file, version) {
-            run_best_effort(session, &cmd);
-        }
+    (labels, jumps)
+}
+
+/// Write the help file and install this session's keys (root-table
+/// bindings that dispatch on session options; see `layout_ui`).
+fn install_keys(
+    session: &str,
+    project_root: &Path,
+    mode: layout_ui::ResolvedMode,
+    version: Option<layout_ui::TmuxVersion>,
+    ordered: &[(String, String)],
+) {
+    let (labels, jumps) = jump_targets(mode, ordered);
+    let help_file = project_root.join(".batty").join("tmux-help.txt");
+    if let Some(parent) = help_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::write(&help_file, layout_ui::help_text(mode, &labels));
+    let root = tmux::root_key_listing();
+    for cmd in layout_ui::key_binding_commands(session, &jumps, mode, &help_file, version, &root) {
+        run_best_effort(session, &cmd);
+    }
+}
+
+/// Select the first member's window/pane.
+fn select_first(session: &str, mode: layout_ui::ResolvedMode, ordered: &[(String, String)]) {
     let first = match mode {
-        ResolvedMode::Windows => format!("{session}:1"),
-        _ => pane_members
+        layout_ui::ResolvedMode::Windows => format!("{session}:1"),
+        _ => ordered
             .first()
-            .and_then(|m| pane_map.get(&m.name))
-            .cloned()
+            .map(|(_, pane)| pane.clone())
             .unwrap_or_else(|| format!("{session}:1")),
     };
     run_best_effort(
         session,
         &["select-window".into(), "-t".into(), first.clone()],
     );
-    if mode != ResolvedMode::Windows {
+    if mode != layout_ui::ResolvedMode::Windows {
         run_best_effort(session, &["select-pane".into(), "-t".into(), first]);
     }
+}
+
+/// Read a global session option, `None` when unset or tmux fails.
+fn global_option(name: &str) -> Option<String> {
+    let out = tmux::run_tmux_with_timeout(["show-options", "-gqv", name], "show-options -g", None)
+        .ok()?;
+    let value = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// Read a session option, `None` when unset or tmux fails.
+fn session_option(session: &str, name: &str) -> Option<String> {
+    let out = tmux::run_tmux_with_timeout(
+        ["show-options", "-qv", "-t", session, name],
+        "show-options",
+        Some(session),
+    )
+    .ok()?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// The layout a running session was built with (`@batty_layout`).
+pub fn session_layout_mode(session: &str) -> layout_ui::ResolvedMode {
+    session_option(session, layout_ui::LAYOUT_OPTION)
+        .map(|v| layout_ui::ResolvedMode::from_option(&v))
+        .unwrap_or(layout_ui::ResolvedMode::Panes)
+}
+
+/// Create the pane for a member added while the team is running.
+///
+/// Follows the session's layout: windows mode opens a new window with the
+/// window options, focus mode splits into the team window and re-applies the
+/// focus layout, panes mode splits `split_target`.
+pub fn add_member_pane(
+    session: &str,
+    member: &str,
+    split_target: &str,
+    project_root: &Path,
+) -> Result<String> {
+    let pane = match session_layout_mode(session) {
+        layout_ui::ResolvedMode::Windows => {
+            let existing: Vec<String> = tmux::run_tmux_with_timeout(
+                ["list-windows", "-t", session, "-F", "#{window_name}"],
+                "list-windows",
+                Some(session),
+            )
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+            let name = layout_ui::unique_window_name(member, &existing);
+            let pane = tmux::new_window_pane(session, &name, &project_root.to_string_lossy())?;
+            apply_window_options(session, &pane);
+            pane
+        }
+        layout_ui::ResolvedMode::Focus => {
+            let pane = tmux::split_window_vertical_in_pane(session, split_target, 50)?;
+            let version = layout_ui::detect_tmux_version();
+            for cmd in layout_ui::focus_layout_commands(&pane, version) {
+                run_best_effort(session, &cmd);
+            }
+            pane
+        }
+        layout_ui::ResolvedMode::Panes => {
+            tmux::split_window_vertical_in_pane(session, split_target, 50)?
+        }
+    };
+    set_pane_title(session, &pane, member)?;
+    Ok(pane)
+}
+
+/// Refresh jump keys and help after the member list changed at runtime.
+///
+/// Does nothing when the session was started without batty keys.
+pub fn refresh_member_ui(session: &str, project_root: &Path, ordered: &[(String, String)]) {
+    if session_option(session, tmux::BATTY_KEYS_OPTION).as_deref() != Some("1") {
+        return;
+    }
+    let mode = session_layout_mode(session);
+    install_keys(
+        session,
+        project_root,
+        mode,
+        layout_ui::detect_tmux_version(),
+        ordered,
+    );
 }
 
 fn build_windows_layout(
@@ -292,8 +390,10 @@ fn build_tiled_layout(
         return Ok(pane_map);
     }
 
-    // Group members by zone for layout
-    let zones = if let Some(layout_config) = layout {
+    // Group members by zone for layout. A `layout:` block without zones
+    // (e.g. only `mode: panes`) uses the automatic zones; an empty zone list
+    // would otherwise place no members at all.
+    let zones = if let Some(layout_config) = layout.as_ref().filter(|l| !l.zones.is_empty()) {
         build_zones_from_config(layout_config, pane_members)
     } else {
         build_zones_auto(pane_members)
@@ -1991,29 +2091,20 @@ roles:
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).to_string();
-        let table = crate::tmux::tmux_command()
-            .args(["list-keys", "-T", session])
-            .output()
-            .unwrap();
-        let table = String::from_utf8_lossy(&table.stdout).to_string();
-        let root = crate::tmux::tmux_command()
-            .args(["list-keys", "-T", "root"])
-            .output()
-            .unwrap();
-        let root = String::from_utf8_lossy(&root.stdout).to_string();
-        let key_table = crate::tmux::tmux_command()
-            .args(["show-options", "-t", session, "-v", "key-table"])
-            .output()
-            .unwrap();
-        let key_table = String::from_utf8_lossy(&key_table.stdout)
-            .trim()
-            .to_string();
+        let root = crate::tmux::root_key_listing();
+        let key_table = session_option(session, "key-table");
+        let f2 = session_option(session, "@batty_key_F2");
+        let f12 = session_option(session, "@batty_key_F12");
+        let mode = session_option(session, layout_ui::LAYOUT_OPTION);
         let _ = crate::tmux::kill_session(session);
-        // Keys live only in the session's own table.
-        assert_eq!(key_table, session);
-        assert!(table.contains("F2") && table.contains("F12") && table.contains("F1 "));
+        // No custom key table: root and mouse bindings stay in effect.
+        assert_eq!(key_table, None);
+        // Root bindings only dispatch; the session holds its own actions.
+        assert_eq!(f2.as_deref(), Some("select-window -t :1"));
+        assert_eq!(f12.as_deref(), Some("resize-pane -Z"));
+        assert_eq!(mode.as_deref(), Some("windows"));
+        assert!(root.contains("@batty_key_F2") && root.contains("@batty_key_F12"));
         assert!(!root.contains("select-window -t :"));
-        assert!(!root.contains("F12"));
         let lines: Vec<_> = text.lines().collect();
         assert_eq!(lines[0], "1:dashboard");
         assert_eq!(lines[1], "2:architect");
@@ -2091,5 +2182,443 @@ roles:
         let _ = crate::tmux::kill_session(session);
         assert_eq!(pane_map.len(), 3);
         assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
+    }
+
+    /// A real tmux client attached through a pty on the test server, fed raw
+    /// terminal bytes (keys and SGR mouse sequences) as a user's terminal
+    /// would send them.
+    struct AttachedClient {
+        writer: Box<dyn std::io::Write + Send>,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        _master: Box<dyn portable_pty::MasterPty + Send>,
+        screen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AttachedClient {
+        const COLS: u16 = 120;
+        const ROWS: u16 = 40;
+
+        fn attach(session: &str) -> Self {
+            use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: Self::ROWS,
+                    cols: Self::COLS,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut cmd = CommandBuilder::new("tmux");
+            cmd.args(["attach", "-t", session]);
+            cmd.env_remove("TMUX");
+            cmd.env("TMUX_TMPDIR", crate::tmux::test_tmux_dir());
+            cmd.env("TERM", "xterm-256color");
+            let child = pair.slave.spawn_command(cmd).unwrap();
+            drop(pair.slave);
+            // Drain client output so tmux never blocks writing to the pty.
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = screen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+            let writer = pair.master.take_writer().unwrap();
+            let client = Self {
+                writer,
+                child,
+                _master: pair.master,
+                screen,
+            };
+            for _ in 0..50 {
+                if !client_sessions().is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            client
+        }
+
+        fn send(&mut self, bytes: &str) {
+            use std::io::Write;
+            self.writer.write_all(bytes.as_bytes()).unwrap();
+            self.writer.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+
+        /// Everything the client drew since the last call.
+        fn take_screen(&self) -> String {
+            let bytes = std::mem::take(&mut *self.screen.lock().unwrap());
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        fn click(&mut self, col: u16, row: u16) {
+            self.send(&format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m"));
+        }
+    }
+
+    impl Drop for AttachedClient {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    use std::io::Read as _;
+
+    fn client_sessions() -> Vec<String> {
+        tmux_out(&["list-clients", "-F", "#{session_name}"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn tmux_out(args: &[&str]) -> String {
+        let out = crate::tmux::tmux_command().args(args).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn fmt(target: &str, format: &str) -> String {
+        tmux_out(&["display-message", "-p", "-t", target, format])
+    }
+
+    fn tmux_run(args: &[&str]) {
+        let out = crate::tmux::tmux_command().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "tmux {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    const F2: &str = "\x1bOQ";
+    const F3: &str = "\x1bOR";
+    const F12: &str = "\x1b[24~";
+
+    /// N2 acceptance: with batty keys on, a real attached client keeps
+    /// click-to-select, wheel scrolling, tab clicks and the user's own
+    /// `bind -n` keys; F-keys act only in batty sessions and pass through
+    /// elsewhere; two batty sessions keep their own key mappings; stopping
+    /// one session keeps the keys for the other and the last stop removes
+    /// them.
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn batty_keys_keep_mouse_and_user_bindings_with_real_client() {
+        let _env_lock = crate::team::test_support::env_lock();
+        let (a, b, user) = ("batty-uxtest-keys-a", "batty-uxtest-keys-b", "uxtest-plain");
+        // Guards kill the sessions even when an assertion fails, so a failed
+        // run does not leave the private test server running.
+        let _guards: Vec<_> = [a, b, user]
+            .into_iter()
+            .map(crate::tmux::TestSession::new)
+            .collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let members = make_members(THREE_MEMBERS);
+        let windows = layout_with_mode(super::super::config::LayoutMode::Windows);
+        let panes = layout_with_mode(super::super::config::LayoutMode::Panes);
+        let build = |s: &str, l: &Option<LayoutConfig>| {
+            build_layout(
+                s,
+                &members,
+                l,
+                tmp.path(),
+                WorkflowMode::Legacy,
+                false,
+                OrchestratorPosition::Bottom,
+            )
+            .unwrap()
+        };
+        let map_a = build(a, &windows);
+        let map_b = build(b, &panes);
+        tmux_run(&[
+            "new-session",
+            "-d",
+            "-s",
+            user,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "cat -v",
+        ]);
+        tmux_run(&["set-option", "-t", user, "mouse", "on"]);
+        // The user's own root binding, installed before and after batty.
+        tmux_run(&[
+            "bind-key",
+            "-n",
+            "M-u",
+            "set-option",
+            "-g",
+            "@user_hit",
+            "yes",
+        ]);
+        let user_hit = || tmux_out(&["show-options", "-gqv", "@user_hit"]);
+
+        let mut client = AttachedClient::attach(a);
+        assert_eq!(client_sessions(), vec![a.to_string()]);
+
+        // F-keys in batty session A (windows mode).
+        tmux_run(&["select-window", "-t", &format!("{a}:3")]);
+        client.send(F2);
+        assert_eq!(fmt(a, "#{window_index}"), "1", "F2 jumps to the dashboard");
+        client.send(F3);
+        assert_eq!(
+            fmt(a, "#{window_index}"),
+            "2",
+            "F3 jumps to the first member"
+        );
+        tmux_run(&["split-window", "-h", "-t", &format!("{a}:2"), "cat -v"]);
+        client.send(F12);
+        assert_eq!(fmt(a, "#{window_zoomed_flag}"), "1", "F12 zooms");
+        client.send(F12);
+        assert_eq!(fmt(a, "#{window_zoomed_flag}"), "0", "F12 unzooms");
+        // F1 opens the help popup; Enter closes it.
+        client.take_screen();
+        client.send("\x1bOP");
+        assert!(
+            client.take_screen().contains("BATTY TMUX HELP"),
+            "F1 shows the help popup"
+        );
+        client.send("\r");
+
+        // tmux's own mouse bindings still work in a batty session.
+        tmux_run(&["select-pane", "-t", &format!("{a}:2.2")]);
+        client.click(10, 10);
+        assert_eq!(fmt(a, "#{pane_index}"), "1", "click selects the left pane");
+        client.send("\x1b[<64;10;10M");
+        assert_eq!(fmt(a, "#{pane_in_mode}"), "1", "wheel enters copy mode");
+        client.send("q");
+        assert_eq!(fmt(a, "#{pane_in_mode}"), "0");
+        // First status row is row 39 of 40: " batty | " then " 1:dashboard ".
+        client.click(13, AttachedClient::ROWS - 1);
+        assert_eq!(fmt(a, "#{window_index}"), "1", "tab click selects window 1");
+
+        // The user's own `bind -n` key works in the batty session.
+        client.send("\x1bu");
+        assert_eq!(
+            user_hit(),
+            "yes",
+            "user root binding works in batty session"
+        );
+        tmux_run(&["set-option", "-gu", "@user_hit"]);
+
+        // Session B (panes mode) has its own mapping, untouched by A.
+        tmux_run(&["switch-client", "-t", b]);
+        assert_eq!(client_sessions(), vec![b.to_string()]);
+        let f2_b = session_option(b, "@batty_key_F2").unwrap();
+        let first_b = f2_b.strip_prefix("select-pane -t ").unwrap().to_string();
+        let first_b = &first_b;
+        assert!(map_b.values().any(|p| p == first_b));
+        let other_b = map_b.values().find(|p| *p != first_b).unwrap();
+        tmux_run(&["select-pane", "-t", other_b]);
+        client.send(F2);
+        assert_eq!(&fmt(b, "#{pane_id}"), first_b, "F2 in B selects B's pane");
+        assert_eq!(
+            session_option(a, "@batty_key_F2").as_deref(),
+            Some("select-window -t :1"),
+            "A's mapping survives B"
+        );
+        assert!(map_a.values().all(|p| p != first_b));
+
+        // A plain session: F-keys pass through, mouse and user keys work.
+        tmux_run(&["switch-client", "-t", user]);
+        client.send(F2);
+        client.send(F12);
+        assert_eq!(
+            tmux_out(&["capture-pane", "-p", "-t", user, "-S", "0", "-E", "0"]),
+            "^[OQ^[[24~",
+            "F-keys reach the pane outside batty sessions"
+        );
+        client.send("\x1bu");
+        assert_eq!(
+            user_hit(),
+            "yes",
+            "user root binding works in plain session"
+        );
+        tmux_run(&["split-window", "-h", "-t", user, "cat -v"]);
+        tmux_run(&["select-pane", "-t", &format!("{user}:0.1")]);
+        client.click(10, 10);
+        assert_eq!(
+            fmt(user, "#{pane_index}"),
+            "0",
+            "click selects in plain session"
+        );
+        client.send("\x1b[<64;10;10M");
+        assert_eq!(
+            fmt(user, "#{pane_in_mode}"),
+            "1",
+            "wheel scrolls in plain session"
+        );
+        drop(client);
+
+        // Stopping A keeps the shared root keys for B; stopping B removes
+        // them and leaves the user's own binding alone.
+        crate::tmux::kill_session(a).unwrap();
+        let after_a = crate::tmux::root_key_listing();
+        crate::tmux::kill_session(b).unwrap();
+        let after_b = crate::tmux::root_key_listing();
+        let _ = crate::tmux::kill_session(user);
+        let _ = crate::tmux::tmux_command()
+            .args(["unbind-key", "-n", "M-u"])
+            .output();
+        assert!(after_a.contains("@batty_key_F2"), "B still needs the keys");
+        assert!(
+            !after_b.contains("@batty_key_"),
+            "last batty stop removes keys"
+        );
+        assert!(
+            after_b.contains("@user_hit"),
+            "user binding is never removed"
+        );
+    }
+
+    /// `layout: { mode: panes }` without zones still gives every member a
+    /// pane (an empty zone list used to place nobody).
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn panes_mode_without_zones_places_every_member() {
+        let _env_lock = crate::team::test_support::env_lock();
+        let session = "batty-uxtest-panes-nozones";
+        let _guard = crate::tmux::TestSession::new(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let pane_map = build_layout(
+            session,
+            &make_members(THREE_MEMBERS),
+            &layout_with_mode(super::super::config::LayoutMode::Panes),
+            tmp.path(),
+            WorkflowMode::Legacy,
+            false,
+            OrchestratorPosition::Bottom,
+        )
+        .unwrap();
+        let panes = tmux_out(&["list-panes", "-t", session]).lines().count();
+        let _ = crate::tmux::kill_session(session);
+        let mut names: Vec<_> = pane_map.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, vec!["architect", "engineer-1", "engineer-2"]);
+        assert_eq!(panes, 3);
+    }
+
+    /// A key the user already bound in the root table is left alone.
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn batty_keys_skip_keys_the_user_bound() {
+        let _env_lock = crate::team::test_support::env_lock();
+        let session = "batty-uxtest-userkey";
+        let _guard = crate::tmux::TestSession::new(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let _holder = crate::tmux::TestSession::new("uxtest-holder");
+        tmux_run(&["new-session", "-d", "-s", "uxtest-holder", "cat"]);
+        tmux_run(&["bind-key", "-n", "F5", "display-message", "mine"]);
+        build_layout(
+            session,
+            &make_members(THREE_MEMBERS),
+            &layout_with_mode(super::super::config::LayoutMode::Panes),
+            tmp.path(),
+            WorkflowMode::Legacy,
+            false,
+            OrchestratorPosition::Bottom,
+        )
+        .unwrap();
+        let root = crate::tmux::root_key_listing();
+        let _ = crate::tmux::kill_session(session);
+        let _ = crate::tmux::kill_session("uxtest-holder");
+        let _ = crate::tmux::tmux_command()
+            .args(["unbind-key", "-n", "F5"])
+            .output();
+        assert_eq!(
+            crate::tmux::root_key_owner(&root, "F5"),
+            crate::tmux::RootKeyOwner::Other
+        );
+        assert_eq!(
+            crate::tmux::root_key_owner(&root, "F2"),
+            crate::tmux::RootKeyOwner::Batty
+        );
+    }
+
+    fn add_engineer(session: &str, project_root: &Path, name: &str) -> String {
+        let target = fmt(session, "#{pane_id}");
+        add_member_pane(session, name, &target, project_root).unwrap()
+    }
+
+    /// N11: a member added at runtime in windows mode gets its own window
+    /// with the window options and a refreshed jump key.
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn runtime_add_in_windows_mode_opens_window_and_refreshes_keys() {
+        let _env_lock = crate::team::test_support::env_lock();
+        let session = "batty-uxtest-add-windows";
+        let _guard = crate::tmux::TestSession::new(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pane_map = build_layout(
+            session,
+            &make_members(THREE_MEMBERS),
+            &layout_with_mode(super::super::config::LayoutMode::Windows),
+            tmp.path(),
+            WorkflowMode::Legacy,
+            false,
+            OrchestratorPosition::Bottom,
+        )
+        .unwrap();
+        let pane = add_engineer(session, tmp.path(), "eng-new");
+        pane_map.insert("eng-new".to_string(), pane.clone());
+        let mut ordered: Vec<(String, String)> = pane_map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        ordered.sort_by_key(|(_, p)| crate::tmux::window_index_of_pane(p).unwrap());
+        refresh_member_ui(session, tmp.path(), &ordered);
+        let window = fmt(&pane, "#{window_index}:#{window_name}:#{window_panes}");
+        let border = fmt(&pane, "#{pane-border-status}");
+        let role = tmux_out(&["show-options", "-pqv", "-t", &pane, "@batty_role"]);
+        let f6 = session_option(session, "@batty_key_F6");
+        let help = std::fs::read_to_string(tmp.path().join(".batty/tmux-help.txt")).unwrap();
+        let _ = crate::tmux::kill_session(session);
+        assert_eq!(window, "5:eng-new:1", "own window, after dashboard + 3");
+        assert_eq!(border, "top", "window options applied");
+        assert_eq!(role, "eng-new");
+        assert_eq!(f6.as_deref(), Some("select-window -t :5"));
+        assert!(help.contains("F6   eng-new"));
+    }
+
+    /// N11: focus mode keeps one window and re-applies its layout.
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn runtime_add_in_focus_mode_reapplies_layout() {
+        let _env_lock = crate::team::test_support::env_lock();
+        let session = "batty-uxtest-add-focus";
+        let _guard = crate::tmux::TestSession::new(session);
+        let tmp = tempfile::tempdir().unwrap();
+        build_layout(
+            session,
+            &make_members(THREE_MEMBERS),
+            &layout_with_mode(super::super::config::LayoutMode::Focus),
+            tmp.path(),
+            WorkflowMode::Legacy,
+            false,
+            OrchestratorPosition::Bottom,
+        )
+        .unwrap();
+        // Disturb the layout so the re-apply is observable.
+        tmux_run(&["select-layout", "-t", session, "even-horizontal"]);
+        let pane = add_engineer(session, tmp.path(), "eng-new");
+        let windows = tmux_out(&["list-windows", "-t", session]).lines().count();
+        let panes = fmt(&pane, "#{window_panes}");
+        // main-vertical: only the main pane touches the left edge.
+        let lefts = tmux_out(&["list-panes", "-t", session, "-F", "#{pane_left}"]);
+        let _ = crate::tmux::kill_session(session);
+        assert_eq!(windows, 1);
+        assert_eq!(panes, "4");
+        assert_eq!(
+            lefts.lines().filter(|l| *l == "0").count(),
+            1,
+            "main-vertical re-applied: {lefts}"
+        );
     }
 }

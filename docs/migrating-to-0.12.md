@@ -12,24 +12,29 @@ This guide covers changes you may need to act on when upgrading from batty 0.11.
    so a mixed setup can stall merges rather than corrupt them.
 2. Install the new binary and run `batty validate` in each project. Fix any
    errors it reports about channels; review its warnings about unused keys.
-3. Start the team with `batty start`. The tmux layout is unchanged (tiled
-   panes) unless you opt into another mode (see [tmux layouts](tmux-layouts.md)).
+3. Start the team with `batty start`. Teams with more than four agents now open
+   with one window per member plus a dashboard (see [tmux layouts](tmux-layouts.md)).
 
 ## Behaviour changes to check
 
 ### tmux layout
 
-Layouts still default to tiled panes (`layout.mode: panes`). Window numbers now
-start at 1. Large teams can opt into a dashboard plus one window per member:
+`layout.mode` defaults to `auto`. Small teams (up to four agent panes that fit
+at a readable size) stay tiled; larger teams get a dashboard window plus one
+window per member. Configs that define `layout.zones` stay tiled. Window
+numbers start at 1. To keep tiled panes for every team:
 
 ```yaml
 layout:
-  mode: windows   # or auto: windows only for more than four agents
+  mode: panes
 ```
 
-Batty's function keys (F1–F12) are off by default (`layout.keys: false`). If you
-turn them on, tmux's default mouse bindings stop working in batty sessions until
-a later release fixes the key table.
+Batty binds F1–F12 (help, jump to a member, focus, zoom) in tmux's root key
+table, but they act only inside batty sessions; elsewhere the key passes
+through. Keys you have already bound yourself are left alone, mouse clicks and
+scrolling keep working, and the bindings are removed when the last batty
+session stops. The keys need tmux 3.2 or newer. Set `layout.keys: false` to
+skip them.
 
 ### `batty status`
 

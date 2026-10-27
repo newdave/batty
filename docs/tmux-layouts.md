@@ -45,8 +45,8 @@ keys (prefix, pane switching, zoom, copy mode, detach) to do anything.
   tab list, which needs no tmux knowledge. Window 1 is a live `batty status`
   dashboard, so you still see the whole team at a glance.
 - Con: you only see one member at a time.
-- Needs: tmux 2.9+ for the two-line status bar, 3.0+ for F-keys, 3.2+ for the
-  help popup. Older versions fall back to a one-line bar and `display-message`.
+- Needs: tmux 2.9+ for the two-line status bar and 3.2+ for the F-keys and
+  help popup. Older versions fall back to a one-line bar and tmux's own keys.
 
 ### (c) Focus layout (`focus`)
 
@@ -88,17 +88,13 @@ support roles, each tiled inside.
 
 ## Recommendation
 
-> **Current default:** `panes` with `keys: false`, matching upstream. `auto`
-> and the F-keys are opt-in until the batty key table stops disabling tmux's
-> mouse and root key bindings. The recommendation below is the intended
-> default once that is fixed.
-
-Recommended default, `auto`:
+Default, `auto` (with `keys: true`):
 
 - Tile panes only when they stay usable: at most 4 agent panes (including the
   orchestrator pane) and a terminal that gives each pane at least 50 columns
-  by 12 rows in a two-column grid. The size comes from the terminal running
-  `batty start` (220x50 when there is no terminal).
+  by 12 rows in a two-column grid. The size comes from the controlling
+  terminal of `batty start` (`/dev/tty`, so redirected stdin does not matter),
+  then stdin, then 220x50 when there is no terminal at all.
 - Otherwise use `windows`.
 - If `layout.zones` is set and `mode` is omitted, tiled panes are kept. A
   hand-written layout is an explicit choice.
@@ -125,14 +121,31 @@ All are session- or window-scoped.
 | F12 | zoom the current pane to full screen |
 | F11 (focus mode) | cycle which member is in the big pane |
 
-Key bindings live in a key table named after the session (for example
-`batty-myteam`), selected with the session-scoped `key-table` option. They are
-never added to the root or prefix tables, so other tmux sessions on the same
-server are unaffected. The prefix key (`Ctrl-b`) and every key without a Batty
-binding behave normally, because tmux falls back to the usual tables (checked
-on tmux 3.8). The table is cleared and rebuilt on each `batty start`, so
-restarts never accumulate bindings. Set `layout.keys: false` to skip the key
-bindings and the `key-table` option entirely (tabs and mouse still work).
+How the keys are installed (tmux 3.2 or later):
+
+- Each batty key (F1-F12) is bound once in tmux's root table, shared by every
+  session on the server. The binding looks up a session option such as
+  `@batty_key_F2`: in a batty session it runs that session's own action, and
+  in any other session (or for a key the session does not use) it passes the
+  key through to the program in the pane.
+- Each batty session stores its own actions, so two teams on one server keep
+  their own jump keys.
+- No custom `key-table` is used, so tmux's mouse bindings (click a pane, wheel
+  scroll, click a tab) and your own `bind -n` keys keep working. The prefix
+  key and `prefix ?` are never touched.
+- If you already bound one of these F-keys in the root table, batty leaves
+  your binding alone and that key is simply not a batty key.
+- `batty stop` removes the root bindings once no other batty session on the
+  server uses them.
+
+Set `layout.keys: false` to skip the key bindings entirely (tabs and mouse
+still work). On tmux older than 3.2 the keys are not installed and the hint
+line shows the tmux defaults instead.
+
+Members added at runtime (by editing `team.yaml` while the team runs) follow
+the layout: a new window in `windows` mode, a re-applied focus layout in
+`focus` mode, a split in `panes` mode. Jump keys and the F1 help are
+refreshed.
 
 Colours follow the Okabe-Ito colour-blind-safe set (blue and orange on a
 dark bar). Meaning is never carried by colour alone: the active tab is
@@ -152,8 +165,8 @@ Minimum sizes: panes below 50x12 are considered unreadable. If you force
 
 ```yaml
 layout:
-  mode: panes  # panes (default) | auto | windows | focus
-  keys: false  # true installs F-key bindings (batty-only key table; disables mouse bindings for now)
+  mode: auto   # auto (default) | panes | windows | focus
+  keys: true   # false skips batty's F-key bindings
 ```
 
 `zones` (see the config reference) still applies to `panes` mode. Existing

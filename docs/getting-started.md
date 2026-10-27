@@ -139,9 +139,11 @@ Attach to the tmux session:
 batty attach            # or: batty attach architect  (jump to one member)
 ```
 
-By default every member is tiled in one tmux window: click a pane to focus it,
-scroll with the mouse wheel, and press `Ctrl-b d` to detach. Large teams can set
-`layout.mode: windows` for a dashboard plus one window per member. See
+By default (`layout.mode: auto`) up to 4 members are tiled in one tmux window
+when the terminal is big enough; otherwise you get a dashboard window plus one
+window per member, with clickable tabs. Click a pane or tab to focus it, scroll
+with the mouse wheel, press F1 for help or F2-F10 to jump to a member, and press
+`Ctrl-b d` to detach. Set `layout.mode: panes` to always tile. See
 [tmux-layouts.md](tmux-layouts.md).
 
 In a second shell, keep a non-interactive view open:

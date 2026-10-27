@@ -189,22 +189,26 @@ must exist locally or as `origin/develop`; when only the remote branch exists,
 
 ```yaml
 layout:
-  mode: panes       # panes | auto | windows | focus (default: panes)
-  keys: false       # F-key bindings in a batty-only key table (default: false)
+  mode: auto        # auto | panes | windows | focus (default: auto)
+  keys: true        # batty's F-key bindings (default: true)
   zones: []         # optional hand-built tiled layout (panes mode)
 ```
 
-- `auto`: tiled panes when at most 4 agent panes fit at 50x12 or larger each;
-  otherwise `windows`. If `zones` is set and `mode` is omitted, panes are kept.
-- `panes`: every member tiled in one window.
+- `auto` (default): tiled panes when at most 4 agent panes fit at 50x12 or
+  larger each in the terminal running `batty start`; otherwise `windows`. If
+  `zones` is set and `mode` is omitted, panes are kept.
+- `panes`: every member tiled in one window (automatic zones unless `zones`
+  is set).
 - `windows`: window 1 is a live status dashboard, then one window per member
   in hierarchy order, with a clickable tab bar and F-key jumps.
 - `focus`: one big pane plus a narrow column; F2-F10 swap a member in, F11 cycles.
 
-- `keys`: when `true`, Batty installs F1 (help), F2-F10 (jump), F12 (zoom) and
-  F11 (focus) in a key table used only by its own session. Default `false`:
-  that key table currently disables tmux's mouse and root key bindings in the
-  session (clicking panes, wheel scrolling, clickable tabs).
+- `keys` (default `true`, tmux 3.2+): Batty installs F1 (help), F2-F10
+  (jump), F12 (zoom) and F11 (focus). They are bound in tmux's root table but
+  act only in batty sessions, each with its own actions; elsewhere the key
+  passes through to the pane. Mouse bindings, `prefix ?` and your own `bind -n`
+  keys keep working, and an F-key you already bound is left alone. `false`
+  skips the bindings.
 
 See [tmux-layouts.md](tmux-layouts.md) for the comparison and key reference.
 

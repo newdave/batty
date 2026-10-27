@@ -2,9 +2,14 @@
 //!
 //! Everything here returns tmux argv vectors (or strings) so it can be unit
 //! tested without a tmux server. All options are session- or window-scoped;
-//! nothing touches `~/.tmux.conf` or global options. Key bindings are
-//! server-wide in tmux, so each one is guarded to act only inside `batty-*`
-//! sessions and to pass the key through everywhere else.
+//! nothing touches `~/.tmux.conf` or global options.
+//!
+//! Key bindings are server-wide in tmux. Batty binds its F-keys in the root
+//! table, and each binding dispatches on a session option
+//! (`@batty_key_F2`, ...): a session that set the option runs its own action,
+//! every other session gets the key passed through to the pane. No custom
+//! `key-table` is used, so tmux's mouse bindings and the user's own `bind -n`
+//! keys keep working, and several batty sessions never overwrite each other.
 
 use std::path::Path;
 
@@ -69,15 +74,39 @@ pub fn panes_stay_usable(n: usize, cols: u16, rows: u16) -> bool {
 }
 
 /// Terminal size of the invoking terminal, or the session default.
+///
+/// Reads the controlling terminal (`/dev/tty`) first, so a start with
+/// redirected stdin still sees the real size; then stdin; then
+/// [`DEFAULT_COLS`]x[`DEFAULT_ROWS`].
 pub fn terminal_size() -> (u16, u16) {
+    pick_size(
+        || {
+            std::fs::File::open("/dev/tty")
+                .ok()
+                .and_then(|tty| stty_size(std::process::Stdio::from(tty)))
+        },
+        || stty_size(std::process::Stdio::inherit()),
+    )
+}
+
+/// First size found: controlling terminal, then stdin, then the default.
+pub fn pick_size(
+    tty: impl FnOnce() -> Option<(u16, u16)>,
+    stdin: impl FnOnce() -> Option<(u16, u16)>,
+) -> (u16, u16) {
+    tty().or_else(stdin).unwrap_or((DEFAULT_COLS, DEFAULT_ROWS))
+}
+
+/// Run `stty size` with the given stdin; `None` when it is not a terminal.
+fn stty_size(stdin: std::process::Stdio) -> Option<(u16, u16)> {
     std::process::Command::new("stty")
         .arg("size")
-        .stdin(std::process::Stdio::inherit())
+        .stdin(stdin)
+        .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| parse_stty_size(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or((DEFAULT_COLS, DEFAULT_ROWS))
 }
 
 /// Parse `stty size` output (`rows cols`) into `(cols, rows)`.
@@ -93,6 +122,29 @@ pub struct TmuxVersion {
     pub major: u32,
     pub minor: u32,
 }
+
+impl ResolvedMode {
+    /// Value stored in the `@batty_layout` session option.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResolvedMode::Panes => "panes",
+            ResolvedMode::Windows => "windows",
+            ResolvedMode::Focus => "focus",
+        }
+    }
+
+    /// Parse the `@batty_layout` session option (unknown means panes).
+    pub fn from_option(value: &str) -> ResolvedMode {
+        match value.trim() {
+            "windows" => ResolvedMode::Windows,
+            "focus" => ResolvedMode::Focus,
+            _ => ResolvedMode::Panes,
+        }
+    }
+}
+
+/// Session option recording the resolved layout, read by runtime member adds.
+pub const LAYOUT_OPTION: &str = "@batty_layout";
 
 impl TmuxVersion {
     pub fn at_least(self, major: u32, minor: u32) -> bool {
@@ -156,6 +208,19 @@ pub fn window_names<'a>(members: impl IntoIterator<Item = &'a str>) -> Vec<Strin
     out
 }
 
+/// A window name for `member` that is not already in `existing`.
+pub fn unique_window_name(member: &str, existing: &[String]) -> String {
+    let base = window_name(member);
+    let taken = |name: &str| name == "dashboard" || existing.iter().any(|e| e == name);
+    let mut candidate = base.clone();
+    let mut n = 2;
+    while taken(&candidate) {
+        candidate = format!("{base}-{n}");
+        n += 1;
+    }
+    candidate
+}
+
 /// Shell command for the dashboard window.
 ///
 /// Uses `batty status --watch` when the binary supports it, otherwise a
@@ -212,11 +277,8 @@ pub fn hint_line(version: Option<TmuxVersion>, mode: ResolvedMode, keys: bool) -
     }
 }
 
-fn keys_supported(version: Option<TmuxVersion>) -> bool {
-    version.is_some_and(|v| v.at_least(3, 0))
-}
-
-fn popup_supported(version: Option<TmuxVersion>) -> bool {
+/// Batty keys need `run-shell -C` and `display-popup` (tmux 3.2+).
+pub fn keys_supported(version: Option<TmuxVersion>) -> bool {
     version.is_some_and(|v| v.at_least(3, 2))
 }
 
@@ -236,11 +298,16 @@ pub const PANE_BORDER_FORMAT: &str =
     "#{?pane_active,#[fg=colour39 bold]> ,  }#[bold]#{@batty_role}#[default] #{@batty_status} ";
 
 /// Session-scoped option commands (`set-option -t <session> ...`).
+///
+/// `status_format0` is the server's global `status-format[0]`. Setting
+/// `status-format[1]` on the session gives it its own array, which would
+/// otherwise leave line 0 (the window tabs) empty, so line 0 is copied in.
 pub fn session_option_commands(
     session: &str,
     version: Option<TmuxVersion>,
     mode: ResolvedMode,
     keys: bool,
+    status_format0: Option<&str>,
 ) -> Vec<Vec<String>> {
     let s = |n: &str, v: &str| set(session, "-q", n, v);
     let mut cmds = vec![
@@ -253,27 +320,21 @@ pub fn session_option_commands(
         s("status-style", "bg=colour17,fg=colour255"),
         s("status-left", " #[bold]batty#[default] | "),
         s("status-left-length", "24"),
-        s("window-status-format", " #I:#W "),
-        s(
-            "window-status-current-format",
-            "#[bg=colour208,fg=colour16,bold] [#I:#W] #[default]",
-        ),
-        s("window-status-separator", ""),
         s("display-time", "4000"),
+        s(LAYOUT_OPTION, mode.as_str()),
     ];
-    if keys && keys_supported(version) {
-        // Session-scoped key table: other sessions on the server are unaffected.
-        cmds.push(s("key-table", &key_table_name(session)));
-    }
     let hint = hint_line(version, mode, keys);
-    if version.is_some_and(|v| v.at_least(2, 9)) {
+    let two_lines = version.is_some_and(|v| v.at_least(2, 9));
+    if let Some(line0) = status_format0.filter(|f| two_lines && !f.trim().is_empty()) {
         cmds.push(s("status", "2"));
+        cmds.push(s("status-format[0]", line0));
         cmds.push(s("status-right", " #{session_name} "));
         cmds.push(s(
             "status-format[1]",
             &format!("#[align=centre,fg=colour250] {hint} "),
         ));
     } else {
+        // No two-line status: keep tmux's own line and put the hint right.
         cmds.push(s("status-right-length", "120"));
         cmds.push(s("status-right", &format!(" {hint} ")));
     }
@@ -294,6 +355,12 @@ pub fn window_option_commands(target: &str) -> Vec<Vec<String>> {
         w("pane-border-status", "top"),
         w("pane-border-format", PANE_BORDER_FORMAT),
         w("pane-border-style", "fg=colour244"),
+        w("window-status-format", " #I:#W "),
+        w(
+            "window-status-current-format",
+            "#[bg=colour208,fg=colour16,bold] [#I:#W] #[default]",
+        ),
+        w("window-status-separator", ""),
         w("pane-active-border-style", "fg=colour39,bold"),
     ]
 }
@@ -313,56 +380,52 @@ pub fn focus_layout_commands(target: &str, version: Option<TmuxVersion>) -> Vec<
     cmds
 }
 
-/// Name of the key table owned by one batty session (the session name).
-///
-/// A session whose `key-table` option names a custom table looks keys up
-/// there first; the prefix key and any unbound key still behave normally
-/// (verified on tmux 3.8). Using one table per session keeps pane-id targets
-/// from different teams apart.
-pub fn key_table_name(session: &str) -> String {
-    session.to_string()
-}
-
-fn bind(table: &str, key: &str, action: &str) -> Vec<String> {
-    vec![
-        "bind-key".into(),
-        "-T".into(),
-        table.into(),
-        key.into(),
-        action.into(),
-    ]
-}
-
 /// F-key for jump slot `i` (0-based): F2..F10.
 pub fn jump_key(i: usize) -> String {
     format!("F{}", i + 2)
 }
 
-/// Key bindings in the session's own key table (never the root or prefix
-/// tables). The table is cleared first so re-running start cannot accumulate
-/// stale bindings. Returns nothing when keys are unsupported.
-pub fn key_binding_commands(
-    session: &str,
+/// Every key batty may bind in the root table.
+pub fn owned_keys() -> Vec<String> {
+    (1..=12).map(|n| format!("F{n}")).collect()
+}
+
+/// Session option holding `key`'s action for one session.
+pub fn key_option(key: &str) -> String {
+    format!("{}{key}", crate::tmux::BATTY_KEY_OPTION_PREFIX)
+}
+
+/// The shared root-table binding for `key`.
+///
+/// It runs the action stored in the current session's `@batty_key_<key>`
+/// option, and sends the key on to the pane when that option is unset (any
+/// non-batty session, or a key this session does not use).
+pub fn root_binding(key: &str) -> Vec<String> {
+    let opt = key_option(key);
+    vec![
+        "bind-key".into(),
+        "-T".into(),
+        "root".into(),
+        key.into(),
+        "if-shell".into(),
+        "-F".into(),
+        format!("#{{{opt}}}"),
+        format!("run-shell -C '#{{{opt}}}'"),
+        format!("send-keys {key}"),
+    ]
+}
+
+/// Per-session key actions as `(key, tmux command)` pairs.
+pub fn key_actions(
     jumps: &[JumpTarget],
     mode: ResolvedMode,
     help_file: &Path,
-    version: Option<TmuxVersion>,
-) -> Vec<Vec<String>> {
-    if !keys_supported(version) {
-        return Vec::new();
-    }
-    let table = key_table_name(session);
-    let table = table.as_str();
-    let mut cmds = vec![vec![
-        "unbind-key".into(),
-        "-a".into(),
-        "-T".into(),
-        table.into(),
-    ]];
-    cmds.push(bind(table, "F1", &help_action(help_file, version)));
-    cmds.push(bind(table, "F12", "resize-pane -Z"));
+) -> Vec<(String, String)> {
+    let mut actions = vec![
+        ("F1".to_string(), help_action(help_file)),
+        ("F12".to_string(), "resize-pane -Z".to_string()),
+    ];
     for (i, target) in jumps.iter().take(MAX_JUMP_KEYS).enumerate() {
-        let key = jump_key(i);
         let action = match (target, mode) {
             (JumpTarget::Window(n), _) => format!("select-window -t :{n}"),
             (JumpTarget::Pane(id), ResolvedMode::Focus) => {
@@ -370,25 +433,67 @@ pub fn key_binding_commands(
             }
             (JumpTarget::Pane(id), _) => format!("select-pane -t {id}"),
         };
-        cmds.push(bind(table, &key, &action));
+        actions.push((jump_key(i), action));
     }
     if mode == ResolvedMode::Focus {
-        cmds.push(bind(table, "F11", "rotate-window -U ; select-pane -t :.1"));
+        actions.push((
+            "F11".to_string(),
+            "rotate-window -U ; select-pane -t :.1".to_string(),
+        ));
+    }
+    actions
+}
+
+/// Commands that install batty's keys for one session.
+///
+/// Sets the session's `@batty_keys` marker and one `@batty_key_<key>` option
+/// per key it uses (unsetting the rest, so a refresh drops stale jumps), then
+/// binds each owned key in the root table. `root_listing` is the current
+/// `list-keys -T root` output: a key the user already bound there is left
+/// alone and is simply not a batty key. Returns nothing when keys are
+/// unsupported (tmux older than 3.2).
+pub fn key_binding_commands(
+    session: &str,
+    jumps: &[JumpTarget],
+    mode: ResolvedMode,
+    help_file: &Path,
+    version: Option<TmuxVersion>,
+    root_listing: &str,
+) -> Vec<Vec<String>> {
+    use crate::tmux::{RootKeyOwner, root_key_owner};
+    if !keys_supported(version) {
+        return Vec::new();
+    }
+    let actions = key_actions(jumps, mode, help_file);
+    let mut cmds = vec![set(session, "-q", crate::tmux::BATTY_KEYS_OPTION, "1")];
+    for key in owned_keys() {
+        let option = key_option(&key);
+        match actions.iter().find(|(k, _)| *k == key) {
+            Some((_, action)) => cmds.push(set(session, "-q", &option, action)),
+            None => cmds.push(vec![
+                "set-option".into(),
+                "-qu".into(),
+                "-t".into(),
+                session.into(),
+                option,
+            ]),
+        }
+    }
+    for key in owned_keys() {
+        if root_key_owner(root_listing, &key) != RootKeyOwner::Other {
+            cmds.push(root_binding(&key));
+        }
     }
     cmds
 }
 
-fn help_action(help_file: &Path, version: Option<TmuxVersion>) -> String {
-    if popup_supported(version) {
-        let file = sh_quote(&help_file.to_string_lossy());
-        let script = format!("cat {file}; printf '\\nPress Enter to close'; read _");
-        format!(
-            "display-popup -E -w 80 -h 30 {}",
-            tmux_quote(&format!("sh -c {}", sh_quote(&script)))
-        )
-    } else {
-        "display-message -d 15000 'F2-F10 jump | F12 zoom | scroll: mouse wheel | detach: Ctrl-b d | commands: batty status, batty send, batty inbox'".to_string()
-    }
+fn help_action(help_file: &Path) -> String {
+    let file = sh_quote(&help_file.to_string_lossy());
+    let script = format!("cat {file}; printf '\\nPress Enter to close'; read _");
+    format!(
+        "display-popup -E -w 80 -h 30 {}",
+        tmux_quote(&format!("sh -c {}", sh_quote(&script)))
+    )
 }
 
 fn tmux_quote(value: &str) -> String {
@@ -494,19 +599,24 @@ mod tests {
     }
 
     #[test]
-    fn layout_mode_defaults_to_panes() {
+    fn layout_defaults_to_auto_with_keys() {
         let layout: crate::team::config::LayoutConfig =
             serde_yaml::from_str("zones:\n- name: architect\n  width_pct: 100\n").unwrap();
-        assert_eq!(layout.mode, LayoutMode::Panes);
+        assert_eq!(layout.mode, LayoutMode::Auto);
         assert_eq!(
             crate::team::config::LayoutConfig::default().mode,
-            LayoutMode::Panes
+            LayoutMode::Auto
         );
         assert_eq!(layout.zones.len(), 1);
-        assert!(!layout.keys, "keys stay off until mouse bindings survive");
-        assert!(!crate::team::config::LayoutConfig::default().keys);
-        let on: crate::team::config::LayoutConfig = serde_yaml::from_str("keys: true\n").unwrap();
-        assert!(on.keys);
+        assert!(layout.keys);
+        assert!(crate::team::config::LayoutConfig::default().keys);
+        let off: crate::team::config::LayoutConfig = serde_yaml::from_str("keys: false\n").unwrap();
+        assert!(!off.keys);
+        // Existing zones keep their tiled layout under `auto`.
+        assert_eq!(
+            resolve_mode(layout.mode, 9, !layout.zones.is_empty(), 80, 24),
+            ResolvedMode::Panes
+        );
     }
 
     #[test]
@@ -566,7 +676,8 @@ mod tests {
 
     #[test]
     fn session_options_are_session_scoped_and_versioned() {
-        let new = session_option_commands("batty-x", v(3, 4), ResolvedMode::Windows, true);
+        let new =
+            session_option_commands("batty-x", v(3, 4), ResolvedMode::Windows, true, Some("F0"));
         assert!(new.iter().all(|c| c[2] == "-t" && c[3] == "batty-x"));
         assert!(new.iter().all(|c| c[0] == "set-option" && c[1] == "-q"));
         let has = |cmds: &Vec<Vec<String>>, name: &str, value: &str| {
@@ -583,16 +694,28 @@ mod tests {
                 .any(|c| c[4] == "status-format[1]" && c[5].contains("F1 help"))
         );
 
-        assert!(has(&new, "key-table", "batty-x"));
-        let nokeys = session_option_commands("batty-x", v(3, 4), ResolvedMode::Windows, false);
-        assert!(!nokeys.iter().any(|c| c[4] == "key-table"));
+        // Line 0 (window tabs) is kept when line 1 becomes the hint.
+        assert!(has(&new, "status-format[0]", "F0"));
+        let unknown =
+            session_option_commands("batty-x", v(3, 4), ResolvedMode::Windows, true, None);
+        assert!(!unknown.iter().any(|c| c[4].starts_with("status-format")));
+        assert!(
+            unknown
+                .iter()
+                .any(|c| c[4] == "status-right" && c[5].contains("Click a tab"))
+        );
+        // N2: no custom key table, which would hide root and mouse bindings.
+        assert!(!new.iter().any(|c| c[4] == "key-table"));
+        assert!(has(&new, LAYOUT_OPTION, "windows"));
+        let nokeys =
+            session_option_commands("batty-x", v(3, 4), ResolvedMode::Windows, false, Some("F0"));
         assert!(
             nokeys
                 .iter()
                 .any(|c| c[4] == "status-format[1]" && !c[5].contains("F1"))
         );
-        let old = session_option_commands("batty-x", v(2, 6), ResolvedMode::Windows, true);
-        assert!(!old.iter().any(|c| c[4] == "key-table"));
+        let old =
+            session_option_commands("batty-x", v(2, 6), ResolvedMode::Windows, true, Some("F0"));
         assert!(!has(&old, "status", "2"));
         assert!(!has(&old, "window-size", "latest"));
         assert!(
@@ -610,6 +733,8 @@ mod tests {
                 .any(|c| c[4] == "aggressive-resize" && c[5] == "on")
         );
         assert!(cmds.iter().any(|c| c[4] == "allow-rename" && c[5] == "off"));
+        // Tab formats are window options: set on every window, not just one.
+        assert!(cmds.iter().any(|c| c[4] == "window-status-format"));
     }
 
     #[test]
@@ -619,8 +744,14 @@ mod tests {
         assert!(PANE_BORDER_FORMAT.contains("pane_active"));
     }
 
+    fn option_value<'a>(cmds: &'a [Vec<String>], name: &str) -> Option<&'a str> {
+        cmds.iter()
+            .find(|c| c[0] == "set-option" && c[1] == "-q" && c[4] == name)
+            .map(|c| c[5].as_str())
+    }
+
     #[test]
-    fn key_bindings_use_session_table_and_are_numbered() {
+    fn key_bindings_dispatch_from_root_on_session_options() {
         let jumps = vec![JumpTarget::Window(1), JumpTarget::Window(2)];
         let cmds = key_binding_commands(
             "batty-x",
@@ -628,61 +759,168 @@ mod tests {
             ResolvedMode::Windows,
             Path::new("/p/help.txt"),
             v(3, 4),
+            "",
         );
-        // Table is cleared first so restarts do not accumulate bindings.
-        assert_eq!(cmds[0], vec!["unbind-key", "-a", "-T", "batty-x"]);
-        // Never the root or prefix tables.
+        // Actions live in the session's own options.
+        assert_eq!(option_value(&cmds, "@batty_keys"), Some("1"));
+        assert_eq!(
+            option_value(&cmds, "@batty_key_F2"),
+            Some("select-window -t :1")
+        );
+        assert_eq!(
+            option_value(&cmds, "@batty_key_F3"),
+            Some("select-window -t :2")
+        );
+        assert_eq!(
+            option_value(&cmds, "@batty_key_F12"),
+            Some("resize-pane -Z")
+        );
         assert!(
-            cmds[1..]
-                .iter()
-                .all(|c| c[0] == "bind-key" && c[1] == "-T" && c[2] == "batty-x")
+            option_value(&cmds, "@batty_key_F1")
+                .unwrap()
+                .starts_with("display-popup")
         );
-        let f2 = cmds.iter().find(|c| c[3] == "F2").unwrap();
-        assert_eq!(f2[4], "select-window -t :1");
+        // Unused keys are unset so a refresh drops stale jumps.
         assert!(
             cmds.iter()
-                .any(|c| c[3] == "F3" && c[4] == "select-window -t :2")
+                .any(|c| c[1] == "-qu" && c[4] == "@batty_key_F4")
         );
-        assert!(!cmds.iter().any(|c| c[3] == "F4"));
-        let f12 = cmds.iter().find(|c| c[3] == "F12").unwrap();
-        assert_eq!(f12[4], "resize-pane -Z");
-        let f1 = cmds.iter().find(|c| c[3] == "F1").unwrap();
-        assert!(f1[4].starts_with("display-popup"));
-        assert!(!cmds.iter().any(|c| c.iter().any(|a| a == "?")));
+        assert!(option_value(&cmds, "@batty_key_F4").is_none());
+        // Every set targets this session only.
+        assert!(
+            cmds.iter()
+                .filter(|c| c[0] == "set-option")
+                .all(|c| c[2] == "-t" && c[3] == "batty-x")
+        );
+        // Root bindings are identical for every session and pass the key on.
+        let binds: Vec<_> = cmds.iter().filter(|c| c[0] == "bind-key").collect();
+        assert_eq!(binds.len(), 12);
+        assert!(binds.iter().all(|c| c[1] == "-T" && c[2] == "root"));
+        let f2 = binds.iter().find(|c| c[3] == "F2").unwrap();
+        assert_eq!(
+            f2[4..],
+            [
+                "if-shell",
+                "-F",
+                "#{@batty_key_F2}",
+                "run-shell -C '#{@batty_key_F2}'",
+                "send-keys F2"
+            ]
+        );
+        assert!(!cmds.iter().flatten().any(|a| a == "key-table" || a == "?"));
+        assert!(!cmds.iter().any(|c| c[0] == "unbind-key"));
     }
 
     #[test]
-    fn help_falls_back_to_message_before_3_2() {
-        let f = |ver| key_binding_commands("s", &[], ResolvedMode::Panes, Path::new("/h"), ver);
-        let cmds = f(v(3, 0));
-        let f1 = cmds.iter().find(|c| c[3] == "F1").unwrap();
-        assert!(f1[4].starts_with("display-message"));
-        assert!(f(v(2, 8)).is_empty());
+    fn key_bindings_leave_user_root_keys_alone() {
+        let listing = "bind-key -T root F5 display-message mine\n\
+                       bind-key -T root F2 if-shell -F \"#{@batty_key_F2}\" x y\n";
+        let cmds = key_binding_commands(
+            "s",
+            &[JumpTarget::Window(1)],
+            ResolvedMode::Windows,
+            Path::new("/h"),
+            v(3, 4),
+            listing,
+        );
+        let bound: Vec<&str> = cmds
+            .iter()
+            .filter(|c| c[0] == "bind-key")
+            .map(|c| c[3].as_str())
+            .collect();
+        assert!(!bound.contains(&"F5"), "user's F5 is not overwritten");
+        assert!(bound.contains(&"F2"), "batty's own binding is refreshed");
+        assert_eq!(bound.len(), 11);
+    }
+
+    #[test]
+    fn keys_need_tmux_3_2() {
+        let f = |ver| key_binding_commands("s", &[], ResolvedMode::Panes, Path::new("/h"), ver, "");
+        assert!(f(v(3, 1)).is_empty());
         assert!(f(None).is_empty());
+        let cmds = f(v(3, 2));
+        assert!(
+            option_value(&cmds, "@batty_key_F1")
+                .unwrap()
+                .starts_with("display-popup")
+        );
+        assert!(!hint_line(v(3, 1), ResolvedMode::Panes, true).contains("F1"));
+        assert!(hint_line(v(3, 2), ResolvedMode::Panes, true).contains("F1"));
     }
 
     #[test]
     fn pane_and_focus_jumps() {
         let jumps = vec![JumpTarget::Pane("%7".into())];
-        let f = |mode| key_binding_commands("s", &jumps, mode, Path::new("/h"), v(3, 4));
+        let f = |mode| key_binding_commands("s", &jumps, mode, Path::new("/h"), v(3, 4), "");
         let panes = f(ResolvedMode::Panes);
-        assert!(
-            panes
-                .iter()
-                .any(|c| c[3] == "F2" && c[4] == "select-pane -t %7")
+        assert_eq!(
+            option_value(&panes, "@batty_key_F2"),
+            Some("select-pane -t %7")
         );
-        assert!(!panes.iter().any(|c| c[3] == "F11"));
+        assert!(option_value(&panes, "@batty_key_F11").is_none());
         let focus = f(ResolvedMode::Focus);
         assert!(
-            focus
-                .iter()
-                .any(|c| c[3] == "F2" && c[4].starts_with("swap-pane -s %7"))
+            option_value(&focus, "@batty_key_F2")
+                .unwrap()
+                .starts_with("swap-pane -s %7")
         );
         assert!(
-            focus
-                .iter()
-                .any(|c| c[3] == "F11" && c[4].starts_with("rotate-window"))
+            option_value(&focus, "@batty_key_F11")
+                .unwrap()
+                .starts_with("rotate-window")
         );
+    }
+
+    #[test]
+    fn help_popup_quotes_the_path() {
+        let actions = key_actions(&[], ResolvedMode::Panes, Path::new("/p/it's #1/help.txt"));
+        let f1 = &actions.iter().find(|(k, _)| k == "F1").unwrap().1;
+        assert!(f1.starts_with("display-popup -E"));
+        assert!(
+            f1.contains("##1"),
+            "# is escaped for format expansion: {f1}"
+        );
+    }
+
+    #[test]
+    fn resolved_mode_round_trips_through_session_option() {
+        for mode in [
+            ResolvedMode::Panes,
+            ResolvedMode::Windows,
+            ResolvedMode::Focus,
+        ] {
+            assert_eq!(ResolvedMode::from_option(mode.as_str()), mode);
+        }
+        assert_eq!(ResolvedMode::from_option(""), ResolvedMode::Panes);
+        assert_eq!(
+            ResolvedMode::from_option("windows\n"),
+            ResolvedMode::Windows
+        );
+    }
+
+    #[test]
+    fn unique_window_name_avoids_existing_windows() {
+        let existing = vec!["dashboard".to_string(), "eng-1".into(), "eng-1-2".into()];
+        assert_eq!(unique_window_name("eng-1", &existing), "eng-1-3");
+        assert_eq!(unique_window_name("eng.2", &existing), "eng-2");
+        assert_eq!(unique_window_name("dashboard", &[]), "dashboard-2");
+    }
+
+    #[test]
+    fn terminal_size_prefers_tty_then_stdin_then_default() {
+        assert_eq!(pick_size(|| Some((100, 30)), || Some((80, 24))), (100, 30));
+        assert_eq!(pick_size(|| None, || Some((80, 24))), (80, 24));
+        assert_eq!(pick_size(|| None, || None), (DEFAULT_COLS, DEFAULT_ROWS));
+        // The stdin probe only runs when the tty probe fails.
+        let mut called = false;
+        pick_size(
+            || Some((1, 1)),
+            || {
+                called = true;
+                None
+            },
+        );
+        assert!(!called);
     }
 
     #[test]

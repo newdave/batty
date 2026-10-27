@@ -49,9 +49,10 @@ batty attach
 batty status
 ```
 
-By default every member is tiled in one tmux window. Large teams can opt into a
-dashboard plus one window per member with `layout.mode: windows` (or `auto`).
-See [docs/tmux-layouts.md](docs/tmux-layouts.md).
+By default (`layout.mode: auto`) a small team is tiled in one tmux window and a
+larger team gets a dashboard plus one window per member. F1 shows help, F2-F10
+jump to a member, and the mouse works as usual. See
+[docs/tmux-layouts.md](docs/tmux-layouts.md).
 
 `cargo install batty-cli` installs the `batty` binary. After `batty init`, edit
 `.batty/team_config/team.yaml`, start the daemon, attach to the live tmux session,

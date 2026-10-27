@@ -705,7 +705,112 @@ pub fn kill_session(session: &str) -> Result<()> {
     }
 
     info!(session = session, "tmux session killed");
+    release_batty_keys_if_unused();
     Ok(())
+}
+
+/// Session option marking a session that uses batty's root-table keys.
+pub const BATTY_KEYS_OPTION: &str = "@batty_keys";
+/// Prefix of the per-session options that hold each key's action.
+pub const BATTY_KEY_OPTION_PREFIX: &str = "@batty_key_";
+
+/// Who owns a key in tmux's root table, judged from `list-keys -T root`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootKeyOwner {
+    Unbound,
+    Batty,
+    Other,
+}
+
+/// Parse one `list-keys` line into `(table, key, command)`.
+fn parse_list_keys_line(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = line.trim_start().strip_prefix("bind-key")?.trim_start();
+    let mut table = "prefix";
+    let mut rest = rest;
+    // Flags come before the key: -r, -n, -T <table>, -N <note>.
+    loop {
+        if let Some(after) = rest.strip_prefix("-T ") {
+            let after = after.trim_start();
+            let end = after.find(char::is_whitespace)?;
+            table = &after[..end];
+            rest = after[end..].trim_start();
+        } else if let Some(after) = rest.strip_prefix("-n ") {
+            table = "root";
+            rest = after.trim_start();
+        } else if let Some(after) = rest.strip_prefix("-r ") {
+            rest = after.trim_start();
+        } else {
+            break;
+        }
+    }
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some((table, &rest[..end], rest[end..].trim_start()))
+}
+
+/// Owner of `key` in the root table, given `list-keys -T root` output.
+pub fn root_key_owner(listing: &str, key: &str) -> RootKeyOwner {
+    listing
+        .lines()
+        .filter_map(parse_list_keys_line)
+        .find(|(table, k, _)| *table == "root" && *k == key)
+        .map_or(RootKeyOwner::Unbound, |(_, _, command)| {
+            if command.contains(BATTY_KEY_OPTION_PREFIX) {
+                RootKeyOwner::Batty
+            } else {
+                RootKeyOwner::Other
+            }
+        })
+}
+
+/// Root-table keys that batty installed, given `list-keys -T root` output.
+pub fn batty_root_keys(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(parse_list_keys_line)
+        .filter(|(table, _, command)| *table == "root" && command.contains(BATTY_KEY_OPTION_PREFIX))
+        .map(|(_, key, _)| key.to_string())
+        .collect()
+}
+
+/// `list-keys -T root` output, or empty when tmux cannot answer.
+pub fn root_key_listing() -> String {
+    run_tmux_with_timeout(["list-keys", "-T", "root"], "list-keys root", None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// Remove batty's root-table keys once no remaining session uses them.
+///
+/// Keys are shared by every batty session on the server, so they stay while
+/// any session still has [`BATTY_KEYS_OPTION`] set. Keys batty did not
+/// install are never touched.
+pub fn release_batty_keys_if_unused() {
+    let Ok(output) = run_tmux_with_timeout(
+        [
+            "list-sessions",
+            "-F",
+            format!("#{{{BATTY_KEYS_OPTION}}}").as_str(),
+        ],
+        "list-sessions batty keys",
+        None,
+    ) else {
+        return;
+    };
+    if !output.status.success() {
+        // No server left (last session killed): nothing to release.
+        return;
+    }
+    if String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim() == "1")
+    {
+        return;
+    }
+    for key in batty_root_keys(&root_key_listing()) {
+        let _ = run_tmux_with_timeout(["unbind-key", "-T", "root", &key], "unbind-key", None);
+    }
 }
 
 /// Capture the current visible content of a tmux target (session or pane).
@@ -1097,6 +1202,31 @@ mod tests {
             error_chain.contains("%hung"),
             "timeout should include target context, got: {error_chain}"
         );
+    }
+
+    const ROOT_LISTING: &str = "\
+bind-key    -T root   MouseDown1Pane    select-pane -t = \\; send-keys -M
+bind-key    -T root   F2                if-shell -F \"#{@batty_key_F2}\" \"run-shell -C '#{@batty_key_F2}'\" \"send-keys F2\"
+bind-key -r -T root   F5                display-message mine
+bind-key    -T prefix F3                display-message prefixed
+bind-key -n F7 display-message old-style
+";
+
+    #[test]
+    fn root_key_owner_tells_batty_user_and_unbound_apart() {
+        assert_eq!(root_key_owner(ROOT_LISTING, "F2"), RootKeyOwner::Batty);
+        assert_eq!(root_key_owner(ROOT_LISTING, "F5"), RootKeyOwner::Other);
+        assert_eq!(root_key_owner(ROOT_LISTING, "F7"), RootKeyOwner::Other);
+        // A prefix-table binding does not own the root key.
+        assert_eq!(root_key_owner(ROOT_LISTING, "F3"), RootKeyOwner::Unbound);
+        assert_eq!(root_key_owner(ROOT_LISTING, "F12"), RootKeyOwner::Unbound);
+        assert_eq!(root_key_owner("", "F2"), RootKeyOwner::Unbound);
+    }
+
+    #[test]
+    fn batty_root_keys_lists_only_batty_bindings() {
+        assert_eq!(batty_root_keys(ROOT_LISTING), vec!["F2".to_string()]);
+        assert!(batty_root_keys("garbage\n").is_empty());
     }
 
     #[test]

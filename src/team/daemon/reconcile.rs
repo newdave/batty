@@ -62,6 +62,9 @@ impl TeamDaemon {
         // Phase 3: Update daemon config to reflect new topology
         self.config.team_config = new_config;
         self.config.members = new_members;
+        if !diff.added.is_empty() || !diff.removed.is_empty() {
+            self.refresh_layout_ui();
+        }
 
         info!(
             added = diff.added.len(),
@@ -565,31 +568,19 @@ impl TeamDaemon {
         Ok(())
     }
 
-    /// Create a new tmux pane for a member by splitting an existing one.
+    /// Create a tmux pane for a member added at runtime, following the
+    /// session's layout mode (new window in windows mode, focus re-layout in
+    /// focus mode, a split otherwise).
     fn create_pane_for_member(&self, member: &MemberInstance) -> Result<String> {
         let target_pane = self.find_split_target(member);
 
-        let pane_id = tmux::split_window_vertical_in_pane(&self.config.session, &target_pane, 50)
-            .with_context(|| format!("failed to create pane for {}", member.name))?;
-
-        // Label the pane with @batty_role
-        let _ = tmux::run_tmux_with_timeout(
-            ["select-pane", "-t", &pane_id, "-T", &member.name],
-            "select-pane -T",
-            Some(&pane_id),
-        );
-        let _ = tmux::run_tmux_with_timeout(
-            [
-                "set-option",
-                "-p",
-                "-t",
-                &pane_id,
-                "@batty_role",
-                &member.name,
-            ],
-            "set-option @batty_role",
-            Some(&pane_id),
-        );
+        let pane_id = crate::team::layout::add_member_pane(
+            &self.config.session,
+            &member.name,
+            &target_pane,
+            &self.config.project_root,
+        )
+        .with_context(|| format!("failed to create pane for {}", member.name))?;
 
         info!(
             member = member.name.as_str(),
@@ -597,6 +588,27 @@ impl TeamDaemon {
             "created tmux pane"
         );
         Ok(pane_id)
+    }
+
+    /// Re-install jump keys and help for the current member list.
+    fn refresh_layout_ui(&self) {
+        let ordered: Vec<(String, String)> = self
+            .config
+            .members
+            .iter()
+            .filter(|m| m.role_type != RoleType::User)
+            .filter_map(|m| {
+                self.config
+                    .pane_map
+                    .get(&m.name)
+                    .map(|pane| (m.name.clone(), pane.clone()))
+            })
+            .collect();
+        crate::team::layout::refresh_member_ui(
+            &self.config.session,
+            &self.config.project_root,
+            &ordered,
+        );
     }
 
     /// Find the best existing pane to split when adding a new member.
