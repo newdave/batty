@@ -65,8 +65,11 @@ pub enum Command {
     /// Stop the team daemon and kill the tmux session
     Stop,
 
-    /// Attach to the running team tmux session
-    Attach,
+    /// Attach to the running team tmux session, optionally jumping to a member
+    Attach {
+        /// Member whose window/pane to select (e.g. `architect`, `eng-1-1`)
+        member: Option<String>,
+    },
 
     /// Show all team members and their states
     Status {
@@ -1521,7 +1524,16 @@ mod tests {
     #[test]
     fn attach_subcommand_parses() {
         let cli = Cli::parse_from(["batty", "attach"]);
-        assert!(matches!(cli.command, Command::Attach));
+        assert!(matches!(cli.command, Command::Attach { member: None }));
+    }
+
+    #[test]
+    fn attach_subcommand_accepts_member() {
+        let cli = Cli::parse_from(["batty", "attach", "eng-1-1"]);
+        match cli.command {
+            Command::Attach { member } => assert_eq!(member.as_deref(), Some("eng-1-1")),
+            other => panic!("expected attach, got {other:?}"),
+        }
     }
 
     #[test]

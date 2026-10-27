@@ -663,7 +663,7 @@ mod tests {
         crate::tmux::create_window(&session, "keeper", "sleep", &["30".to_string()], "/tmp")
             .unwrap();
         let pane_id = crate::tmux::pane_id(&session).unwrap();
-        std::process::Command::new("tmux")
+        crate::tmux::tmux_command()
             .args(["set-option", "-p", "-t", &pane_id, "remain-on-exit", "on"])
             .output()
             .unwrap();

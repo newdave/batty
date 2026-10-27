@@ -226,8 +226,8 @@ pub(super) fn run_stop(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run_attach(root: &Path) -> Result<()> {
-    team::attach_team(root)?;
+pub(super) fn run_attach(root: &Path, member: Option<&str>) -> Result<()> {
+    team::attach_team(root, member)?;
     Ok(())
 }
 

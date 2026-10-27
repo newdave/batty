@@ -406,7 +406,7 @@ mod tests {
 
         let architect_pane = crate::tmux::pane_id(&session).unwrap();
         let engineer_pane = crate::tmux::pane_id(&format!("{session}:eng-1")).unwrap();
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .args([
                 "set-option",
                 "-p",
@@ -505,7 +505,7 @@ mod tests {
         let manager_pane = crate::tmux::pane_id(&format!("{session}:manager")).unwrap();
         let engineer_pane = crate::tmux::pane_id(&format!("{session}:eng-1")).unwrap();
 
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .args([
                 "set-option",
                 "-p",

@@ -29,10 +29,40 @@ fn tmux_command_timeout() -> Duration {
     TMUX_COMMAND_TIMEOUT
 }
 
+/// Build a `tmux` command. Every tmux invocation in the crate goes through here.
+///
+/// In test builds the command is pinned to a private server: `$TMUX` is
+/// removed (it would otherwise select the caller's live server) and
+/// `TMUX_TMPDIR` points at a per-process temp directory, so tests can never
+/// touch the user's default tmux server, sessions or key bindings.
+pub fn tmux_command() -> Command {
+    let command = Command::new("tmux");
+    #[cfg(test)]
+    let command = {
+        let mut command = command;
+        command.env_remove("TMUX");
+        command.env("TMUX_TMPDIR", test_tmux_dir());
+        command
+    };
+    command
+}
+
+/// Per-process private tmux socket directory used by test builds.
+#[cfg(test)]
+pub(crate) fn test_tmux_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        // Short path: unix socket paths are limited to ~104 bytes on macOS.
+        let dir = std::path::PathBuf::from(format!("/tmp/bt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
 #[cfg(test)]
 /// Return whether the tmux binary is available in the current environment.
 pub fn tmux_available() -> bool {
-    Command::new("tmux")
+    crate::tmux::tmux_command()
         .arg("-V")
         .output()
         .is_ok_and(|output| output.status.success())
@@ -47,7 +77,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let mut command = Command::new("tmux");
+    let mut command = crate::tmux::tmux_command();
     command.args(args);
     command_output_with_timeout(command, command_label, target, tmux_command_timeout())
 }
@@ -284,7 +314,7 @@ pub fn create_session(session: &str, program: &str, args: &[String], work_dir: &
 
     // Build the full command string for tmux
     // tmux new-session -d -s <name> -c <work_dir> <program> <args...>
-    let mut cmd = Command::new("tmux");
+    let mut cmd = crate::tmux::tmux_command();
     cmd.args(["new-session", "-d", "-s", session, "-c", work_dir]);
     // Set a generous size so the PTY isn't tiny
     cmd.args(["-x", "220", "-y", "50"]);
@@ -331,7 +361,7 @@ pub fn create_window(
         bail!("tmux session '{session}' not found");
     }
 
-    let mut cmd = Command::new("tmux");
+    let mut cmd = crate::tmux::tmux_command();
     cmd.args([
         "new-window",
         "-d",
@@ -426,6 +456,106 @@ pub fn setup_pipe_pane(target: &str, log_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Create a detached window in `session` and return its first pane id.
+pub fn new_window_pane(session: &str, window_name: &str, work_dir: &str) -> Result<String> {
+    let output = run_tmux_with_timeout(
+        [
+            "new-window",
+            "-d",
+            "-t",
+            &format!("{session}:"),
+            "-n",
+            window_name,
+            "-c",
+            work_dir,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "env",
+            "-u",
+            "CLAUDECODE",
+            "bash",
+        ],
+        "new-window",
+        Some(session),
+    )
+    .with_context(|| format!("failed to create window '{window_name}' in '{session}'"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(TmuxError::command_failed("new-window", Some(session), &stderr).into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Index of the window containing `pane` (e.g. `%3`).
+pub fn window_index_of_pane(pane: &str) -> Result<usize> {
+    let output = run_tmux_with_timeout(
+        ["display-message", "-p", "-t", pane, "#{window_index}"],
+        "display-message window_index",
+        Some(pane),
+    )?;
+    if !output.status.success() {
+        bail!("tmux could not resolve window for pane '{pane}'");
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .with_context(|| format!("unexpected window index for pane '{pane}'"))
+}
+
+/// Find a member's `(window_index, pane_id)` in `list-panes -s` output of
+/// tab-separated `window_index, pane_id, @batty_role` lines.
+pub fn find_member_target(listing: &str, member: &str) -> Option<(usize, String)> {
+    listing.lines().find_map(|line| {
+        let mut parts = line.split('\t');
+        let window = parts.next()?.trim().parse().ok()?;
+        let pane = parts.next()?.trim();
+        let role = parts.next()?.trim();
+        (role == member).then(|| (window, pane.to_string()))
+    })
+}
+
+/// Names of members that have a pane in the session (for error hints).
+pub fn listed_members(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| line.split('\t').nth(2))
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// Select the window and pane of `member` in `session`.
+pub fn select_member(session: &str, member: &str) -> Result<()> {
+    let output = run_tmux_with_timeout(
+        [
+            "list-panes",
+            "-s",
+            "-t",
+            session,
+            "-F",
+            "#{window_index}\t#{pane_id}\t#{@batty_role}",
+        ],
+        "list-panes member",
+        Some(session),
+    )?;
+    if !output.status.success() {
+        bail!("tmux could not list panes for '{session}'");
+    }
+    let listing = String::from_utf8_lossy(&output.stdout).to_string();
+    let Some((window, pane)) = find_member_target(&listing, member) else {
+        let known = listed_members(&listing).join(", ");
+        bail!("no member '{member}' in session '{session}' (members: {known})");
+    };
+    let _ = run_tmux_with_timeout(
+        ["select-window", "-t", &format!("{session}:{window}")],
+        "select-window",
+        Some(session),
+    );
+    let _ = run_tmux_with_timeout(["select-pane", "-t", &pane], "select-pane", Some(&pane));
+    Ok(())
+}
+
 /// Attach to an existing tmux session (blocks until detach/exit).
 ///
 /// If already inside tmux, uses `switch-client` instead of `attach-session`.
@@ -445,7 +575,7 @@ pub fn attach(session: &str) -> Result<()> {
         ("attach-session", vec!["-t", session])
     };
 
-    let status = Command::new("tmux")
+    let status = crate::tmux::tmux_command()
         .arg(cmd)
         .args(&args)
         .status()
@@ -466,7 +596,7 @@ pub fn send_keys(target: &str, keys: &str, press_enter: bool) -> Result<()> {
     if !keys.is_empty() {
         // `-l` sends text literally so punctuation/symbols are not interpreted as
         // tmux key names.
-        let mut command = Command::new("tmux");
+        let mut command = crate::tmux::tmux_command();
         command.args(["send-keys", "-t", target, "-l", "--", keys]);
         let output =
             command_output_with_timeout(command, "send-keys", Some(target), TMUX_COMMAND_TIMEOUT)
@@ -485,7 +615,7 @@ pub fn send_keys(target: &str, keys: &str, press_enter: bool) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(SEND_KEYS_SUBMIT_DELAY_MS));
         }
 
-        let mut command = Command::new("tmux");
+        let mut command = crate::tmux::tmux_command();
         command.args(["send-keys", "-t", target, "Enter"]);
         let output = command_output_with_timeout(
             command,
@@ -599,7 +729,7 @@ pub fn capture_pane_recent(target: &str, lines: u32) -> Result<String> {
         args.push(format!("-{lines}"));
     }
 
-    let mut command = Command::new("tmux");
+    let mut command = crate::tmux::tmux_command();
     command.args(&args);
     let output =
         command_output_with_timeout(command, "capture-pane", Some(target), TMUX_COMMAND_TIMEOUT)
@@ -1058,7 +1188,7 @@ mod tests {
 
         create_session(session, "sleep", &["10".to_string()], "/tmp").unwrap();
 
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["set-environment", "-t", session, "CLAUDECODE", "1"])
             .output()
             .unwrap();
@@ -1100,7 +1230,7 @@ mod tests {
 
         create_session(session, "sleep", &["10".to_string()], "/tmp").unwrap();
 
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["show-options", "-t", session, "-v", "mouse"])
             .output()
             .unwrap();
@@ -1304,7 +1434,7 @@ mod tests {
         create_session(session, "sleep", &["10".to_string()], "/tmp").unwrap();
         configure_supervisor_hotkeys(session).unwrap();
 
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "show-options",
                 "-v",
@@ -1592,7 +1722,7 @@ mod tests {
 
         // Mouse is enabled by create_session; disable it
         set_mouse(session, false).unwrap();
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["show-options", "-t", session, "-v", "mouse"])
             .output()
             .unwrap();
@@ -1604,7 +1734,7 @@ mod tests {
 
         // Re-enable
         set_mouse(session, true).unwrap();
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["show-options", "-t", session, "-v", "mouse"])
             .output()
             .unwrap();
@@ -1628,7 +1758,7 @@ mod tests {
 
         tmux_set(session, "@batty_test_opt", "test-value").unwrap();
 
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["show-options", "-v", "-t", session, "@batty_test_opt"])
             .output()
             .unwrap();
@@ -1776,5 +1906,38 @@ mod tests {
 
         // Pane should still exist and not be dead
         assert!(pane_exists(&pane), "respawned pane should exist");
+    }
+
+    #[test]
+    fn test_tmux_commands_never_target_the_default_server() {
+        let command = tmux_command();
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+        // $TMUX explicitly removed, TMUX_TMPDIR pinned to the private dir.
+        assert_eq!(envs.get(std::ffi::OsStr::new("TMUX")), Some(&None));
+        let tmpdir = envs
+            .get(std::ffi::OsStr::new("TMUX_TMPDIR"))
+            .and_then(|v| *v)
+            .expect("TMUX_TMPDIR must be set in test builds");
+        assert_eq!(tmpdir, test_tmux_dir().as_os_str());
+        assert!(test_tmux_dir().to_string_lossy().starts_with("/tmp/bt-"));
+    }
+
+    #[test]
+    fn find_member_target_matches_role_exactly() {
+        let listing = "1\t%0\tdashboard\n2\t%4\teng-1\n3\t%5\teng-1-1\n";
+        assert_eq!(
+            find_member_target(listing, "eng-1"),
+            Some((2, "%4".to_string()))
+        );
+        assert_eq!(
+            find_member_target(listing, "eng-1-1"),
+            Some((3, "%5".to_string()))
+        );
+        assert_eq!(find_member_target(listing, "eng"), None);
+        assert_eq!(find_member_target("garbage", "x"), None);
+        assert_eq!(
+            listed_members(listing),
+            vec!["dashboard", "eng-1", "eng-1-1"]
+        );
     }
 }

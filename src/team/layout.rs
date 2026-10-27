@@ -13,6 +13,7 @@ use tracing::{debug, info};
 
 use super::config::{LayoutConfig, OrchestratorPosition, RoleType, WorkflowMode};
 use super::hierarchy::MemberInstance;
+use super::layout_ui;
 use crate::tmux;
 
 const ORCHESTRATOR_PANE_WIDTH_PCT: u32 = 20;
@@ -48,32 +49,236 @@ pub fn build_layout(
     }
 
     let work_dir = project_root.to_string_lossy().to_string();
+    let orchestrator_enabled = should_launch_orchestrator_pane(workflow_mode, orchestrator_pane);
+    let (cols, rows) = layout_ui::terminal_size();
+    let mode = layout_ui::resolve_mode(
+        layout.as_ref().map(|l| l.mode).unwrap_or_default(),
+        pane_members.len() + usize::from(orchestrator_enabled),
+        layout.as_ref().is_some_and(|l| !l.zones.is_empty()),
+        cols,
+        rows,
+    );
+    let version = layout_ui::detect_tmux_version();
+    let keys = layout.as_ref().is_none_or(|l| l.keys);
+    info!(session, ?mode, "resolved tmux layout mode");
 
     // Create session with the first member
     tmux::create_session(session, "bash", &[], &work_dir)?;
-    tmux::rename_window(&format!("{session}:0"), "team")?;
-
-    // Enable pane borders with role labels using @batty_role (agent-proof)
-    let _ = tmux::run_tmux_with_timeout(
-        ["set-option", "-t", session, "pane-border-status", "top"],
-        "set-option pane-border-status",
-        Some(session),
-    );
-    let _ = tmux::run_tmux_with_timeout(
-        [
-            "set-option",
-            "-t",
-            session,
-            "pane-border-format",
-            " #[fg=green,bold]#{@batty_role}#[default] #{@batty_status} ",
+    for cmd in layout_ui::session_option_commands(session, version, mode, keys) {
+        run_best_effort(session, &cmd);
+    }
+    let initial_pane = tmux::pane_id(session)?;
+    // base-index is 1 now; move the first window off index 0.
+    run_best_effort(
+        session,
+        &[
+            "move-window".to_string(),
+            "-s".to_string(),
+            format!("{session}:0"),
+            "-t".to_string(),
+            format!("{session}:1"),
         ],
-        "set-option pane-border-format",
-        Some(session),
     );
+
+    let pane_map = match mode {
+        layout_ui::ResolvedMode::Panes => build_tiled_layout(
+            session,
+            &initial_pane,
+            &pane_members,
+            layout,
+            project_root,
+            orchestrator_enabled,
+            orchestrator_position,
+        )?,
+        layout_ui::ResolvedMode::Windows => build_windows_layout(
+            session,
+            &initial_pane,
+            &pane_members,
+            project_root,
+            orchestrator_enabled,
+            &work_dir,
+        )?,
+        layout_ui::ResolvedMode::Focus => build_focus_layout(
+            session,
+            &initial_pane,
+            &pane_members,
+            project_root,
+            orchestrator_enabled,
+            version,
+        )?,
+    };
+
+    finish_ui(
+        session,
+        project_root,
+        mode,
+        version,
+        keys,
+        &pane_members,
+        &pane_map,
+    );
+    info!(session, panes = pane_map.len(), "team layout created");
+    Ok(pane_map)
+}
+
+/// Run one tmux command, logging (not failing) on error.
+fn run_best_effort(session: &str, args: &[String]) {
+    match tmux::run_tmux_with_timeout(args, "layout-ui", Some(session)) {
+        Ok(out) if !out.status.success() => {
+            debug!(?args, stderr = %String::from_utf8_lossy(&out.stderr), "tmux ui command failed");
+        }
+        Err(error) => debug!(?args, %error, "tmux ui command errored"),
+        _ => {}
+    }
+}
+
+fn apply_window_options(session: &str, pane: &str) {
+    for cmd in layout_ui::window_option_commands(pane) {
+        run_best_effort(session, &cmd);
+    }
+}
+
+/// Install key bindings and the help file; select the first window/pane.
+fn finish_ui(
+    session: &str,
+    project_root: &Path,
+    mode: layout_ui::ResolvedMode,
+    version: Option<layout_ui::TmuxVersion>,
+    keys: bool,
+    pane_members: &[&MemberInstance],
+    pane_map: &HashMap<String, String>,
+) {
+    use layout_ui::{JumpTarget, ResolvedMode};
+    let mut labels: Vec<String> = Vec::new();
+    let mut jumps: Vec<JumpTarget> = Vec::new();
+    if mode == ResolvedMode::Windows {
+        labels.push("dashboard".to_string());
+        jumps.push(JumpTarget::Window(1));
+    }
+    for member in pane_members {
+        let Some(pane) = pane_map.get(&member.name) else {
+            continue;
+        };
+        labels.push(member.name.clone());
+        match mode {
+            ResolvedMode::Windows => {
+                if let Ok(idx) = tmux::window_index_of_pane(pane) {
+                    jumps.push(JumpTarget::Window(idx));
+                }
+            }
+            _ => jumps.push(JumpTarget::Pane(pane.clone())),
+        }
+    }
+    if keys {
+        let help_file = project_root.join(".batty").join("tmux-help.txt");
+        if let Some(parent) = help_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&help_file, layout_ui::help_text(mode, &labels));
+        for cmd in layout_ui::key_binding_commands(session, &jumps, mode, &help_file, version) {
+            run_best_effort(session, &cmd);
+        }
+    }
+    let first = match mode {
+        ResolvedMode::Windows => format!("{session}:1"),
+        _ => pane_members
+            .first()
+            .and_then(|m| pane_map.get(&m.name))
+            .cloned()
+            .unwrap_or_else(|| format!("{session}:1")),
+    };
+    run_best_effort(
+        session,
+        &["select-window".into(), "-t".into(), first.clone()],
+    );
+    if mode != ResolvedMode::Windows {
+        run_best_effort(session, &["select-pane".into(), "-t".into(), first]);
+    }
+}
+
+fn build_windows_layout(
+    session: &str,
+    initial_pane: &str,
+    pane_members: &[&MemberInstance],
+    project_root: &Path,
+    orchestrator_enabled: bool,
+    work_dir: &str,
+) -> Result<HashMap<String, String>> {
+    let batty = batty_binary();
+    let command =
+        layout_ui::dashboard_command(&batty, work_dir, layout_ui::status_supports_watch(&batty));
+    tmux::rename_window(initial_pane, "dashboard")?;
+    apply_window_options(session, initial_pane);
+    tmux::respawn_pane(
+        initial_pane,
+        &format!("bash -lc {}", shell_quote_arg(&command)),
+    )?;
+    set_pane_title(session, initial_pane, "dashboard")?;
+
+    let names = layout_ui::window_names(pane_members.iter().map(|m| m.name.as_str()));
+    let mut pane_map = HashMap::new();
+    for (member, window) in pane_members.iter().zip(names.iter()) {
+        let pane = tmux::new_window_pane(session, window, work_dir)?;
+        apply_window_options(session, &pane);
+        set_pane_title(session, &pane, &member.name)?;
+        pane_map.insert(member.name.clone(), pane);
+    }
+    if orchestrator_enabled {
+        let pane = tmux::new_window_pane(session, ORCHESTRATOR_ROLE, work_dir)?;
+        apply_window_options(session, &pane);
+        start_orchestrator_stream(session, &pane, project_root)?;
+    }
+    Ok(pane_map)
+}
+
+fn build_focus_layout(
+    session: &str,
+    initial_pane: &str,
+    pane_members: &[&MemberInstance],
+    project_root: &Path,
+    orchestrator_enabled: bool,
+    version: Option<layout_ui::TmuxVersion>,
+) -> Result<HashMap<String, String>> {
+    tmux::rename_window(initial_pane, "team")?;
+    apply_window_options(session, initial_pane);
+    let mut pane_map = HashMap::new();
+    set_pane_title(session, initial_pane, &pane_members[0].name)?;
+    pane_map.insert(pane_members[0].name.clone(), initial_pane.to_string());
+    let mut last = initial_pane.to_string();
+    for member in &pane_members[1..] {
+        let pane = tmux::split_window_vertical_in_pane(session, &last, 50)?;
+        set_pane_title(session, &pane, &member.name)?;
+        pane_map.insert(member.name.clone(), pane.clone());
+        last = pane;
+        for cmd in layout_ui::focus_layout_commands(initial_pane, version) {
+            run_best_effort(session, &cmd);
+        }
+    }
+    if orchestrator_enabled {
+        let pane = tmux::split_window_vertical_in_pane(session, &last, 50)?;
+        start_orchestrator_stream(session, &pane, project_root)?;
+    }
+    for cmd in layout_ui::focus_layout_commands(initial_pane, version) {
+        run_best_effort(session, &cmd);
+    }
+    Ok(pane_map)
+}
+
+/// The classic tiled layout: zones as columns, members stacked within.
+fn build_tiled_layout(
+    session: &str,
+    initial_pane: &str,
+    pane_members: &[&MemberInstance],
+    layout: &Option<LayoutConfig>,
+    project_root: &Path,
+    orchestrator_enabled: bool,
+    orchestrator_position: OrchestratorPosition,
+) -> Result<HashMap<String, String>> {
+    tmux::rename_window(initial_pane, "team")?;
+    apply_window_options(session, initial_pane);
 
     let mut pane_map: HashMap<String, String> = HashMap::new();
-    let orchestrator_enabled = should_launch_orchestrator_pane(workflow_mode, orchestrator_pane);
-    let initial_pane = tmux::pane_id(session)?;
+    let initial_pane = initial_pane.to_string();
     let agent_root_pane = if orchestrator_enabled {
         launch_orchestrator_pane(session, &initial_pane, project_root, orchestrator_position)?
     } else {
@@ -89,9 +294,9 @@ pub fn build_layout(
 
     // Group members by zone for layout
     let zones = if let Some(layout_config) = layout {
-        build_zones_from_config(layout_config, &pane_members)
+        build_zones_from_config(layout_config, pane_members)
     } else {
-        build_zones_auto(&pane_members)
+        build_zones_auto(pane_members)
     };
 
     // Create remaining zone columns by splitting the previous zone's pane.
@@ -147,8 +352,6 @@ pub fn build_layout(
         }
     }
 
-    info!(session, panes = pane_map.len(), "team layout created");
-
     Ok(pane_map)
 }
 
@@ -187,24 +390,7 @@ fn launch_orchestrator_pane(
         }
     };
 
-    let tail_command = format!(
-        "bash -lc 'touch {path}; exec tail -n 200 -F {path}'",
-        path = shell_single_quote(ansi_log_path.to_string_lossy().as_ref())
-    );
-    tmux::respawn_pane(&orchestrator_target, &tail_command)?;
-    set_pane_title(session, &orchestrator_target, ORCHESTRATOR_ROLE)?;
-    let _ = tmux::run_tmux_with_timeout(
-        [
-            "set-option",
-            "-p",
-            "-t",
-            orchestrator_target.as_str(),
-            "@batty_status",
-            "workflow stream",
-        ],
-        "set-option @batty_status",
-        Some(orchestrator_target.as_str()),
-    );
+    start_orchestrator_stream(session, &orchestrator_target, project_root)?;
     let _ = tmux::run_tmux_with_timeout(
         ["select-pane", "-t", agent_root_pane.as_str()],
         "select-pane",
@@ -213,12 +399,43 @@ fn launch_orchestrator_pane(
     Ok(agent_root_pane)
 }
 
+/// Point a pane at the orchestrator log stream and label it.
+fn start_orchestrator_stream(session: &str, target: &str, project_root: &Path) -> Result<()> {
+    let plain_log_path = super::orchestrator_log_path(project_root);
+    let ansi_log_path = super::orchestrator_ansi_log_path(project_root);
+    ensure_orchestrator_log(&plain_log_path)?;
+    ensure_orchestrator_log(&ansi_log_path)?;
+    let tail_command = format!(
+        "bash -lc 'touch {path}; exec tail -n 200 -F {path}'",
+        path = shell_single_quote(ansi_log_path.to_string_lossy().as_ref())
+    );
+    tmux::respawn_pane(target, &tail_command)?;
+    set_pane_title(session, target, ORCHESTRATOR_ROLE)?;
+    let _ = tmux::run_tmux_with_timeout(
+        [
+            "set-option",
+            "-p",
+            "-t",
+            target,
+            "@batty_status",
+            "workflow stream",
+        ],
+        "set-option @batty_status",
+        Some(target),
+    );
+    Ok(())
+}
+
 fn ensure_orchestrator_log(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     OpenOptions::new().create(true).append(true).open(path)?;
     Ok(())
+}
+
+fn shell_quote_arg(value: &str) -> String {
+    format!("'{}'", shell_single_quote(value))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -551,7 +768,6 @@ mod tests {
     use super::super::config::TeamConfig;
     use super::super::hierarchy;
     use super::*;
-    use std::process::Command;
 
     fn make_members(yaml: &str) -> Vec<MemberInstance> {
         let config: TeamConfig = serde_yaml::from_str(yaml).unwrap();
@@ -610,6 +826,8 @@ roles:
 "#,
         );
         let layout = LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![
                 super::super::config::ZoneDef {
                     members: Vec::new(),
@@ -675,6 +893,8 @@ roles:
         );
 
         let layout = Some(LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![
                 super::super::config::ZoneDef {
                     members: Vec::new(),
@@ -709,7 +929,7 @@ roles:
         .unwrap();
         assert_eq!(pane_map.len(), 9);
 
-        let pane_count_output = Command::new("tmux")
+        let pane_count_output = crate::tmux::tmux_command()
             .args(["list-panes", "-t", session, "-F", "#{pane_id}"])
             .output()
             .unwrap();
@@ -719,7 +939,7 @@ roles:
             .count();
         assert_eq!(pane_count, 9);
 
-        let engineer_geometry_output = Command::new("tmux")
+        let engineer_geometry_output = crate::tmux::tmux_command()
             .args([
                 "list-panes",
                 "-t",
@@ -832,6 +1052,8 @@ roles:
         );
         // Only define one zone — everything else should end up there
         let layout = LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![super::super::config::ZoneDef {
                 members: Vec::new(),
                 name: "architect".to_string(),
@@ -882,6 +1104,8 @@ roles:
 "#,
         );
         let layout = LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![
                 super::super::config::ZoneDef {
                     members: Vec::new(),
@@ -1000,7 +1224,7 @@ roles:
         .unwrap();
         assert_eq!(pane_map.len(), 2);
 
-        let panes_output = Command::new("tmux")
+        let panes_output = crate::tmux::tmux_command()
             .args([
                 "list-panes",
                 "-t",
@@ -1056,7 +1280,7 @@ roles:
         .unwrap();
         assert_eq!(pane_map.len(), 2);
 
-        let pane_count_output = Command::new("tmux")
+        let pane_count_output = crate::tmux::tmux_command()
             .args(["list-panes", "-t", session, "-F", "#{pane_id}"])
             .output()
             .unwrap();
@@ -1111,6 +1335,8 @@ roles:
         );
 
         let layout = Some(LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![super::super::config::ZoneDef {
                 members: Vec::new(),
                 name: "architect".to_string(),
@@ -1131,7 +1357,7 @@ roles:
         .unwrap();
         assert_eq!(pane_map.len(), 2);
 
-        let geometry_output = Command::new("tmux")
+        let geometry_output = crate::tmux::tmux_command()
             .args([
                 "list-panes",
                 "-t",
@@ -1462,6 +1688,8 @@ roles:
         );
         // Zone names contain role-type keywords
         let layout = LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![
                 super::super::config::ZoneDef {
                     members: Vec::new(),
@@ -1516,6 +1744,8 @@ roles:
 "#,
         );
         let layout = LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![super::super::config::ZoneDef {
                 members: Vec::new(),
                 name: "unrelated-zone".to_string(),
@@ -1545,6 +1775,8 @@ roles:
 "#,
         );
         let layout = LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![
                 super::super::config::ZoneDef {
                     members: Vec::new(),
@@ -1573,6 +1805,8 @@ roles:
     #[test]
     fn config_zones_horizontal_columns_stored_from_split() {
         let layout = LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![super::super::config::ZoneDef {
                 members: Vec::new(),
                 name: "engineers".to_string(),
@@ -1654,6 +1888,8 @@ roles:
         );
         // Limit engineer zone to only 3 via split.horizontal
         let layout = LayoutConfig {
+            mode: Default::default(),
+            keys: true,
             zones: vec![
                 super::super::config::ZoneDef {
                     members: Vec::new(),
@@ -1713,5 +1949,101 @@ roles:
         assert_eq!(zones[0].members.len(), 3);
         assert_eq!(zones[0].members[0].role_name, "auditor");
         assert_eq!(zones.len(), 1);
+    }
+
+    fn layout_with_mode(mode: super::super::config::LayoutMode) -> Option<LayoutConfig> {
+        Some(LayoutConfig {
+            mode,
+            keys: true,
+            zones: Vec::new(),
+        })
+    }
+
+    const THREE_MEMBERS: &str = "name: test\nroles:\n- name: architect\n  role_type: architect\n  agent: claude\n- name: engineer\n  role_type: engineer\n  agent: codex\n  instances: 2\n";
+
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn windows_mode_creates_dashboard_and_one_window_per_member() {
+        let _env_lock = crate::team::test_support::env_lock();
+        let session = "batty-uxtest-windows";
+        let _ = crate::tmux::kill_session(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let members = make_members(THREE_MEMBERS);
+        let pane_map = build_layout(
+            session,
+            &members,
+            &layout_with_mode(super::super::config::LayoutMode::Windows),
+            tmp.path(),
+            WorkflowMode::Legacy,
+            false,
+            OrchestratorPosition::Bottom,
+        )
+        .unwrap();
+        assert_eq!(pane_map.len(), 3);
+        let out = crate::tmux::tmux_command()
+            .args([
+                "list-windows",
+                "-t",
+                session,
+                "-F",
+                "#{window_index}:#{window_name}",
+            ])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let table = crate::tmux::tmux_command()
+            .args(["list-keys", "-T", session])
+            .output()
+            .unwrap();
+        let table = String::from_utf8_lossy(&table.stdout).to_string();
+        let root = crate::tmux::tmux_command()
+            .args(["list-keys", "-T", "root"])
+            .output()
+            .unwrap();
+        let root = String::from_utf8_lossy(&root.stdout).to_string();
+        let key_table = crate::tmux::tmux_command()
+            .args(["show-options", "-t", session, "-v", "key-table"])
+            .output()
+            .unwrap();
+        let key_table = String::from_utf8_lossy(&key_table.stdout)
+            .trim()
+            .to_string();
+        let _ = crate::tmux::kill_session(session);
+        // Keys live only in the session's own table.
+        assert_eq!(key_table, session);
+        assert!(table.contains("F2") && table.contains("F12") && table.contains("F1 "));
+        assert!(!root.contains("select-window -t :"));
+        assert!(!root.contains("F12"));
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], "1:dashboard");
+        assert_eq!(lines[1], "2:architect");
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn focus_mode_keeps_all_members_in_one_window() {
+        let _env_lock = crate::team::test_support::env_lock();
+        let session = "batty-uxtest-focus";
+        let _ = crate::tmux::kill_session(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let members = make_members(THREE_MEMBERS);
+        let pane_map = build_layout(
+            session,
+            &members,
+            &layout_with_mode(super::super::config::LayoutMode::Focus),
+            tmp.path(),
+            WorkflowMode::Legacy,
+            false,
+            OrchestratorPosition::Bottom,
+        )
+        .unwrap();
+        let out = crate::tmux::tmux_command()
+            .args(["list-windows", "-t", session])
+            .output()
+            .unwrap();
+        let _ = crate::tmux::kill_session(session);
+        assert_eq!(pane_map.len(), 3);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
     }
 }

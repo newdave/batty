@@ -49,6 +49,10 @@ batty attach
 batty status
 ```
 
+Small teams are tiled in one tmux window; larger teams get a dashboard plus one
+window per member (click the tabs or press F2-F10; F1 shows help). See
+[docs/tmux-layouts.md](docs/tmux-layouts.md) and `layout.mode`.
+
 `cargo install batty-cli` installs the `batty` binary. After `batty init`, edit
 `.batty/team_config/team.yaml`, start the daemon, attach to the live tmux session,
 and use a second shell to send the architect the first directive:

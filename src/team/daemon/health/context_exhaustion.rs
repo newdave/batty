@@ -328,7 +328,6 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::path::Path;
-    use std::process::Command;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -360,7 +359,7 @@ mod tests {
         )
         .unwrap();
         let pane_id = crate::tmux::pane_id(&session).unwrap();
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .args(["set-option", "-p", "-t", &pane_id, "remain-on-exit", "on"])
             .output()
             .unwrap();
@@ -467,7 +466,7 @@ mod tests {
         )
         .unwrap();
         let pane_id = crate::tmux::pane_id(&session).unwrap();
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .args(["set-option", "-p", "-t", &pane_id, "remain-on-exit", "on"])
             .output()
             .unwrap();

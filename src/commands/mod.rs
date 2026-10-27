@@ -28,7 +28,7 @@ pub fn dispatch(root: &Path, command: Command) -> Result<()> {
         Command::Retro { events } => metrics::run_retro(root, events)?,
         Command::Start { attach, quiet } => lifecycle::run_start(root, attach, quiet)?,
         Command::Stop => lifecycle::run_stop(root)?,
-        Command::Attach => lifecycle::run_attach(root)?,
+        Command::Attach { member } => lifecycle::run_attach(root, member.as_deref())?,
         Command::Status {
             json,
             detail,

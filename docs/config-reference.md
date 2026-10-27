@@ -183,6 +183,28 @@ PRs; open a PR from `develop` into `main` on your own schedule. The branch
 must exist locally or as `origin/develop`; when only the remote branch exists,
 `batty start` creates a local tracking branch.
 
+## `layout`
+
+```yaml
+layout:
+  mode: auto        # auto | panes | windows | focus (default: auto)
+  keys: true        # F-key bindings in a batty-only key table (default: true)
+  zones: []         # optional hand-built tiled layout (panes mode)
+```
+
+- `auto`: tiled panes when at most 4 agent panes fit at 50x12 or larger each;
+  otherwise `windows`. If `zones` is set and `mode` is omitted, panes are kept.
+- `panes`: every member tiled in one window.
+- `windows`: window 1 is a live status dashboard, then one window per member
+  in hierarchy order, with a clickable tab bar and F-key jumps.
+- `focus`: one big pane plus a narrow column; F2-F10 swap a member in, F11 cycles.
+
+- `keys`: when `true` (default) Batty installs F1 (help), F2-F10 (jump), F12
+  (zoom) and F11 (focus) in a key table used only by its own session; the
+  prefix and all other keys are unaffected. `false` installs none.
+
+See [tmux-layouts.md](tmux-layouts.md) for the comparison and key reference.
+
 ## `board`
 
 `board` controls the daemon's view of runnable work.

@@ -304,7 +304,7 @@ pub fn stop_team(project_root: &Path) -> Result<()> {
 ///
 /// First tries the team config in the project root. If not found, looks for
 /// any running `batty-*` tmux session and attaches to it.
-pub fn attach_team(project_root: &Path) -> Result<()> {
+pub fn attach_team(project_root: &Path, member: Option<&str>) -> Result<()> {
     let config_path = team_config_path(project_root);
 
     let session = if config_path.exists() {
@@ -328,6 +328,10 @@ pub fn attach_team(project_root: &Path) -> Result<()> {
 
     if !tmux::session_exists(&session) {
         bail!("no running session '{session}'; run `batty start` first");
+    }
+
+    if let Some(member) = member {
+        tmux::select_member(&session, member)?;
     }
 
     tmux::attach(&session)
@@ -1483,13 +1487,13 @@ roles:
         crate::tmux::create_session(session, "sleep", &["20".to_string()], "/tmp").unwrap();
         let pane_id = crate::tmux::pane_id(session).unwrap();
 
-        let role_output = std::process::Command::new("tmux")
+        let role_output = crate::tmux::tmux_command()
             .args(["set-option", "-p", "-t", &pane_id, "@batty_role", "eng-1"])
             .output()
             .unwrap();
         assert!(role_output.status.success());
 
-        let status_output = std::process::Command::new("tmux")
+        let status_output = crate::tmux::tmux_command()
             .args([
                 "set-option",
                 "-p",

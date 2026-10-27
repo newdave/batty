@@ -59,6 +59,7 @@ pub mod inbox;
 pub mod inbox_tiered;
 pub mod integration_health;
 pub mod layout;
+pub mod layout_ui;
 pub mod learnings;
 pub use daemon_mgmt::*;
 mod session;

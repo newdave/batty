@@ -919,7 +919,44 @@ impl Default for AutomationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
+    /// How members are arranged in tmux. Omitted means `auto`.
+    #[serde(default)]
+    pub mode: LayoutMode,
+    /// Install batty's F-key bindings (in a batty-only key table). Default true.
+    #[serde(default = "default_layout_keys")]
+    pub keys: bool,
+    /// Custom tiled-pane zones (used by `panes` mode; honoured by `auto`).
+    #[serde(default)]
     pub zones: Vec<ZoneDef>,
+}
+
+/// tmux arrangement of team members.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    /// Tiled panes when they stay usable, otherwise one window per member.
+    #[default]
+    Auto,
+    /// Always tile every member into one window.
+    Panes,
+    /// Dashboard window plus one window per member.
+    Windows,
+    /// One big pane plus a narrow list; keys swap focus.
+    Focus,
+}
+
+fn default_layout_keys() -> bool {
+    true
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            mode: LayoutMode::Auto,
+            keys: true,
+            zones: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
