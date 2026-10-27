@@ -18,6 +18,8 @@ nav:
   - Home: index.md
   - Demo: demo.md
   - Getting Started: getting-started.md
+  - Migrating to 0.12: migrating-to-0.12.md
+  - tmux Layouts: tmux-layouts.md
   - Workflow Migration: workflow-migration.md
   - Team Config Reference: config-reference.md
   - Reference:

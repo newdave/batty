@@ -2,6 +2,117 @@
 
 All notable changes to Batty are documented here.
 
+## 0.12.0 — Unreleased (2026-10-27)
+
+See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
+
+### Breaking
+
+- The library crate no longer exports `batty_cli::events`, `batty_cli::log` or
+  `batty_cli::config`; `config::Policy` moved to `task::Policy`. The version is
+  bumped to 0.12.0 for this.
+- `batty config` exits non-zero when no team config exists (it printed a message
+  and exited 0). `--json` adds `schema_version: 2` and the full resolved `config`
+  object next to the upstream top-level keys.
+- tmux layouts default to `layout.mode: auto`: teams with more than four agent
+  panes now get one window per member plus a dashboard window instead of tiled
+  panes. Configs with `layout.zones` stay tiled. The first window is index 1.
+- Status moves made by the daemon go through the task state machine, so illegal
+  moves are refused and reported instead of applied.
+- Every git command runs with a timeout (120s, or 600s for slow commands such as
+  fetch, push, commit, merge, rebase, checkout, reset, stash, add, status, clean,
+  diff and merge-tree). Override with `BATTY_GIT_TIMEOUT_SECS` and
+  `BATTY_GIT_LONG_TIMEOUT_SECS`.
+
+### Added
+
+- `batty status` leads with a summary and a plain-language "Needs attention"
+  list with suggested commands, and fits the members table to the terminal.
+  New flags: `--wide` (all columns), `--watch [SECS]` (live refresh) and
+  `--no-color`. Colour is used only on a TTY with `NO_COLOR` unset. `--json` is
+  unchanged.
+- `layout.mode` (`auto`, `panes`, `windows`, `focus`) and `layout.keys`. Batty
+  sessions get clickable window tabs, a key-hint line, F1 help, F2–F10 to jump to
+  a member, F11 to cycle focus and F12 to zoom, in a per-session key table that
+  leaves other tmux sessions alone. See docs/tmux-layouts.md.
+- `batty attach [MEMBER]` jumps to a member's window or pane.
+- `telemetry.retention_days` (default 90, 0 disables) prunes old telemetry rows,
+  starting on the first tick after startup.
+- `workflow_policy.verification.timeout_secs` (default 3600, 0 disables) kills
+  and fails background verification and test jobs that run too long.
+- `loop_step_error_summary` events every 10 minutes while a failing step's
+  errors are throttled, and a Grafana panel that counts both.
+- `integration_unhealthy` / `integration_recovered` events after five failed
+  chat polls, and `batty doctor` checks for the Telegram and Discord bots.
+- `batty validate` checks role channel config: unknown channel types and empty
+  Telegram targets are errors, missing credentials are warnings, and it reports
+  whether Telegram uses the bot API or the CLI provider. It also warns about
+  config keys that nothing reads.
+- `command_dropped` events when a legacy queued command gives up.
+
+### Changed
+
+- Completion verification, the main smoke check, chat merges and post-merge
+  verification run as background jobs instead of blocking the daemon loop.
+  Shutdown and hot reload stop them and re-run interrupted verifications.
+- Direct and chat merges go through the merge queue. The merge lock is held
+  through post-merge verification, including after a restart, and is deleted on
+  release so older binaries can take it. `flock` falls back to an exclusive file
+  where unsupported.
+- Post-merge verification and revert use the configured trunk branch
+  (`refs/heads/<trunk>`), verifying in `.batty/verify-worktree` when the root has
+  another branch checked out. A failed merge is reverted only if trunk still
+  points at it, never by discarding uncommitted root changes.
+- The board is parsed once per daemon tick and shared by every step.
+- Telegram and Discord reply once after a restart when commands sent while Batty
+  was offline were ignored.
+- `batty init --agent X` keeps template comments and valid `model`/`effort`
+  pins, and reports the pins it drops.
+- Bundled templates set no `auto_merge` block again, matching upstream; the
+  interactive `batty init` prompt defaults to "no".
+- Seven config keys that nothing reads (`commit_before_reset`,
+  `narration_threshold`, `narration_nudge_max`, `replenishment_threshold`,
+  `auto_respawn_on_crash`, `capability_overrides`, role `owns`) still load but are
+  undocumented and flagged by `batty validate`.
+- The openclaw provider is called with `--channel telegram --target`, falling
+  back once to `--to` for older releases.
+
+### Fixed
+
+- The daemon no longer panics at startup within two hours of a reboot on macOS.
+- A stalled agent no longer freezes the daemon loop for 30–60s, and long test
+  commands no longer stall message delivery, health checks or hot reload.
+- Telegram and Discord HTTP calls time out; failed Telegram sends back off
+  instead of retrying every poll, a partly sent message is not resent, and bot
+  tokens are redacted from errors.
+- Merge requests survive errors and panics, with retry backoff and escalation.
+- Auto-merge checks, scope reverts and archive steps fail closed when git fails.
+  Dirty work is snapshotted before any forced reset, rebase auto-resolve can no
+  longer stage conflict markers, and multi-repo merges are checked up front and
+  rolled back on failure.
+- Worktrees are no longer left on another member's branch after reassignment,
+  and recovery resets work in sub-repos whose default branch differs from trunk.
+- Shim messages are no longer corrupted by partial reads or writes, agent
+  runtimes kill and reap their whole process group, and every in-flight message
+  is replayed once after a shim dies.
+- Re-adding a member while its old shim is being removed no longer kills the new
+  one, and removing a member no longer blocks the daemon.
+- Board, activity-log, state and registry writes are atomic and locked.
+- Task frontmatter closers such as `--- # note` parse again, and rejected files
+  report a line number.
+- A task whose merge landed while still in progress moves to done via review.
+- Multi-repo completions of claimed tasks no longer crash in the scope check.
+- Repeating warnings are logged once or throttled instead of every poll.
+- Several timing-sensitive tests are deterministic, live-tmux tests run only
+  with the `integration` feature, and tests never touch the default tmux server.
+
+### Removed
+
+- Unreferenced modules and code: `src/events.rs`, `src/log/`, `src/agent/mock.rs`,
+  `ProjectConfig`, `orphan_breadcrumbs.rs`, and dead adapter, tmux and board
+  helpers (about 4,900 lines).
+- The generated `docs/reference/config.md`; use docs/config-reference.md.
+
 ## Unreleased — 2026-10-25
 
 ### Added

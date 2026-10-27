@@ -23,6 +23,13 @@ If neither is set, the `-v` / `-vv` / `-vvv` CLI flags control verbosity.
 | -------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | ---------------------- |
 | `BATTY_MEMBER` | Override the detected sender for `batty send`. Set automatically by the shim when a subprocess needs a stable identity. | detected from tmux pane `@batty_role` | `BATTY_MEMBER=eng-1-2` |
 
+## Git
+
+| Name                          | Purpose                                                                                                                                                             | Default | Example                              |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | ------------------------------------ |
+| `BATTY_GIT_TIMEOUT_SECS`      | Timeout for quick git commands batty runs. A timed-out command gets SIGTERM, then SIGKILL after 5s.                                                                 | `120`   | `BATTY_GIT_TIMEOUT_SECS=300`         |
+| `BATTY_GIT_LONG_TIMEOUT_SECS` | Timeout for slow git commands (fetch, push, commit, merge, rebase, checkout, worktree, gc, reset, stash, add, status, clean, diff, merge-tree).                      | `600`   | `BATTY_GIT_LONG_TIMEOUT_SECS=1800`   |
+
 ## MCP isolation
 
 Batty sets these variables for each launched member. MCP server configs should
