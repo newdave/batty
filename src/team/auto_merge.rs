@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -268,10 +267,10 @@ pub fn analyze_diff(repo: &Path, base: &str, branch: &str) -> Result<DiffSummary
 /// A failed `git diff` prints nothing on stdout; treating that as "no
 /// changes" would make a broken repo look like a tiny, safe diff.
 fn git_stdout_checked(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = crate::git::cmd(repo)
         .args(args)
-        .current_dir(repo)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to run git {}", args.join(" ")))?;
     if !output.status.success() {
         anyhow::bail!(
@@ -315,10 +314,10 @@ pub(crate) fn branch_has_conflicts(repo: &Path, base: &str, branch: &str) -> boo
 /// routed to manual review instead of being auto-merged.
 fn check_has_conflicts(repo: &Path, base: &str, branch: &str) -> bool {
     // Modern git (>= 2.38): exit 0 = clean, 1 = conflicts, anything else = error.
-    let modern = Command::new("git")
+    let modern = crate::git::cmd(repo)
         .args(["merge-tree", "--write-tree", "--name-only", base, branch])
-        .current_dir(repo)
-        .output();
+        .allow_fail()
+        .run();
     match modern {
         Ok(output) => match output.status.code() {
             Some(0) => return false,
@@ -330,10 +329,10 @@ fn check_has_conflicts(repo: &Path, base: &str, branch: &str) -> bool {
         Err(_) => return true,
     }
 
-    let merge_base = Command::new("git")
+    let merge_base = crate::git::cmd(repo)
         .args(["merge-base", base, branch])
-        .current_dir(repo)
-        .output();
+        .allow_fail()
+        .run();
     let merge_base_sha = match merge_base {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -341,10 +340,10 @@ fn check_has_conflicts(repo: &Path, base: &str, branch: &str) -> bool {
         _ => return true, // Can't find merge base — treat as conflicting
     };
 
-    let result = Command::new("git")
+    let result = crate::git::cmd(repo)
         .args(["merge-tree", &merge_base_sha, base, branch])
-        .current_dir(repo)
-        .output();
+        .allow_fail()
+        .run();
     match result {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);

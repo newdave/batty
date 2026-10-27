@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -8,13 +9,9 @@ use super::config::RoleType;
 use super::hierarchy;
 use super::workspace::{engineer_workspace_dir, workspace_repo_targets};
 
-fn git_program() -> &'static str {
-    for program in ["git", "/usr/bin/git", "/opt/homebrew/bin/git"] {
-        if Command::new(program).arg("--version").output().is_ok() {
-            return program;
-        }
-    }
-    "git"
+#[cfg(test)]
+fn git_program() -> &'static Path {
+    crate::git::program()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,10 +239,10 @@ fn status_notes(status: &WorktreeHealth) -> String {
 }
 
 fn registered_worktree_paths(project_root: &Path) -> Result<HashSet<PathBuf>> {
-    let output = Command::new(git_program())
+    let output = crate::git::cmd(project_root)
         .args(["worktree", "list", "--porcelain"])
-        .current_dir(project_root)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed to query git worktree list in {}",
@@ -285,17 +282,7 @@ fn git_output(path: &Path, args: &[&str]) -> Option<String> {
     if !path.exists() {
         return None;
     }
-    let output = Command::new(git_program())
-        .args(args)
-        .current_dir(path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let value = crate::git::cmd(path).args(args).stdout().ok()?;
     if value.is_empty() { None } else { Some(value) }
 }
 
@@ -352,21 +339,7 @@ fn find_lock_files(path: &Path) -> Vec<String> {
 }
 
 fn behind_trunk_count(project_root: &Path, path: &Path, trunk_branch: &str) -> Option<u64> {
-    let range = format!("HEAD...{trunk_branch}");
-    let output = Command::new(git_program())
-        .args(["rev-list", "--left-right", "--count", &range])
-        .current_dir(path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parts = stdout.split_whitespace();
-    let _ahead = parts.next()?;
-    let behind = parts.next()?.parse::<u64>().ok()?;
+    let behind = u64::from(crate::worktree::ops::ahead_count(path, "HEAD", trunk_branch).ok()?);
 
     if path.starts_with(project_root) {
         Some(behind)

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -556,7 +557,7 @@ fn task_has_active_claim(task: &task::Task, member_name: &str) -> bool {
 fn managed_task_branch(member_name: &str, task: &task::Task) -> String {
     task.branch
         .clone()
-        .unwrap_or_else(|| format!("{member_name}/{}", task.id))
+        .unwrap_or_else(|| crate::worktree::ops::engineer_task_branch_name(member_name, task.id))
 }
 
 fn format_branch_mismatch_signal(
@@ -2021,11 +2022,7 @@ fn task_branch_mismatch(
 }
 
 fn git_stdout_raw<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let output = crate::git::cmd(cwd).args(args).allow_fail().run().ok()?;
     if !output.status.success() {
         return None;
     }

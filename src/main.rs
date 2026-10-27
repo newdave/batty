@@ -24,10 +24,10 @@ fn project_root() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Use git to find the main repo root (handles worktrees)
-    if let Ok(output) = std::process::Command::new("git")
+    if let Ok(output) = batty_cli::git::cmd(&cwd)
         .args(["rev-parse", "--git-common-dir"])
-        .current_dir(&cwd)
-        .output()
+        .allow_fail()
+        .run()
     {
         if output.status.success() {
             let git_common = String::from_utf8_lossy(&output.stdout).trim().to_string();

@@ -132,7 +132,10 @@ fn active_claim_conflict_failure(worktree_dir: &Path) -> Result<Option<Verificat
                     task.branch
                         .as_deref()
                         .map(|task_branch| task_branch == branch)
-                        .unwrap_or_else(|| format!("{engineer}/{}", task.id) == branch)
+                        .unwrap_or_else(|| {
+                            crate::worktree::ops::engineer_task_branch_name(&engineer, task.id)
+                                == branch
+                        })
                 })
                 .count()
         })
@@ -259,27 +262,27 @@ fn recovery_branch_for_task(project_root: &Path, engineer: &str, task: &Task) ->
         return branch;
     }
 
-    declared_branch.unwrap_or_else(|| format!("{engineer}/{}", task.id))
+    declared_branch
+        .unwrap_or_else(|| crate::worktree::ops::engineer_task_branch_name(engineer, task.id))
 }
 
 fn git_ref_exists(project_root: &Path, branch: &str) -> bool {
-    std::process::Command::new("git")
+    crate::git::cmd(project_root)
         .args([
             "show-ref",
             "--verify",
             "--quiet",
             &format!("refs/heads/{branch}"),
         ])
-        .current_dir(project_root)
-        .status()
-        .is_ok_and(|status| status.success())
+        .succeeds()
+        .unwrap_or(false)
 }
 
 fn task_branch_candidates(project_root: &Path, task_id: u32) -> Vec<String> {
-    let Ok(output) = std::process::Command::new("git")
+    let Ok(output) = crate::git::cmd(project_root)
         .args(["for-each-ref", "refs/heads", "--format=%(refname:short)"])
-        .current_dir(project_root)
-        .output()
+        .allow_fail()
+        .run()
     else {
         return Vec::new();
     };
@@ -315,14 +318,14 @@ fn task_branch_candidates(project_root: &Path, task_id: u32) -> Vec<String> {
 }
 
 fn preserved_branch_candidates(project_root: &Path, engineer: &str, task_id: u32) -> Vec<String> {
-    let Ok(output) = std::process::Command::new("git")
+    let Ok(output) = crate::git::cmd(project_root)
         .args([
             "for-each-ref",
             "refs/heads/preserved",
             "--format=%(refname:short)",
         ])
-        .current_dir(project_root)
-        .output()
+        .allow_fail()
+        .run()
     else {
         return Vec::new();
     };
@@ -374,10 +377,10 @@ pub(crate) fn changed_files_from_trunk(
     trunk_branch: &str,
 ) -> Result<Vec<String>> {
     let range = format!("{trunk_branch}..HEAD");
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["diff", "--name-only", &range])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to run git diff in {}", worktree_dir.display()))?;
 
     if !output.status.success() {
@@ -398,10 +401,10 @@ pub(crate) fn changed_files_from_trunk(
 }
 
 fn current_branch_name(worktree_dir: &Path) -> Result<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["branch", "--show-current"])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to read git branch in {}", worktree_dir.display()))?;
 
     if !output.status.success() {
@@ -423,10 +426,10 @@ fn commit_subjects_since_main(worktree_dir: &Path) -> Result<Vec<String>> {
 
 fn commit_subjects_since_trunk(worktree_dir: &Path, trunk_branch: &str) -> Result<Vec<String>> {
     let range = format!("{trunk_branch}..HEAD");
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["log", "--format=%s", &range])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed to read commit subjects in {}",
@@ -711,7 +714,9 @@ fn task_matches_branch(engineer: &str, task: &Task, branch: &str) -> bool {
     task.branch
         .as_deref()
         .map(|task_branch| task_branch == branch)
-        .unwrap_or_else(|| format!("{engineer}/{}", task.id) == branch)
+        .unwrap_or_else(|| {
+            crate::worktree::ops::engineer_task_branch_name(engineer, task.id) == branch
+        })
 }
 
 fn resolve_worktree_path(project_root: &Path, worktree_path: &str) -> PathBuf {

@@ -7,6 +7,7 @@ pub mod config;
 pub mod console_pane;
 pub mod env_file;
 pub mod events;
+pub mod git;
 pub mod log;
 pub mod paths;
 pub mod project_registry;

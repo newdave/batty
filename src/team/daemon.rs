@@ -18,7 +18,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(test)]
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
@@ -50,7 +49,7 @@ use super::task_loop::next_unclaimed_task;
 use super::task_loop::setup_engineer_worktree;
 use super::task_loop::{
     branch_is_merged_into, current_worktree_branch, engineer_base_branch_name,
-    preserve_worktree_with_commit_for, setup_engineer_worktree_from_trunk,
+    setup_engineer_worktree_from_trunk,
 };
 use super::verification::VerificationState;
 use super::watcher::{SessionWatcher, WatcherState};
@@ -550,7 +549,7 @@ impl TeamDaemon {
             return false;
         }
 
-        match preserve_worktree_with_commit_for(
+        match crate::worktree::ops::preserve_with_commit(
             &worktree_dir,
             commit_message,
             Duration::from_secs(policy.graceful_shutdown_timeout_secs),
@@ -963,7 +962,7 @@ impl TeamDaemon {
                 .workflow_policy
                 .graceful_shutdown_timeout_secs,
         );
-        match preserve_worktree_with_commit_for(
+        match crate::worktree::ops::preserve_with_commit(
             worktree_dir,
             "wip: auto-save before restart [batty]",
             timeout,
@@ -1183,10 +1182,10 @@ impl TeamDaemon {
         } else {
             vec!["revert", "--no-edit", "HEAD"]
         };
-        let output = Command::new("git")
+        let output = crate::git::cmd(self.project_root())
             .args(&revert_args)
-            .current_dir(self.project_root())
-            .output()
+            .allow_fail()
+            .run()
             .with_context(|| {
                 format!("failed to launch auto-revert for broken main commit {broken_commit}")
             })?;

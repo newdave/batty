@@ -41,28 +41,29 @@ pub fn record(
     let mut commit_sha = String::new();
     if let Some(commit) = commit {
         let config = TeamConfig::load(&team_config_path(root))?;
-        let output = std::process::Command::new("git")
+        let output = crate::git::cmd(root)
             .args([
                 "rev-parse",
                 "--verify",
                 "--end-of-options",
                 &format!("{commit}^{{commit}}"),
             ])
-            .current_dir(root)
-            .output()?;
+            .allow_fail()
+            .run()?;
         if !output.status.success() {
             bail!("commit evidence is not a valid commit");
         }
         commit_sha = String::from_utf8(output.stdout)?.trim().into();
-        if !std::process::Command::new("git")
+        if !crate::git::cmd(root)
             .args([
                 "merge-base",
                 "--is-ancestor",
                 &commit_sha,
                 config.trunk_branch(),
             ])
-            .current_dir(root)
-            .status()?
+            .allow_fail()
+            .run()
+            .map(|output| output.status)?
             .success()
         {
             bail!("commit evidence is not integrated into the configured trunk");

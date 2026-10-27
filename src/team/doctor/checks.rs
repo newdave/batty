@@ -691,7 +691,9 @@ pub(super) fn active_task_targets(
             .map(str::trim)
             .filter(|name| is_engineer_name(name))
         {
-            branches.insert(format!("{claimed_by}/{}", task.id));
+            branches.insert(crate::worktree::ops::engineer_task_branch_name(
+                claimed_by, task.id,
+            ));
         }
 
         if let Some(worktree_path) = task

@@ -406,10 +406,10 @@ fn latest_commit_timestamp(
     {
         return None;
     }
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(work_dir)
         .args(["log", "-1", "--format=%cI"])
-        .current_dir(work_dir)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -430,7 +430,9 @@ fn task_has_claim_progress(
     if latest_commit_timestamp(work_dir, trunk_branch).is_some_and(|ts| ts > last_progress_at) {
         return true;
     }
-    if crate::team::git_cmd::has_user_changes(work_dir).unwrap_or(false) {
+    if crate::worktree::ops::is_dirty(work_dir, crate::worktree::ops::ExcludePolicy::BattyRuntime)
+        .unwrap_or(false)
+    {
         return true;
     }
     false

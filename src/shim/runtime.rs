@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -99,12 +98,10 @@ pub(crate) fn preserve_handoff(
 }
 
 fn git_capture(worktree: &Path, args: &[&str]) -> Result<String> {
-    let output = ProcessCommand::new("git")
+    let output = crate::git::cmd(worktree)
         .args(args)
-        .current_dir(worktree)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed to run `git {}` in {}",
@@ -384,8 +381,12 @@ pub(crate) fn preserve_work_before_kill(worktree_path: &Path) -> Result<bool> {
         timeout,
         auto_commit_on_restart_enabled(),
         move |path| {
-            crate::team::git_cmd::auto_commit_if_dirty(&path, AUTO_COMMIT_MESSAGE, timeout)
-                .map_err(anyhow::Error::from)
+            crate::worktree::ops::preserve_with_commit(
+                &path,
+                AUTO_COMMIT_MESSAGE,
+                timeout,
+                "shim/restart-preserve",
+            )
         },
     )
 }
@@ -468,83 +469,12 @@ impl ShimArgs {
         if !self.auto_commit_on_restart {
             return Ok(false);
         }
-
-        let status = ProcessCommand::new("git")
-            .arg("-C")
-            .arg(worktree_path)
-            .args(["status", "--porcelain"])
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to inspect git status in {}",
-                    worktree_path.display()
-                )
-            })?;
-        if !status.status.success() {
-            anyhow::bail!("git status failed in {}", worktree_path.display());
-        }
-
-        let dirty = String::from_utf8_lossy(&status.stdout)
-            .lines()
-            .any(|line| !line.starts_with("?? .batty/"));
-        if !dirty {
-            return Ok(false);
-        }
-
-        let timeout = Duration::from_secs(self.graceful_shutdown_timeout_secs);
-        run_git_preserve_with_timeout(worktree_path, &["add", "-A"], timeout)?;
-        run_git_preserve_with_timeout(
+        crate::worktree::ops::preserve_with_commit(
             worktree_path,
-            &["commit", "-m", "wip: auto-save before restart [batty]"],
-            timeout,
-        )?;
-        Ok(true)
-    }
-}
-
-fn run_git_preserve_with_timeout(
-    worktree_path: &Path,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<()> {
-    let mut child = ProcessCommand::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .args(args)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to launch `git {}` in {}",
-                args.join(" "),
-                worktree_path.display()
-            )
-        })?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                return Ok(());
-            }
-            anyhow::bail!(
-                "`git {}` failed in {} with status {}",
-                args.join(" "),
-                worktree_path.display(),
-                status
-            );
-        }
-
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!(
-                "`git {}` timed out after {}s in {}",
-                args.join(" "),
-                timeout.as_secs(),
-                worktree_path.display()
-            );
-        }
-
-        thread::sleep(Duration::from_millis(50));
+            AUTO_COMMIT_MESSAGE,
+            Duration::from_secs(self.graceful_shutdown_timeout_secs),
+            "shim/restart-preserve",
+        )
     }
 }
 

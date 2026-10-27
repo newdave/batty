@@ -374,21 +374,7 @@ fn worktree_commits_ahead_of_trunk(
     worktree_dir: &std::path::Path,
     trunk_branch: &str,
 ) -> Result<u32> {
-    let range = format!("{trunk_branch}..HEAD");
-    let output = std::process::Command::new("git")
-        .args(["rev-list", "--count", &range])
-        .current_dir(worktree_dir)
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to count commits ahead of {trunk_branch} in {}: {}",
-            worktree_dir.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()?)
+    crate::worktree::ops::ahead_count(worktree_dir, trunk_branch, "HEAD")
 }
 
 pub(super) fn owned_task_intervention_signature(tasks: &[&crate::task::Task]) -> String {

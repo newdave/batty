@@ -554,7 +554,13 @@ impl TeamDaemon {
         match kanban_result {
             Ok(output) if output.status.success() => true,
             Ok(output) => {
-                let detail = describe_command_failure("kanban-md", args, &output);
+                let detail = describe_command_failure(
+                    "kanban-md",
+                    args,
+                    output.status,
+                    &output.stdout,
+                    &output.stderr,
+                );
                 self.report_nonfatal_kanban_failure(action, &detail, recipients);
                 false
             }
@@ -843,7 +849,7 @@ pub(super) fn engineer_task_branch_name(
             let unique = Uuid::new_v4().simple().to_string();
             format!("task-{slug}-{}", &unique[..8])
         });
-    format!("{engineer}/{suffix}")
+    crate::worktree::ops::engineer_task_branch_name(engineer, suffix)
 }
 
 pub(crate) fn parse_assignment_task_id(task: &str) -> Option<u32> {

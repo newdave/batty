@@ -1,7 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -737,11 +736,10 @@ fn load_changelog_entry(project_root: &Path, version: &str) -> Result<(String, S
 }
 
 fn git_stdout(project_root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let output = crate::git::cmd(project_root)
         .args(args)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to run git {}", args.join(" ")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -764,11 +762,10 @@ fn git_ok(project_root: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn git_ref_for_tag(project_root: &Path, tag: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let output = crate::git::cmd(project_root)
         .args(["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")])
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to inspect tag `{tag}`"))?;
     match output.status.code() {
         Some(0) => Ok(Some(
@@ -783,11 +780,10 @@ fn git_ref_for_tag(project_root: &Path, tag: &str) -> Result<Option<String>> {
 }
 
 fn latest_git_tag(project_root: &Path) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let output = crate::git::cmd(project_root)
         .args(["describe", "--tags", "--abbrev=0"])
-        .output()
+        .allow_fail()
+        .run()
         .context("failed to resolve the latest git tag")?;
     if output.status.success() {
         return Ok(Some(

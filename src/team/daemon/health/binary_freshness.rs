@@ -23,7 +23,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
@@ -323,10 +322,10 @@ fn binary_mtime_unix(binary_path: &Path) -> Result<Option<i64>> {
 }
 
 fn head_commit_ts(repo_root: &Path) -> Result<Option<i64>> {
-    let output = Command::new("git")
+    let output = crate::git::cmd(repo_root)
         .args(["log", "-1", "--format=%ct", "HEAD"])
-        .current_dir(repo_root)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to invoke git in {}", repo_root.display()))?;
     if !output.status.success() {
         // Not a git worktree, or git unavailable — skip the check.
@@ -351,7 +350,7 @@ fn commits_touching_src_since(repo_root: &Path, since_ts: i64) -> Result<(u32, S
     // --format=%ct\t%h\t%s — tab-separated commit time, short hash,
     // subject. --no-merges keeps the count focused on source changes
     // rather than noise from merge commits.
-    let output = Command::new("git")
+    let output = crate::git::cmd(repo_root)
         .args([
             "log",
             "HEAD",
@@ -360,8 +359,8 @@ fn commits_touching_src_since(repo_root: &Path, since_ts: i64) -> Result<(u32, S
             "--",
             "src",
         ])
-        .current_dir(repo_root)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to invoke git log in {}", repo_root.display()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

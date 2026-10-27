@@ -1270,7 +1270,9 @@ impl TeamDaemon {
         let expected_branch = self
             .active_task(member_name)?
             .and_then(|task| task.branch)
-            .unwrap_or_else(|| format!("{member_name}/{task_id}"));
+            .unwrap_or_else(|| {
+                crate::worktree::ops::engineer_task_branch_name(member_name, task_id)
+            });
         let base_branch = crate::team::task_loop::engineer_base_branch_name(member_name);
         let branch_exists =
             crate::team::git_cmd::show_ref_exists(self.project_root(), &expected_branch)

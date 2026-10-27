@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -98,11 +97,7 @@ pub(super) fn canonical_agent_name(agent_name: &str) -> String {
 }
 
 pub(super) fn git_output(path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(path)
-        .output()
-        .ok()?;
+    let output = crate::git::cmd(path).args(args).allow_fail().run().ok()?;
     if !output.status.success() {
         return None;
     }

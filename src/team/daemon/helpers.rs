@@ -21,16 +21,18 @@ pub(super) struct MemberWorktreeContext {
 pub(super) fn describe_command_failure(
     command: &str,
     args: &[&str],
-    output: &std::process::Output,
+    status: std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
 ) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
     let details = if !stderr.is_empty() {
         stderr
     } else if !stdout.is_empty() {
         stdout
     } else {
-        format!("process exited with status {}", output.status)
+        format!("process exited with status {status}")
     };
 
     format!("`{command} {}` failed: {details}", args.join(" "))
@@ -149,10 +151,10 @@ pub(super) fn ensure_board_initialized(project_root: &Path) -> Result<bool> {
 }
 
 pub(super) fn ensure_git_ready(project_root: &Path) -> Result<()> {
-    let repo_check = Command::new("git")
+    let repo_check = crate::git::cmd(project_root)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(project_root)
-        .output()
+        .allow_fail()
+        .run()
         .context(
             "daemon startup pre-flight failed while verifying git repository: could not execute `git rev-parse --is-inside-work-tree`",
         )?;
@@ -183,10 +185,10 @@ pub(super) fn ensure_git_ready(project_root: &Path) -> Result<()> {
     }
 
     for key in ["user.name", "user.email"] {
-        let output = Command::new("git")
-            .args(["config", "--get", key])
-            .current_dir(project_root)
-            .output()
+        let output = crate::git::cmd(project_root)
+        .args(["config", "--get", key])
+        .allow_fail()
+        .run()
             .with_context(|| {
                 format!(
                     "daemon startup pre-flight failed while verifying git config: could not execute `git config --get {key}`"
@@ -217,10 +219,10 @@ pub(super) fn ensure_worktree_operations(project_root: &Path) -> Result<()> {
     ));
     let worktree_path = worktree_dir.to_string_lossy().to_string();
 
-    let add_output = Command::new("git")
+    let add_output = crate::git::cmd(project_root)
         .args(["worktree", "add", "--detach", &worktree_path, "HEAD"])
-        .current_dir(project_root)
-        .output()
+        .allow_fail()
+        .run()
         .context(
             "daemon startup pre-flight failed while verifying git worktree support: could not execute `git worktree add`",
         )?;
@@ -228,15 +230,17 @@ pub(super) fn ensure_worktree_operations(project_root: &Path) -> Result<()> {
         let detail = describe_command_failure(
             "git",
             &["worktree", "add", "--detach", &worktree_path, "HEAD"],
-            &add_output,
+            add_output.status,
+            &add_output.stdout,
+            &add_output.stderr,
         );
         bail!("daemon startup pre-flight failed: {detail}");
     }
 
-    let remove_output = Command::new("git")
+    let remove_output = crate::git::cmd(project_root)
         .args(["worktree", "remove", "--force", &worktree_path])
-        .current_dir(project_root)
-        .output()
+        .allow_fail()
+        .run()
         .context(
             "daemon startup pre-flight failed while verifying git worktree cleanup: could not execute `git worktree remove`",
         )?;
@@ -244,7 +248,9 @@ pub(super) fn ensure_worktree_operations(project_root: &Path) -> Result<()> {
         let detail = describe_command_failure(
             "git",
             &["worktree", "remove", "--force", &worktree_path],
-            &remove_output,
+            remove_output.status,
+            &remove_output.stdout,
+            &remove_output.stderr,
         );
         let _ = std::fs::remove_dir_all(&worktree_dir);
         bail!("daemon startup pre-flight failed: {detail}");

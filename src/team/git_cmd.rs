@@ -1,9 +1,8 @@
-#![allow(dead_code)]
+//! Typed git helpers whose failures are classified as transient or
+//! permanent ([`GitError`]) so callers can retry lock contention. Every
+//! command runs through the shared runner in [`crate::git`].
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::mpsc;
-use std::time::Duration;
 
 pub use super::errors::GitError;
 
@@ -37,49 +36,35 @@ fn classify_error(stderr: &str) -> GitError {
     }
 }
 
-fn format_git_command(repo_dir: &Path, args: &[&str]) -> String {
-    let mut parts = vec![
-        "git".to_string(),
-        "-C".to_string(),
-        repo_dir.display().to_string(),
-    ];
-    parts.extend(args.iter().map(|arg| arg.to_string()));
-    parts.join(" ")
-}
-
-fn git_program() -> &'static str {
-    for program in ["git", "/usr/bin/git", "/opt/homebrew/bin/git"] {
-        if std::process::Command::new(program)
-            .arg("--version")
-            .output()
-            .is_ok()
-        {
-            return program;
+impl From<crate::git::GitError> for GitError {
+    fn from(error: crate::git::GitError) -> Self {
+        match error {
+            crate::git::GitError::Failed { stderr, .. } => classify_error(&stderr),
+            crate::git::GitError::Spawn { command, source }
+            | crate::git::GitError::Wait { command, source } => GitError::Exec { command, source },
+            crate::git::GitError::Timeout {
+                command, timeout, ..
+            } => GitError::Exec {
+                command,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("git timed out after {}s", timeout.as_secs()),
+                ),
+            },
         }
     }
-    "git"
 }
 
-fn run_git_with_status(repo_dir: &Path, args: &[&str]) -> Result<std::process::Output, GitError> {
-    Command::new(git_program())
-        .arg("-C")
-        .arg(repo_dir)
-        .args(args)
-        .output()
-        .map_err(|source| GitError::Exec {
-            command: format_git_command(repo_dir, args),
-            source,
-        })
+/// Run git, returning the raw output whatever the exit status.
+fn run_git_with_status(repo_dir: &Path, args: &[&str]) -> Result<crate::git::GitOutput, GitError> {
+    Ok(crate::git::cmd(repo_dir).args(args).allow_fail().run()?)
 }
 
 /// Check whether `path` is inside a git work tree.
 pub fn is_git_repo(path: &Path) -> bool {
-    Command::new(git_program())
-        .arg("-C")
-        .arg(path)
+    crate::git::cmd(path)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map(|o| o.status.success())
+        .succeeds()
         .unwrap_or(false)
 }
 
@@ -104,15 +89,11 @@ pub fn discover_sub_repos(path: &Path) -> Vec<PathBuf> {
 }
 
 pub fn run_git(repo_dir: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
-    let output = run_git_with_status(repo_dir, args)?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
-        Ok(GitOutput { stdout, stderr })
-    } else {
-        Err(classify_error(&stderr))
-    }
+    let output = crate::git::cmd(repo_dir).args(args).run()?;
+    Ok(GitOutput {
+        stdout: output.stdout_str(),
+        stderr: output.stderr_str(),
+    })
 }
 
 /// Resolve the default branch name for a repo. Tries `origin/HEAD` first
@@ -253,48 +234,6 @@ pub fn status_porcelain(repo: &Path) -> Result<String, GitError> {
     Ok(run_git(repo, &["status", "--porcelain"])?.stdout)
 }
 
-pub fn has_user_changes(repo: &Path) -> Result<bool, GitError> {
-    Ok(status_porcelain(repo)?
-        .lines()
-        .any(|line| !line.starts_with("?? .batty/")))
-}
-
-pub fn auto_commit_if_dirty(
-    repo: &Path,
-    message: &str,
-    timeout: Duration,
-) -> Result<bool, GitError> {
-    if !has_user_changes(repo)? {
-        return Ok(false);
-    }
-
-    let repo = repo.to_path_buf();
-    let message = message.to_string();
-    let command = format_git_command(&repo, &["add", "-A"]);
-    let (tx, rx) = mpsc::channel();
-
-    std::thread::spawn(move || {
-        let result = (|| -> Result<bool, GitError> {
-            run_git(&repo, &["add", "-A"])?;
-            run_git(&repo, &["commit", "-m", &message])?;
-            Ok(true)
-        })();
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(GitError::Exec {
-            command,
-            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "git auto-commit timed out"),
-        }),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(GitError::Exec {
-            command,
-            source: std::io::Error::other("git auto-commit worker disconnected"),
-        }),
-    }
-}
-
 pub fn checkout_new_branch(repo: &Path, branch: &str, start: &str) -> Result<(), GitError> {
     run_git(repo, &["checkout", "-B", branch, start])?;
     Ok(())
@@ -429,39 +368,12 @@ mod tests {
     #[test]
     fn git_initialized_dir_returns_true() {
         let tmp = tempfile::tempdir().unwrap();
-        std::process::Command::new(git_program())
+        std::process::Command::new(crate::git::program())
             .args(["init"])
             .current_dir(tmp.path())
             .output()
             .unwrap();
         assert!(is_git_repo(tmp.path()));
-    }
-
-    #[test]
-    fn has_user_changes_ignores_batty_untracked_files() {
-        let tmp = init_repo();
-        std::fs::create_dir_all(tmp.path().join(".batty")).unwrap();
-        std::fs::write(tmp.path().join(".batty").join("state.json"), "{}\n").unwrap();
-
-        assert!(!has_user_changes(tmp.path()).unwrap());
-    }
-
-    #[test]
-    fn auto_commit_if_dirty_commits_changes() {
-        let tmp = init_repo();
-        std::fs::write(tmp.path().join("note.txt"), "hello\n").unwrap();
-
-        let committed = auto_commit_if_dirty(
-            tmp.path(),
-            "wip: auto-save before restart [batty]",
-            Duration::from_secs(20),
-        )
-        .unwrap();
-
-        assert!(committed);
-        assert!(!has_user_changes(tmp.path()).unwrap());
-        let log = run_git(tmp.path(), &["log", "--oneline", "-1"]).unwrap();
-        assert!(log.stdout.contains("wip: auto-save before restart [batty]"));
     }
 
     // --- Error path and recovery tests (Task #265) ---
@@ -622,12 +534,6 @@ mod tests {
         let error =
             merge_base_is_ancestor(tmp.path(), "nonexistent-ref", "also-nonexistent").unwrap_err();
         assert!(!error.is_transient());
-    }
-
-    #[test]
-    fn format_git_command_includes_repo_dir_and_args() {
-        let cmd = format_git_command(Path::new("/my/repo"), &["status", "--porcelain"]);
-        assert_eq!(cmd, "git -C /my/repo status --porcelain");
     }
 
     #[test]

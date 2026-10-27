@@ -457,10 +457,10 @@ fn current_parity_pct(project_root: &Path) -> Option<u32> {
 }
 
 fn git_head(worktree_dir: &Path) -> Result<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["rev-parse", "HEAD"])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to read HEAD in {}", worktree_dir.display()))?;
     if !output.status.success() {
         bail!("failed to read HEAD in {}", worktree_dir.display());
@@ -469,19 +469,21 @@ fn git_head(worktree_dir: &Path) -> Result<String> {
 }
 
 fn git_commit_all(worktree_dir: &Path, message: &str) -> Result<()> {
-    let add = std::process::Command::new("git")
+    let add = crate::git::cmd(worktree_dir)
         .args(["add", "-A"])
-        .current_dir(worktree_dir)
-        .status()
+        .allow_fail()
+        .run()
+        .map(|output| output.status)
         .with_context(|| format!("failed to stage worktree {}", worktree_dir.display()))?;
     if !add.success() {
         bail!("failed to stage worktree {}", worktree_dir.display());
     }
 
-    let commit = std::process::Command::new("git")
+    let commit = crate::git::cmd(worktree_dir)
         .args(["commit", "-m", message])
-        .current_dir(worktree_dir)
-        .status()
+        .allow_fail()
+        .run()
+        .map(|output| output.status)
         .with_context(|| format!("failed to commit worktree {}", worktree_dir.display()))?;
     if !commit.success() {
         bail!("failed to commit worktree {}", worktree_dir.display());
@@ -490,10 +492,11 @@ fn git_commit_all(worktree_dir: &Path, message: &str) -> Result<()> {
 }
 
 fn git_reset_hard(worktree_dir: &Path, target: &str) -> Result<()> {
-    let status = std::process::Command::new("git")
+    let status = crate::git::cmd(worktree_dir)
         .args(["reset", "--hard", target])
-        .current_dir(worktree_dir)
-        .status()
+        .allow_fail()
+        .run()
+        .map(|output| output.status)
         .with_context(|| format!("failed to reset {}", worktree_dir.display()))?;
     if !status.success() {
         bail!("failed to reset {} to {}", worktree_dir.display(), target);

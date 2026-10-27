@@ -423,10 +423,10 @@ fn git_current_branch(worktree_dir: &Path) -> Option<String> {
     if !worktree_dir.exists() {
         return None;
     }
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if output.status.success() {
         let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -455,10 +455,10 @@ fn git_last_commit(worktree_dir: &Path) -> Option<String> {
     if !worktree_dir.exists() {
         return None;
     }
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["log", "-1", "--oneline"])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if output.status.success() {
         let line = String::from_utf8_lossy(&output.stdout).trim().to_string();

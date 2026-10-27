@@ -178,14 +178,11 @@ pub(crate) fn run_disk_hygiene(
     if git_objects.is_dir() {
         let objects_bytes = dir_size_bytes(&git_objects);
         if objects_bytes > 500 * 1_048_576 {
-            let status = std::process::Command::new("git")
+            let status = crate::git::cmd(project_root)
                 .args(["gc", "--prune=now"])
-                .current_dir(project_root)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+                .allow_fail()
+                .run()
+                .map(|output| output.status);
             match status {
                 Ok(s) if s.success() => report.git_gc_ran = true,
                 Ok(s) => debug!(exit_code = ?s.code(), "git gc exited non-zero"),
@@ -236,12 +233,10 @@ pub(crate) fn post_merge_cleanup(
 
     // Prune the merged branch
     if config.prune_merged_branches {
-        let prune_result = std::process::Command::new("git")
+        let prune_result = crate::git::cmd(project_root)
             .args(["branch", "-D", branch])
-            .current_dir(project_root)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .output();
+            .allow_fail()
+            .run();
         match prune_result {
             Ok(output) if output.status.success() => {
                 report.branches_pruned.push(branch.to_string());

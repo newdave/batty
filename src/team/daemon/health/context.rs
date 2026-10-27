@@ -437,10 +437,10 @@ impl TeamDaemon {
             return None;
         }
 
-        let output = std::process::Command::new("git")
+        let output = crate::git::cmd(work_dir)
             .args(["log", "-1", "--format=%ct"])
-            .current_dir(work_dir)
-            .output()
+            .allow_fail()
+            .run()
             .ok()?;
         if !output.status.success() {
             return None;

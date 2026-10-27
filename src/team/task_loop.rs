@@ -1,9 +1,11 @@
 //! Task-loop helpers extracted from the team daemon.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
@@ -11,6 +13,10 @@ use tracing::{debug, info, warn};
 use super::git_cmd;
 use super::retry::{RetryConfig, retry_sync};
 use super::test_results::{self, TestRunOutput};
+pub(crate) use crate::worktree::ops::engineer_base_branch_name;
+#[cfg(test)]
+use crate::worktree::ops::fallback_identity_args;
+use crate::worktree::ops::{self, ExcludePolicy};
 
 const SHARED_CARGO_CONFIG_MARKER: &str = "# Managed by Batty: shared cargo target";
 const WORKTREE_EXCLUDE_MARKER: &str = "# Managed by Batty worktree ignores";
@@ -33,19 +39,6 @@ fn effective_trunk_branch(repo: &Path, trunk_branch: &str) -> String {
 pub(crate) const ADDITIVE_CONFLICT_AUTO_RESOLVE_FENCE: &[&str] =
     &["src/team/task_loop.rs", "src/team/review.rs"];
 const MIN_REVIEW_READY_PRODUCTION_ADDITIONS: usize = 10;
-const USER_WORKTREE_STATUS_ARGS: &[&str] = &[
-    "status",
-    "--porcelain=v1",
-    "--untracked-files=all",
-    "--",
-    ".",
-    ":(exclude).batty",
-    ":(exclude).cargo",
-    ":(exclude).batty-target",
-];
-const PRESERVATION_UNSTAGE_ARGS: &[&str] =
-    &["reset", "-q", "--", ".batty", ".cargo", ".batty-target"];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorktreeRefreshAction {
     Unchanged,
@@ -531,8 +524,8 @@ pub(crate) fn prepare_engineer_assignment_worktree_from_trunk(
     }
 
     let previous_branch = current_worktree_branch(worktree_dir)?;
-    let previous_branch_is_engineer_owned = previous_branch == engineer_name
-        || previous_branch.starts_with(&format!("{engineer_name}/"));
+    let previous_branch_is_engineer_owned =
+        ops::branch_belongs_to_engineer(&previous_branch, engineer_name);
     if previous_branch != base_branch
         && previous_branch != task_branch
         && !previous_branch_is_engineer_owned
@@ -880,10 +873,6 @@ pub(crate) fn refresh_engineer_worktree_from_trunk(
     Ok(WorktreeRefreshAction::Reset)
 }
 
-pub(crate) fn engineer_base_branch_name(engineer_name: &str) -> String {
-    format!("eng-main/{engineer_name}")
-}
-
 fn maybe_migrate_legacy_engineer_worktree(
     project_root: &Path,
     worktree_dir: &Path,
@@ -924,7 +913,7 @@ fn maybe_migrate_legacy_engineer_worktree(
         return Ok(());
     }
 
-    let archive_branch = archived_legacy_branch_name(project_root, engineer_name)?;
+    let archive_branch = ops::free_archive_branch_name(project_root, engineer_name)?;
     rename_branch(project_root, engineer_name, &archive_branch)?;
     warn!(
         old_branch = engineer_name,
@@ -965,7 +954,7 @@ fn ensure_task_branch_namespace_available(
         return Ok(());
     }
 
-    let archive_branch = archived_legacy_branch_name(project_root, engineer_name)?;
+    let archive_branch = ops::free_archive_branch_name(project_root, engineer_name)?;
     rename_branch(project_root, engineer_name, &archive_branch)?;
     warn!(
         old_branch = engineer_name,
@@ -1120,28 +1109,12 @@ fn ensure_engineer_worktree_excludes(worktree_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Run git in `worktree_dir`, returning the output whatever the exit status.
 fn run_git_command_with_fallback(
     worktree_dir: &Path,
     args: &[&str],
-) -> std::io::Result<std::process::Output> {
-    let mut last_not_found = None;
-    for program in ["git", "/usr/bin/git", "/opt/homebrew/bin/git"] {
-        match Command::new(program)
-            .args(args)
-            .current_dir(worktree_dir)
-            .output()
-        {
-            Ok(output) => return Ok(output),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_not_found = Some(error);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    Err(last_not_found.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "git binary not found")
-    }))
+) -> std::result::Result<crate::git::GitOutput, crate::git::GitError> {
+    crate::git::cmd(worktree_dir).args(args).allow_fail().run()
 }
 
 fn engineer_worktree_project_root(worktree_dir: &Path) -> Option<PathBuf> {
@@ -1161,171 +1134,18 @@ fn engineer_worktree_project_root(worktree_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Whether the worktree has user changes (Batty runtime dirs excluded).
 pub(crate) fn worktree_has_user_changes(worktree_dir: &Path) -> Result<bool> {
-    Ok(!current_worktree_user_change_paths(worktree_dir)?.is_empty())
+    ops::is_dirty(worktree_dir, ExcludePolicy::BattyRuntime)
 }
 
-pub(crate) fn current_worktree_user_change_paths(worktree_dir: &Path) -> Result<Vec<String>> {
-    // Multi-repo mode: worktree root isn't a git repo itself, it holds per-package
-    // git worktrees underneath. Iterate sub-repos and aggregate (mirrors preflight.rs
-    // and discover_sub_repos elsewhere). Single-repo path unchanged.
-    if !git_cmd::is_git_repo(worktree_dir) {
-        let sub_repos = git_cmd::discover_sub_repos(worktree_dir);
-        if sub_repos.is_empty() {
-            // Not a git repo and no git sub-repos — nothing we can inspect.
-            // Fall through to single-repo path to surface the original error.
-        } else {
-            let mut aggregated = Vec::new();
-            for repo in sub_repos {
-                let status = map_git_error(
-                    retry_git(|| {
-                        git_cmd::run_git(&repo, USER_WORKTREE_STATUS_ARGS)
-                            .map(|output| output.stdout)
-                    }),
-                    "failed to inspect sub-repo worktree status",
-                )?;
-                let repo_name = repo
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                for path in parse_status_paths(&status) {
-                    if repo_name.is_empty() {
-                        aggregated.push(path);
-                    } else {
-                        aggregated.push(format!("{repo_name}/{path}"));
-                    }
-                }
-            }
-            return Ok(aggregated);
-        }
-    }
-    let status = map_git_error(
-        retry_git(|| {
-            git_cmd::run_git(worktree_dir, USER_WORKTREE_STATUS_ARGS).map(|output| output.stdout)
-        }),
-        "failed to inspect worktree status",
-    )?;
-    Ok(parse_status_paths(&status))
-}
-
-pub(crate) fn current_staged_change_paths(worktree_dir: &Path) -> Result<Vec<String>> {
-    let output = map_git_error(
-        retry_git(|| git_cmd::run_git(worktree_dir, &["diff", "--cached", "--name-only"])),
-        "failed to inspect staged worktree changes",
-    )?;
-    Ok(output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
-fn parse_status_paths(status: &str) -> Vec<String> {
-    status
-        .lines()
-        .filter_map(|line| {
-            if line.len() < 4 {
-                return None;
-            }
-            let path = line[3..].trim();
-            (!path.is_empty()).then(|| path.to_string())
-        })
-        .collect()
-}
-
-pub(crate) fn log_worktree_mutation_audit(
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn preserve_worktree_with_commit(
     worktree_dir: &Path,
-    subsystem: &str,
-    operation: &str,
-    files: &[String],
-) {
-    let branch = crate::worktree::git_current_branch(worktree_dir)
-        .unwrap_or_else(|_| "<detached-or-unavailable>".to_string());
-    let file_summary = if files.is_empty() {
-        "<none>".to_string()
-    } else {
-        files.join(", ")
-    };
-    info!(
-        subsystem,
-        operation,
-        cwd = %worktree_dir.display(),
-        branch,
-        files = %file_summary,
-        "worktree mutation audit"
-    );
-}
-
-fn rollback_newly_staged_paths(
-    worktree_dir: &Path,
-    original_staged_paths: &HashSet<String>,
-    subsystem: &str,
-) {
-    let rollback_paths = match current_staged_change_paths(worktree_dir) {
-        Ok(paths) => paths
-            .into_iter()
-            .filter(|path| !original_staged_paths.contains(path))
-            .collect::<Vec<_>>(),
-        Err(error) => {
-            warn!(
-                subsystem,
-                cwd = %worktree_dir.display(),
-                error = %error,
-                "failed to inspect staged paths while rolling back preservation staging"
-            );
-            return;
-        }
-    };
-
-    if rollback_paths.is_empty() {
-        return;
-    }
-
-    log_worktree_mutation_audit(worktree_dir, subsystem, "git reset -q --", &rollback_paths);
-    let mut last_not_found = None;
-    for program in ["git", "/usr/bin/git", "/opt/homebrew/bin/git"] {
-        let output = Command::new(program)
-            .arg("-C")
-            .arg(worktree_dir)
-            .args(["reset", "-q", "--"])
-            .args(&rollback_paths)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => return,
-            Ok(output) => {
-                warn!(
-                    subsystem,
-                    cwd = %worktree_dir.display(),
-                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                    "failed to roll back newly staged paths after preserve failure"
-                );
-                return;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_not_found = Some(error);
-            }
-            Err(error) => {
-                warn!(
-                    subsystem,
-                    cwd = %worktree_dir.display(),
-                    error = %error,
-                    "failed to launch git while rolling back preservation staging"
-                );
-                return;
-            }
-        }
-    }
-
-    if let Some(error) = last_not_found {
-        warn!(
-            subsystem,
-            cwd = %worktree_dir.display(),
-            error = %error,
-            "git binary unavailable while rolling back preservation staging"
-        );
-    }
+    commit_message: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    ops::preserve_with_commit(worktree_dir, commit_message, timeout, "task-loop/preserve")
 }
 
 pub(crate) fn git_has_unresolved_conflicts(repo_dir: &Path) -> Result<bool> {
@@ -1436,7 +1256,7 @@ pub(crate) fn is_worktree_safe_to_mutate(worktree_dir: &Path) -> Result<bool> {
     };
 
     // eng-main/* branches are base branches with no user work worth preserving.
-    if branch.starts_with("eng-main/") {
+    if ops::is_engineer_base_branch(&branch) {
         return Ok(true);
     }
 
@@ -1447,200 +1267,6 @@ pub(crate) fn is_worktree_safe_to_mutate(worktree_dir: &Path) -> Result<bool> {
         "worktree has uncommitted changes on task branch, refusing to mutate"
     );
     Ok(false)
-}
-
-fn run_git_with_timeout(worktree_dir: &Path, args: &[&str], timeout: Duration) -> Result<()> {
-    let mut last_not_found = None;
-    let mut child = None;
-    for program in ["git", "/usr/bin/git", "/opt/homebrew/bin/git"] {
-        let mut command = Command::new(program);
-        command.arg("-C").arg(worktree_dir).args(args);
-        // Pipe stderr so we can surface it in error messages. Without this,
-        // failures like `git add -A -- . :(exclude).batty :(exclude).cargo`
-        // just say "exit status: 1" with no reason, making preserve-worktree
-        // bugs impossible to diagnose from daemon logs alone. Stdout goes to
-        // /dev/null because we never consume it in this helper.
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        match command.spawn() {
-            Ok(process) => {
-                child = Some(process);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_not_found = Some(error);
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to launch `git {}` in {}",
-                        args.join(" "),
-                        worktree_dir.display()
-                    )
-                });
-            }
-        }
-    }
-    let mut child = child
-        .ok_or_else(|| {
-            last_not_found.unwrap_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "git binary not found")
-            })
-        })
-        .with_context(|| {
-            format!(
-                "failed to launch `git {}` in {}",
-                args.join(" "),
-                worktree_dir.display()
-            )
-        })?;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                // Drain stderr so the pipe closes cleanly; discard contents.
-                if let Some(mut err) = child.stderr.take() {
-                    let mut sink = Vec::new();
-                    let _ = std::io::Read::read_to_end(&mut err, &mut sink);
-                }
-                return Ok(());
-            }
-            let mut stderr_buf = Vec::new();
-            if let Some(mut err) = child.stderr.take() {
-                let _ = std::io::Read::read_to_end(&mut err, &mut stderr_buf);
-            }
-            let stderr = String::from_utf8_lossy(&stderr_buf);
-            let stderr_trimmed = stderr.trim();
-            if stderr_trimmed.is_empty() {
-                bail!(
-                    "`git {}` failed in {} with status {}",
-                    args.join(" "),
-                    worktree_dir.display(),
-                    status
-                );
-            } else {
-                bail!(
-                    "`git {}` failed in {} with status {}: {}",
-                    args.join(" "),
-                    worktree_dir.display(),
-                    status,
-                    stderr_trimmed
-                );
-            }
-        }
-
-        if Instant::now() >= deadline {
-            terminate_process_tree(&mut child);
-            let _ = child.wait();
-            bail!(
-                "`git {}` timed out after {}s in {}",
-                args.join(" "),
-                timeout.as_secs(),
-                worktree_dir.display()
-            );
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(unix)]
-fn terminate_process_tree(child: &mut std::process::Child) {
-    let _ = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-}
-
-#[cfg(not(unix))]
-fn terminate_process_tree(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn preserve_worktree_with_commit(
-    worktree_dir: &Path,
-    commit_message: &str,
-    timeout: Duration,
-) -> Result<bool> {
-    preserve_worktree_with_commit_for(worktree_dir, commit_message, timeout, "task-loop/preserve")
-}
-
-/// `-c` overrides that give git a placeholder identity when the repo has none
-/// configured, so preservation commits cannot fail with "Please tell me who
-/// you are". Returns an empty slice when git can already resolve an identity.
-pub(crate) fn fallback_identity_args(dir: &Path) -> &'static [&'static str] {
-    let has_identity = ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"]
-        .iter()
-        .all(|var| {
-            Command::new("git")
-                .args(["var", var])
-                .current_dir(dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        });
-    if has_identity {
-        &[]
-    } else {
-        &["-c", "user.name=batty", "-c", "user.email=batty@localhost"]
-    }
-}
-
-pub(crate) fn preserve_worktree_with_commit_for(
-    worktree_dir: &Path,
-    commit_message: &str,
-    timeout: Duration,
-    subsystem: &str,
-) -> Result<bool> {
-    let dirty_paths = current_worktree_user_change_paths(worktree_dir)?;
-    if dirty_paths.is_empty() {
-        return Ok(false);
-    }
-
-    // Stage from the repository root, then unstage Batty-managed runtime dirs.
-    // Explicit `:(exclude)` pathspecs against ignored dirs can make `git add`
-    // fail before it stages the real user changes we need to preserve.
-    let original_staged_paths = current_staged_change_paths(worktree_dir)?
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let preserve_result = (|| -> Result<bool> {
-        log_worktree_mutation_audit(worktree_dir, subsystem, "git add -A", &dirty_paths);
-        run_git_with_timeout(worktree_dir, &["add", "-A"], timeout)?;
-        run_git_with_timeout(worktree_dir, PRESERVATION_UNSTAGE_ARGS, timeout)?;
-
-        let staged_paths = current_staged_change_paths(worktree_dir)?;
-        if staged_paths.is_empty() {
-            return Ok(false);
-        }
-
-        log_worktree_mutation_audit(worktree_dir, subsystem, "git commit", &staged_paths);
-        let mut commit_args: Vec<&str> = fallback_identity_args(worktree_dir).to_vec();
-        commit_args.extend([
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "commit",
-            "-m",
-            commit_message,
-        ]);
-        run_git_with_timeout(worktree_dir, &commit_args, timeout)?;
-        Ok(true)
-    })();
-
-    if preserve_result.is_err() {
-        rollback_newly_staged_paths(worktree_dir, &original_staged_paths, subsystem);
-    }
-
-    preserve_result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1687,7 +1313,7 @@ pub(crate) fn quarantine_completed_lane_for_recovery(
         task.id, current_branch
     );
 
-    match preserve_worktree_with_commit_for(
+    match ops::preserve_with_commit(
         worktree_dir,
         &commit_message,
         timeout,
@@ -1844,7 +1470,7 @@ fn auto_clean_worktree(worktree_dir: &Path) -> Result<()> {
 pub(crate) fn auto_commit_before_reset(worktree_dir: &Path) -> bool {
     let branch = retry_git(|| git_cmd::rev_parse_branch(worktree_dir)).unwrap_or_default();
     let msg = format!("wip: auto-save before worktree reset [{}]", branch);
-    match preserve_worktree_with_commit_for(
+    match ops::preserve_with_commit(
         worktree_dir,
         &msg,
         Duration::from_secs(5),
@@ -2023,23 +1649,6 @@ pub(crate) fn delete_branch(project_root: &Path, branch_name: &str) -> Result<()
         retry_git(|| git_cmd::branch_delete(project_root, branch_name)),
         &format!("failed to delete branch '{branch_name}'"),
     )
-}
-
-fn archived_legacy_branch_name(project_root: &Path, engineer_name: &str) -> Result<String> {
-    let short_sha = map_git_error(
-        retry_git(|| git_cmd::run_git(project_root, &["rev-parse", "--short", engineer_name])),
-        &format!("failed to resolve legacy branch '{engineer_name}'"),
-    )?
-    .stdout
-    .trim()
-    .to_string();
-    let mut candidate = format!("legacy/{engineer_name}-{short_sha}");
-    let mut counter = 1usize;
-    while branch_exists(project_root, &candidate)? {
-        counter += 1;
-        candidate = format!("legacy/{engineer_name}-{short_sha}-{counter}");
-    }
-    Ok(candidate)
 }
 
 fn rename_branch(project_root: &Path, old_branch: &str, new_branch: &str) -> Result<()> {
@@ -2728,7 +2337,7 @@ mod tests {
 
         let legacy_check = git(&repo, &["rev-parse", "--verify", "eng-8"]);
         assert!(!legacy_check.status.success());
-        assert!(!git_stdout(&repo, &["branch", "--list", "legacy/eng-8-*"]).is_empty());
+        assert!(!git_stdout(&repo, &["branch", "--list", "preserved/eng-8-*"]).is_empty());
         assert_eq!(
             git_stdout(&worktree_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
             "eng-8/100"
@@ -4355,13 +3964,9 @@ mod tests {
         assert!(!fallback_identity_args(&repo).is_empty());
         std::fs::write(repo.join("wip.txt"), "wip\n").unwrap();
 
-        let preserved = preserve_worktree_with_commit_for(
-            &repo,
-            "wip: no identity",
-            Duration::from_secs(10),
-            "test",
-        )
-        .unwrap();
+        let preserved =
+            ops::preserve_with_commit(&repo, "wip: no identity", Duration::from_secs(10), "test")
+                .unwrap();
 
         assert!(preserved);
         let author = git_stdout(&repo, &["log", "-1", "--format=%an <%ae>"]);

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+#[cfg(test)]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -1602,10 +1603,10 @@ fn unavailable_branch_detail(request: &MergeRequest, trunk_branch: &str) -> Resu
 
 fn commits_ahead_of_trunk(worktree_dir: &std::path::Path, trunk_branch: &str) -> Result<u32> {
     let range = format!("{trunk_branch}..HEAD");
-    let output = Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["rev-list", "--count", &range])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed to count commits ahead of {trunk_branch} in {}",
@@ -1631,10 +1632,10 @@ fn commits_ahead_of_trunk(worktree_dir: &std::path::Path, trunk_branch: &str) ->
 }
 
 fn git_head(repo_dir: &std::path::Path) -> Result<String> {
-    let output = Command::new("git")
+    let output = crate::git::cmd(repo_dir)
         .args(["rev-parse", "HEAD"])
-        .current_dir(repo_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed to capture pre-merge HEAD for post-merge verification in {}",
@@ -1652,10 +1653,10 @@ fn git_head(repo_dir: &std::path::Path) -> Result<String> {
 }
 
 fn reset_main_to(repo_dir: &std::path::Path, target: &str) -> Result<()> {
-    let output = Command::new("git")
+    let output = crate::git::cmd(repo_dir)
         .args(["reset", "--hard", target])
-        .current_dir(repo_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed to run git reset --hard {target} in {} after post-merge verification failure",

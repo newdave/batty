@@ -314,10 +314,10 @@ fn persist_verification_recovery_snapshot(
 }
 
 fn git_ref_head(project_root: &Path, branch: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(project_root)
         .args(["rev-parse", "--verify", branch])
-        .current_dir(project_root)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -327,7 +327,7 @@ fn git_ref_head(project_root: &Path, branch: &str) -> Option<String> {
 }
 
 fn worktree_path_for_branch(branch: &str) -> Option<String> {
-    if branch.starts_with("preserved/") || branch.starts_with("backup/") {
+    if crate::worktree::ops::is_archive_branch(branch) {
         return None;
     }
     let engineer = branch.split('/').next()?.trim();
@@ -464,10 +464,10 @@ fn escalate_completion_metadata_rejection(
 }
 
 fn read_worktree_head_commit(worktree_dir: &Path) -> Result<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["rev-parse", "HEAD"])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed to invoke git rev-parse in {}",
@@ -862,10 +862,10 @@ impl VerificationJob {
 }
 
 fn worktree_head(worktree_dir: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["rev-parse", "HEAD"])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     output
         .status
@@ -1845,10 +1845,10 @@ fn load_previous_test_results(board_dir: &Path, task_id: u32) -> Result<Option<T
 }
 
 fn path_exists_on_trunk(worktree_dir: &Path, trunk_branch: &str, file: &str) -> Result<bool> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree_dir)
         .args(["ls-tree", "-r", "--name-only", trunk_branch, "--", file])
-        .current_dir(worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed to inspect whether {file} exists on {trunk_branch} in {}",

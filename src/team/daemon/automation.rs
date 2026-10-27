@@ -341,11 +341,11 @@ pub(in crate::team) fn authoritative_task_branch(
     task.branch
         .clone()
         .filter(|branch| is_managed_task_branch(engineer, branch))
-        .unwrap_or_else(|| format!("{engineer}/{}", task.id))
+        .unwrap_or_else(|| crate::worktree::ops::engineer_task_branch_name(engineer, task.id))
 }
 
 fn is_managed_task_branch(engineer: &str, branch: &str) -> bool {
-    branch.starts_with(&format!("{engineer}/"))
+    crate::worktree::ops::is_engineer_task_branch(branch, engineer)
 }
 
 fn format_branch_recovery_blocker(reason: &str) -> String {
@@ -1574,7 +1574,7 @@ impl TeamDaemon {
                 "wip: auto-save before branch recovery from {} to {}",
                 mismatch.current_branch, mismatch.expected_branch
             );
-            match crate::team::task_loop::preserve_worktree_with_commit_for(
+            match crate::worktree::ops::preserve_with_commit(
                 &worktree_dir,
                 &auto_save_message,
                 Duration::from_secs(10),
@@ -2783,10 +2783,10 @@ impl TeamDaemon {
             return None;
         }
 
-        let branch = std::process::Command::new("git")
+        let branch = crate::git::cmd(&worktree_path)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(&worktree_path)
-            .output()
+            .allow_fail()
+            .run()
             .ok()
             .and_then(|output| {
                 output
@@ -3252,10 +3252,10 @@ fn latest_commit_timestamp(
     {
         return None;
     }
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(work_dir)
         .args(["log", "-1", "--format=%cI"])
-        .current_dir(work_dir)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;

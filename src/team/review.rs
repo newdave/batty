@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -394,7 +393,10 @@ fn select_current_lane<'a>(
                 .branch
                 .as_deref()
                 .map(|branch| branch == current_branch)
-                .unwrap_or_else(|| format!("{engineer}/{}", candidate.id) == current_branch)
+                .unwrap_or_else(|| {
+                    crate::worktree::ops::engineer_task_branch_name(engineer, candidate.id)
+                        == current_branch
+                })
         });
         if let Some(candidate) = branch_matches.next()
             && branch_matches.next().is_none()
@@ -435,10 +437,10 @@ fn review_worktree_commit(project_root: &Path, engineer: &str) -> Option<String>
         return None;
     }
 
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(&worktree_dir)
         .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(&worktree_dir)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -453,19 +455,7 @@ fn branch_commits_ahead_of_trunk(
     branch: &str,
     trunk_branch: &str,
 ) -> Option<u32> {
-    let output = Command::new("git")
-        .args(["rev-list", "--count", &format!("{trunk_branch}..{branch}")])
-        .current_dir(project_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .ok()
+    crate::worktree::ops::ahead_count(project_root, trunk_branch, branch).ok()
 }
 
 fn review_worktree_dir(project_root: &Path, engineer: &str) -> std::path::PathBuf {

@@ -20,17 +20,12 @@ pub(crate) fn run_git_with_context(
     repo_dir: &Path,
     args: &[&str],
     intent: &str,
-) -> Result<std::process::Output> {
+) -> Result<crate::git::GitOutput> {
     let output = run_git_with_context_allow_fail(repo_dir, args, intent)?;
     if !output.status.success() {
         bail!(
             "{} ({})",
-            describe_git_failure(
-                repo_dir,
-                args,
-                intent,
-                &String::from_utf8_lossy(&output.stderr)
-            ),
+            describe_git_failure(repo_dir, args, intent, &output.stderr_str()),
             output.status
         );
     }
@@ -38,18 +33,17 @@ pub(crate) fn run_git_with_context(
 }
 
 /// Run git and return its output whatever the exit status. Only spawn
-/// failures are errors; the caller must check `output.status`.
+/// failures and timeouts are errors; the caller must check `output.status`.
 pub(crate) fn run_git_with_context_allow_fail(
     repo_dir: &Path,
     args: &[&str],
     intent: &str,
-) -> Result<std::process::Output> {
+) -> Result<crate::git::GitOutput> {
     let command = format!("git {}", args.join(" "));
-    std::process::Command::new("git")
+    crate::git::cmd(repo_dir)
         .args(args)
-        .current_dir(repo_dir)
-        .env("GIT_EDITOR", "true")
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed while trying to {intent}: could not execute `{command}` in {}",
@@ -103,33 +97,10 @@ pub(crate) fn commits_ahead_of_main(worktree_dir: &Path) -> Result<u32> {
 }
 
 pub(crate) fn commits_ahead_of_trunk(worktree_dir: &Path, trunk_branch: &str) -> Result<u32> {
-    let range = format!("{trunk_branch}..HEAD");
-    let output = run_git_with_context_allow_fail(
-        worktree_dir,
-        &["rev-list", "--count", &range],
-        &format!("count commits ahead of {trunk_branch} before accepting engineer completion"),
-    )?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "{}",
-            describe_git_failure(
-                worktree_dir,
-                &["rev-list", "--count", &range],
-                &format!(
-                    "count commits ahead of {trunk_branch} before accepting engineer completion"
-                ),
-                &stderr,
-            )
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim().parse::<u32>().with_context(|| {
+    crate::worktree::ops::ahead_count(worktree_dir, trunk_branch, "HEAD").with_context(|| {
         format!(
-            "failed to parse git rev-list --count {range} output: {:?}",
-            stdout.trim()
+            "failed while trying to count commits ahead of {trunk_branch} before accepting engineer completion: `git rev-list --count {trunk_branch}..HEAD` in {}",
+            worktree_dir.display()
         )
     })
 }

@@ -499,7 +499,7 @@ impl TeamDaemon {
         if self.member_uses_worktrees(member) {
             let worktree_dir = self.worktree_dir(member);
             if worktree_dir.exists() {
-                saved = crate::team::task_loop::preserve_worktree_with_commit_for(
+                saved = crate::worktree::ops::preserve_with_commit(
                     &worktree_dir,
                     "wip: auto-save before telegram kick [batty]",
                     std::time::Duration::from_secs(

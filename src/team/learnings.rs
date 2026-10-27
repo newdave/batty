@@ -466,10 +466,10 @@ fn load_changed_paths(path: &Path) -> Result<Vec<String>> {
 }
 
 fn git_commit_summary(project_root: &Path, commit: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(project_root)
         .args(["log", "-1", "--format=%s", commit])
-        .current_dir(project_root)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;

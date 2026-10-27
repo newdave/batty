@@ -18,12 +18,10 @@ const SHARED_TARGET_CLEANUP_INTERVAL: Duration = Duration::from_secs(900);
 const UNCOMMITTED_INSPECTION_INTERVAL: Duration = Duration::from_secs(30);
 
 fn conflict_paths(repo_dir: &Path) -> Vec<String> {
-    let output = match std::process::Command::new("git")
+    let output = match crate::git::cmd(repo_dir)
         .args(["diff", "--name-only", "--diff-filter=U"])
-        .current_dir(repo_dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
+        .allow_fail()
+        .run()
     {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
@@ -53,22 +51,15 @@ impl TeamDaemon {
 }
 
 fn git_ref_exists(repo_dir: &Path, rev: &str) -> bool {
-    std::process::Command::new("git")
+    crate::git::cmd(repo_dir)
         .args(["rev-parse", "--verify", rev])
-        .current_dir(repo_dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
+        .allow_fail()
+        .run()
         .is_ok_and(|output| output.status.success())
 }
 
 fn abort_conflicted_git_operation(repo_dir: &Path, args: &[&str]) {
-    let _ = std::process::Command::new("git")
-        .args(args)
-        .current_dir(repo_dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output();
+    let _ = crate::git::cmd(repo_dir).args(args).allow_fail().run();
 }
 
 fn claude_credentials_path() -> Option<PathBuf> {
@@ -139,12 +130,10 @@ fn uncommitted_warning_worktree_path(
 }
 
 fn git_worktree_root(path: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(path)
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -403,7 +392,7 @@ impl TeamDaemon {
             if !worktree_path.is_dir() {
                 continue;
             }
-            let base = format!("eng-main/{}", name);
+            let base = crate::worktree::ops::engineer_base_branch_name(name);
 
             for repo in
                 workspace_repo_targets(&worktree_path, self.is_multi_repo, &self.sub_repo_names)

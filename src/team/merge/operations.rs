@@ -692,8 +692,7 @@ pub(crate) fn reset_engineer_worktree_to_trunk(
 
     if previous_branch != base_branch
         && previous_branch != "HEAD"
-        && (previous_branch == engineer_name
-            || previous_branch.starts_with(&format!("{engineer_name}/")))
+        && crate::worktree::ops::branch_belongs_to_engineer(&previous_branch, engineer_name)
         && branch_is_merged_into(project_root, &previous_branch, trunk_branch)?
         && let Err(error) = delete_branch(project_root, &previous_branch)
     {

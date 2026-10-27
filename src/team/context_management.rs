@@ -1,6 +1,7 @@
 //! Utilities for proactively tracking context pressure and preserving restart state.
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -223,10 +224,10 @@ fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
     if !worktree.exists() {
         return None;
     }
-    let output = Command::new("git")
+    let output = crate::git::cmd(worktree)
         .args(args)
-        .current_dir(worktree)
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;

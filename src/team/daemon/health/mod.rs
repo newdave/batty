@@ -119,7 +119,7 @@ impl TeamDaemon {
         if let Some(branch) = task.branch.as_deref().filter(|branch| {
             task.claimed_by
                 .as_deref()
-                .is_none_or(|owner| branch.starts_with(&format!("{owner}/")))
+                .is_none_or(|owner| crate::worktree::ops::is_engineer_task_branch(branch, owner))
         }) {
             message.push_str(&format!("\n\nBranch: {branch}"));
         }
@@ -210,15 +210,11 @@ fn uncommitted_diff_lines(worktree: &std::path::Path) -> Result<usize> {
 fn worktree_status_entries(
     worktree: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
-    let mut command = std::process::Command::new("git");
-    command
+    let output = crate::git::cmd(worktree)
         .args(["status", "--porcelain=v1", "--untracked-files=all", "--"])
         .args(UNCOMMITTED_STATUS_PATHS)
-        .current_dir(worktree)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE");
-    let output = command
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to run git status in {}", worktree.display()))?;
     if !output.status.success() {
         anyhow::bail!("git status failed in {}", worktree.display());
@@ -240,18 +236,14 @@ fn worktree_status_entries(
 }
 
 fn diff_numstat_lines(worktree: &std::path::Path, cached: bool, path: &str) -> Result<usize> {
-    let mut command = std::process::Command::new("git");
-    command.arg("diff");
+    let mut command = crate::git::cmd(worktree).arg("diff");
     if cached {
-        command.arg("--cached");
+        command = command.arg("--cached");
     }
-    command
-        .args(["--numstat", "--", path])
-        .current_dir(worktree)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE");
     let output = command
-        .output()
+        .args(["--numstat", "--", path])
+        .allow_fail()
+        .run()
         .with_context(|| format!("failed to run git diff for {}", path))?;
     if !output.status.success() {
         return Ok(0);
@@ -268,12 +260,10 @@ fn diff_numstat_lines(worktree: &std::path::Path, cached: bool, path: &str) -> R
 }
 
 fn tracked_blob_hash(worktree: &std::path::Path, path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree)
         .args(["rev-parse", &format!("HEAD:{path}")])
-        .current_dir(worktree)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -282,12 +272,10 @@ fn tracked_blob_hash(worktree: &std::path::Path, path: &str) -> Option<String> {
 }
 
 fn untracked_blob_hash(worktree: &std::path::Path, path: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::git::cmd(worktree)
         .args(["hash-object", path])
-        .current_dir(worktree)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
+        .allow_fail()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;

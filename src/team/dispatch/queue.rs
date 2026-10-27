@@ -280,9 +280,9 @@ struct ChangedPathsFrontmatter {
 /// which dispatch recreated the task branch from trunk and the work was
 /// archived away from the agent.
 fn worktree_on_clean_own_task_branch(worktree_dir: &Path, engineer: &str, task_id: u32) -> bool {
-    crate::worktree::git_current_branch(worktree_dir)
-        .is_ok_and(|branch| branch == format!("{engineer}/{task_id}"))
-        && crate::team::task_loop::worktree_has_user_changes(worktree_dir).is_ok_and(|dirty| !dirty)
+    crate::worktree::git_current_branch(worktree_dir).is_ok_and(|branch| {
+        branch == crate::worktree::ops::engineer_task_branch_name(engineer, task_id)
+    }) && crate::team::task_loop::worktree_has_user_changes(worktree_dir).is_ok_and(|dirty| !dirty)
 }
 
 fn board_tasks_dir(project_root: &Path) -> std::path::PathBuf {
@@ -1406,7 +1406,8 @@ impl TeamDaemon {
                         );
 
                         // Auto-recover: try rebase first, only reset as last resort.
-                        let base_branch = format!("eng-main/{}", entry.engineer);
+                        let base_branch =
+                            crate::worktree::ops::engineer_base_branch_name(&entry.engineer);
 
                         // SAFETY: if worktree has commits ahead of trunk, try rebase not reset.
                         // Only the base branch is rebased: rebasing a task branch (or another
@@ -1430,10 +1431,10 @@ impl TeamDaemon {
                                 "dispatch queue: worktree has work; trying rebase instead of reset"
                             );
                             // Try to rebase onto trunk to preserve work.
-                            let rebase_result = std::process::Command::new("git")
+                            let rebase_result = crate::git::cmd(&worktree_dir)
                                 .args(["rebase", self.config.team_config.trunk_branch()])
-                                .current_dir(&worktree_dir)
-                                .output();
+                                .allow_fail()
+                                .run();
                             if rebase_result.map(|o| o.status.success()).unwrap_or(false) {
                                 match crate::team::task_loop::engineer_worktree_ready_for_dispatch_from_trunk(
                                 &self.config.project_root,
@@ -1462,10 +1463,10 @@ impl TeamDaemon {
                             }
                             // Rebase failed or was insufficient — abort and fall through to a
                             // reset that archives the base branch's commits first.
-                            let _ = std::process::Command::new("git")
+                            let _ = crate::git::cmd(&worktree_dir)
                                 .args(["rebase", "--abort"])
-                                .current_dir(&worktree_dir)
-                                .output();
+                                .allow_fail()
+                                .run();
                             warn!(
                                 engineer = %entry.engineer,
                                 "dispatch queue: rebase did not make worktree ready; archiving base-branch commits and resetting"

@@ -5,13 +5,26 @@
 //! The executor runs in that worktree. Cleanup is merge-aware:
 //! - merged runs are removed (worktree + branch)
 //! - rejected/failed/unmerged runs are retained for inspection
-#![allow(dead_code)]
+
+pub mod ops;
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[cfg(test)]
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub(crate) use ops::{
+    abort_in_progress_git_operations, archive_branch_if_commits_ahead, heal_stray_task_branch,
+    prepare_worktree_for_reset,
+};
+#[cfg(test)]
+use ops::{
+    checkout_base_branch_across_repos, repos_for_mutation as iter_repos_for_mutation,
+    snapshot_dirty_worktree_to_ref,
+};
+use ops::{ref_exists, rev_count};
 
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
@@ -409,10 +422,10 @@ fn latest_phase_worktree(project_root: &Path, phase: &str) -> Result<Option<Phas
 }
 
 fn resolve_repo_root(project_root: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
-        .current_dir(project_root)
+    let output = crate::git::cmd(project_root)
         .args(["rev-parse", "--show-toplevel"])
-        .output()
+        .allow_fail()
+        .run()
         .with_context(|| {
             format!(
                 "failed while trying to resolve the repository root: could not execute `git rev-parse --show-toplevel` in {}",
@@ -515,28 +528,18 @@ fn sanitize_phase_for_branch(phase: &str) -> String {
     }
 }
 
-fn run_git<I, S>(repo_root: &Path, args: I) -> Result<Output>
+/// Run git in `repo_root` and return its output whatever the exit status;
+/// callers inspect `status`. Spawn failures and timeouts are errors.
+fn run_git<I, S>(repo_root: &Path, args: I) -> Result<crate::git::GitOutput>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let args = args
-        .into_iter()
-        .map(|arg| arg.as_ref().to_os_string())
-        .collect::<Vec<_>>();
-    let command = {
-        let rendered = args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("git {rendered}")
-    };
-    Command::new("git")
-        .current_dir(repo_root)
-        .args(&args)
-        .output()
-        .with_context(|| format!("failed to execute `{command}` in {}", repo_root.display()))
+    let command = crate::git::cmd(repo_root).args(args).allow_fail();
+    let rendered = command.display();
+    command
+        .run()
+        .with_context(|| format!("failed to execute `{rendered}`"))
 }
 
 fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
@@ -733,29 +736,13 @@ pub fn branch_fully_merged(repo_root: &Path, branch: &str, base: &str) -> Result
 /// Count commits on the current branch that are ahead of `base` (e.g. "main").
 /// Returns 0 if the branch is at or behind base.
 pub fn commits_ahead(worktree_path: &Path, base: &str) -> Result<usize> {
-    let output = run_git(worktree_path, ["rev-list", &format!("{base}..HEAD")])?;
-    if !output.status.success() {
-        bail!(
-            "git rev-list failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count())
+    Ok(ops::ahead_count(worktree_path, base, "HEAD")? as usize)
 }
 
-/// Check if a worktree has uncommitted changes (staged or unstaged).
+/// Check if a worktree has uncommitted changes (staged, unstaged or
+/// untracked), counting every path including Batty runtime dirs.
 pub fn has_uncommitted_changes(worktree_path: &Path) -> Result<bool> {
-    let output = run_git(worktree_path, ["status", "--porcelain"])?;
-    if !output.status.success() {
-        bail!(
-            "git status failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    ops::is_dirty(worktree_path, ops::ExcludePolicy::Nothing)
 }
 
 /// Get the current branch name for a repository/worktree path.
@@ -776,36 +763,6 @@ pub fn git_current_branch(path: &Path) -> Result<String> {
         );
     }
     Ok(branch)
-}
-
-fn ref_exists(path: &Path, ref_name: &str) -> Result<bool> {
-    let output = run_git(path, ["show-ref", "--verify", "--quiet", ref_name])?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => bail!(
-            "failed to inspect {} in {}: {}",
-            ref_name,
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    }
-}
-
-fn rev_list_count(path: &Path, range: &str) -> Result<u32> {
-    let output = run_git(path, ["rev-list", "--count", range])?;
-    if !output.status.success() {
-        bail!(
-            "failed to count commits in {} for {}: {}",
-            path.display(),
-            range,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .with_context(|| format!("failed to parse rev-list count for {range}"))
 }
 
 fn merge_base_is_ancestor(path: &Path, older: &str, newer: &str) -> Result<bool> {
@@ -854,7 +811,7 @@ fn preferred_trunk_start_ref(path: &Path, trunk_branch: &str) -> Result<MainStar
     }
 
     if merge_base_is_ancestor(path, &remote_ref, &local_ref)? {
-        let ahead = rev_list_count(path, &format!("origin/{trunk_branch}..{trunk_branch}"))?;
+        let ahead = rev_count(path, &format!("origin/{trunk_branch}..{trunk_branch}"))?;
         return Ok(MainStartRefSelection {
             ref_name: local_branch,
             fallback_reason: Some(format!("stale_origin_fallback ahead={ahead}")),
@@ -868,8 +825,8 @@ fn preferred_trunk_start_ref(path: &Path, trunk_branch: &str) -> Result<MainStar
         });
     }
 
-    let ahead = rev_list_count(path, &format!("origin/{trunk_branch}..{trunk_branch}"))?;
-    let origin_ahead = rev_list_count(path, &format!("{trunk_branch}..origin/{trunk_branch}"))?;
+    let ahead = rev_count(path, &format!("origin/{trunk_branch}..{trunk_branch}"))?;
+    let origin_ahead = rev_count(path, &format!("{trunk_branch}..origin/{trunk_branch}"))?;
     Ok(MainStartRefSelection {
         ref_name: local_branch,
         fallback_reason: Some(format!(
@@ -998,12 +955,11 @@ pub fn ensure_worktree_branch_for_dispatch_from_trunk(
             worktree_path.display()
         )
     })?;
-    crate::team::task_loop::log_worktree_mutation_audit(
+    ops::log_mutation_audit(
         worktree_path,
         "dispatch/branch-reset",
         "git checkout -B",
-        &crate::team::task_loop::current_worktree_user_change_paths(worktree_path)
-            .unwrap_or_default(),
+        &ops::dirty_paths(worktree_path, ops::ExcludePolicy::BattyRuntime).unwrap_or_default(),
     );
     let checkout = run_git(
         worktree_path,
@@ -1096,222 +1052,20 @@ pub fn reset_worktree_to_base_with_options_for_trunk(
     subsystem: &str,
     trunk_branch: &str,
 ) -> Result<WorktreeResetReason> {
-    let current_branch =
-        git_current_branch(worktree_path).unwrap_or_else(|_| base_branch.to_string());
-    let reason = prepare_worktree_for_reset(
+    ops::reset_to_base(
         worktree_path,
-        commit_message,
-        timeout,
-        preserve_failure_mode,
-        subsystem,
-    )?;
-    if !reason.reset_performed() {
-        return Ok(reason);
-    }
-    let already_archived_head =
-        reason == WorktreeResetReason::PreservedBeforeReset && current_branch == base_branch;
-    if already_archived_head {
-        let archived_branch = archive_preserved_base_branch_head(worktree_path, base_branch)?;
-        info!(
-            worktree = %worktree_path.display(),
-            base_branch,
-            archived_branch,
-            "archived preserved base-branch work before reset"
-        );
-    } else {
-        // #659: guard destructive `checkout -B <base_branch> <trunk>` by archiving
-        // any commits already on `base_branch` that are ahead of trunk. This
-        // covers the case where `base_branch` already had unmerged commits from
-        // a prior session (e.g. completed task work that hasn't been merged
-        // yet) and the branch ref is about to be rewritten to trunk.
-        archive_branch_if_commits_ahead_across_repos(
-            worktree_path,
-            base_branch,
-            trunk_branch,
+        base_branch,
+        trunk_branch,
+        &ops::ResetPolicy {
             subsystem,
-        )?;
-    }
-
-    checkout_base_branch_across_repos(worktree_path, base_branch, trunk_branch, subsystem)?;
-    Ok(reason)
-}
-
-pub(crate) fn prepare_worktree_for_reset(
-    worktree_path: &Path,
-    commit_message: &str,
-    timeout: Duration,
-    preserve_failure_mode: PreserveFailureMode,
-    subsystem: &str,
-) -> Result<WorktreeResetReason> {
-    if !worktree_path.exists() || !crate::team::task_loop::worktree_has_user_changes(worktree_path)?
-    {
-        let _ = run_git(worktree_path, ["merge", "--abort"]);
-        return Ok(WorktreeResetReason::CleanReset);
-    }
-
-    match crate::team::task_loop::preserve_worktree_with_commit_for(
-        worktree_path,
-        commit_message,
-        timeout,
-        subsystem,
-    ) {
-        Ok(true) => {
-            let _ = run_git(worktree_path, ["merge", "--abort"]);
-            return Ok(WorktreeResetReason::PreservedBeforeReset);
-        }
-        Ok(false) => {
-            let _ = run_git(worktree_path, ["merge", "--abort"]);
-            return Ok(WorktreeResetReason::CleanReset);
-        }
-        Err(error) => {
-            warn!(
-                worktree = %worktree_path.display(),
-                error = %error,
-                "failed to preserve worktree before reset"
-            );
-        }
-    }
-
-    if preserve_failure_mode == PreserveFailureMode::SkipReset {
-        return Ok(WorktreeResetReason::PreserveFailedResetSkipped);
-    }
-
-    // Never discard work without a saved copy: snapshot the dirty tree
-    // (tracked + untracked) to a ref first, and refuse to reset if that fails.
-    let snapshot_ref = snapshot_dirty_worktree_to_ref(worktree_path, subsystem)
-        .with_context(|| {
-            format!(
-                "refusing to force-reset {}: preserve failed and the dirty-tree snapshot also failed",
-                worktree_path.display()
-            )
-        })?;
-    warn!(
-        subsystem,
-        worktree = %worktree_path.display(),
-        snapshot_ref = %snapshot_ref,
-        "preserve commit failed; saved dirty worktree snapshot before force-reset"
-    );
-
-    let _ = run_git(worktree_path, ["merge", "--abort"]);
-    crate::team::task_loop::log_worktree_mutation_audit(
-        worktree_path,
-        subsystem,
-        "git reset --hard",
-        &crate::team::task_loop::current_worktree_user_change_paths(worktree_path)
-            .unwrap_or_default(),
-    );
-    let reset = run_git(worktree_path, ["reset", "--hard"])?;
-    if !reset.status.success() {
-        bail!(
-            "failed to force-reset worktree {}: {}",
-            worktree_path.display(),
-            String::from_utf8_lossy(&reset.stderr).trim()
-        );
-    }
-    let clean = run_git(worktree_path, ["clean", "-fd", "--exclude=.batty/"])?;
-    if !clean.status.success() {
-        bail!(
-            "failed to clean worktree {}: {}",
-            worktree_path.display(),
-            String::from_utf8_lossy(&clean.stderr).trim()
-        );
-    }
-
-    Ok(WorktreeResetReason::PreserveFailedForceReset)
-}
-
-/// Save every uncommitted change in `worktree_path` (staged, unstaged and
-/// untracked, minus ignored files and Batty runtime dirs) as a commit on a
-/// new `refs/heads/preserved/<branch>-snapshot-<stamp>` ref, without touching
-/// the real index, worktree or HEAD. Returns the created ref name.
-///
-/// Used before a forced reset when the normal preserve commit failed, so the
-/// reset can never be the only copy of the work.
-pub(crate) fn snapshot_dirty_worktree_to_ref(
-    worktree_path: &Path,
-    subsystem: &str,
-) -> Result<String> {
-    fn git_checked(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
-        let mut command = Command::new("git");
-        command.current_dir(dir).args(args);
-        if let Some(index) = index {
-            command.env("GIT_INDEX_FILE", index);
-        }
-        let output = command
-            .output()
-            .with_context(|| format!("failed to execute `git {}`", args.join(" ")))?;
-        if !output.status.success() {
-            bail!(
-                "`git {}` failed in {}: {}",
-                args.join(" "),
-                dir.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    let real_index = PathBuf::from(git_checked(
-        worktree_path,
-        None,
-        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
-    )?);
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp_index = real_index.with_file_name(format!(
-        "index.batty-snapshot-{}-{stamp}",
-        std::process::id()
-    ));
-    // Remove the temp index on every exit path.
-    struct RemoveOnDrop(PathBuf);
-    impl Drop for RemoveOnDrop {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _guard = RemoveOnDrop(temp_index.clone());
-    if real_index.exists() {
-        std::fs::copy(&real_index, &temp_index).with_context(|| {
-            format!("failed to copy index {} for snapshot", real_index.display())
-        })?;
-    }
-
-    let index = Some(temp_index.as_path());
-    git_checked(worktree_path, index, &["add", "-A"])?;
-    git_checked(
-        worktree_path,
-        index,
-        &["reset", "-q", "--", ".batty", ".cargo", ".batty-target"],
-    )?;
-    let tree = git_checked(worktree_path, index, &["write-tree"])?;
-    let head = git_checked(
-        worktree_path,
-        None,
-        &["rev-parse", "--verify", "-q", "HEAD"],
+            dirty: ops::DirtyPolicy::Preserve {
+                commit_message,
+                timeout,
+                on_failure: preserve_failure_mode,
+            },
+            archive_current_branch: false,
+        },
     )
-    .ok();
-    let branch = git_current_branch(worktree_path).unwrap_or_else(|_| "detached".to_string());
-    let message = format!("wip: batty snapshot before forced reset ({subsystem}) [{branch}]");
-
-    let mut commit_args: Vec<&str> =
-        crate::team::task_loop::fallback_identity_args(worktree_path).to_vec();
-    commit_args.extend(["commit-tree", tree.as_str(), "-m", message.as_str()]);
-    if let Some(head) = head.as_deref() {
-        commit_args.extend(["-p", head]);
-    }
-    let commit = git_checked(worktree_path, None, &commit_args)?;
-
-    let slug = branch.replace('/', "-");
-    let ref_name = format!("refs/heads/preserved/{slug}-snapshot-{stamp}");
-    // Empty old-value: create only, never overwrite an existing ref.
-    git_checked(
-        worktree_path,
-        None,
-        &["update-ref", "-m", "batty snapshot", &ref_name, &commit, ""],
-    )?;
-    Ok(ref_name)
 }
 
 #[cfg(test)]
@@ -1323,45 +1077,24 @@ pub fn reset_worktree_to_base_if_clean(
     reset_worktree_to_base_if_clean_from_trunk(worktree_path, base_branch, subsystem, "main")
 }
 
+/// Background reset that never touches a dirty lane: returns
+/// `PreserveFailedResetSkipped` when user changes are present.
 pub fn reset_worktree_to_base_if_clean_from_trunk(
     worktree_path: &Path,
     base_branch: &str,
     subsystem: &str,
     trunk_branch: &str,
 ) -> Result<WorktreeResetReason> {
-    let dirty_paths = crate::team::task_loop::current_worktree_user_change_paths(worktree_path)
-        .unwrap_or_default();
-    if !dirty_paths.is_empty() {
-        warn!(
-            subsystem,
-            worktree = %worktree_path.display(),
-            branch = %git_current_branch(worktree_path).unwrap_or_else(|_| "<detached-or-unavailable>".to_string()),
-            files = %dirty_paths.join(", "),
-            "skipping background worktree reset because the lane is dirty"
-        );
-        return Ok(WorktreeResetReason::PreserveFailedResetSkipped);
-    }
-
-    let _ = run_git(worktree_path, ["merge", "--abort"]);
-    // #659: archive commits ahead of trunk on `base_branch` before the
-    // destructive `checkout -B base_branch <trunk>` below.
-    archive_branch_if_commits_ahead_across_repos(
+    ops::reset_to_base(
         worktree_path,
         base_branch,
         trunk_branch,
-        subsystem,
-    )?;
-    checkout_base_branch_across_repos(worktree_path, base_branch, trunk_branch, subsystem)?;
-
-    Ok(WorktreeResetReason::CleanReset)
-}
-
-/// Abort any in-progress merge, rebase or cherry-pick. Each abort is a no-op
-/// when that operation is not in progress.
-pub(crate) fn abort_in_progress_git_operations(worktree_path: &Path) {
-    for op in ["merge", "rebase", "cherry-pick"] {
-        let _ = run_git(worktree_path, [op, "--abort"]);
-    }
+        &ops::ResetPolicy {
+            subsystem,
+            dirty: ops::DirtyPolicy::Refuse,
+            archive_current_branch: false,
+        },
+    )
 }
 
 /// Converging recovery for background health checks (merge-conflict and
@@ -1384,328 +1117,20 @@ pub(crate) fn recover_worktree_to_base_preserving(
         "wip: auto-save before {subsystem} [{}]",
         current_branch.as_deref().unwrap_or("detached")
     );
-    let reason = prepare_worktree_for_reset(
-        worktree_path,
-        &commit_message,
-        Duration::from_secs(5),
-        PreserveFailureMode::SkipReset,
-        subsystem,
-    )?;
-    if !reason.reset_performed() {
-        return Ok(reason);
-    }
-    match current_branch.as_deref() {
-        Some(branch) if branch != base_branch => {
-            // The current branch ref survives `checkout -B base`, but archive
-            // anyway so a later cleanup of that branch cannot drop the work.
-            archive_branch_if_commits_ahead(worktree_path, branch, trunk_branch, subsystem)?;
-        }
-        Some(_) => {}
-        None => {
-            if rev_list_count(worktree_path, &format!("{trunk_branch}..HEAD"))? > 0 {
-                archive_preserved_base_branch_head(worktree_path, "detached")?;
-            }
-        }
-    }
-    archive_branch_if_commits_ahead_across_repos(
+    ops::reset_to_base(
         worktree_path,
         base_branch,
         trunk_branch,
-        subsystem,
-    )?;
-    checkout_base_branch_across_repos(worktree_path, base_branch, trunk_branch, subsystem)?;
-    Ok(reason)
-}
-
-/// Self-heal a member worktree that is checked out on a branch other than
-/// `expected_branch` (another member's branch, a stale task branch, or a
-/// detached HEAD) before dispatching `expected_branch`.
-///
-/// Dirty work is auto-saved on the stray branch and the stray branch's
-/// commits ahead of trunk are archived to `preserved/...`. When the stray
-/// branch carries the same task id (e.g. `other-member/28` → `me/28`) and
-/// `expected_branch` does not exist yet, the expected branch is created from
-/// the stray HEAD so the work carries over. Returns the archive branch name
-/// when one was created. Fails (without touching branches) if dirty work
-/// cannot be preserved.
-pub(crate) fn heal_stray_task_branch(
-    worktree_path: &Path,
-    expected_branch: &str,
-    base_branch: &str,
-    trunk_branch: &str,
-) -> Result<Option<String>> {
-    let subsystem = "dispatch/stray-branch-heal";
-    let current_branch = git_current_branch(worktree_path).ok();
-    if current_branch
-        .as_deref()
-        .is_some_and(|branch| branch == expected_branch || branch == base_branch)
-    {
-        return Ok(None);
-    }
-    abort_in_progress_git_operations(worktree_path);
-    let label = current_branch.as_deref().unwrap_or("detached");
-    let reason = prepare_worktree_for_reset(
-        worktree_path,
-        &format!("wip: auto-save before switching to {expected_branch} [{label}]"),
-        Duration::from_secs(5),
-        PreserveFailureMode::SkipReset,
-        subsystem,
-    )?;
-    if !reason.reset_performed() {
-        bail!(
-            "worktree {} is on '{}' with dirty changes that could not be preserved; refusing to switch to '{}'",
-            worktree_path.display(),
-            label,
-            expected_branch
-        );
-    }
-
-    let archive = match current_branch.as_deref() {
-        Some(branch) => {
-            archive_branch_if_commits_ahead(worktree_path, branch, trunk_branch, subsystem)?
-        }
-        None if rev_list_count(worktree_path, &format!("{trunk_branch}..HEAD")).unwrap_or(0)
-            > 0 =>
-        {
-            Some(archive_preserved_base_branch_head(
-                worktree_path,
-                &format!("detached-{expected_branch}"),
-            )?)
-        }
-        None => None,
-    };
-
-    let task_suffix = |branch: &str| {
-        branch
-            .rsplit_once('/')
-            .map(|(_, suffix)| suffix.to_string())
-    };
-    let same_task = current_branch
-        .as_deref()
-        .and_then(task_suffix)
-        .is_some_and(|suffix| Some(suffix) == task_suffix(expected_branch));
-    if same_task && !ref_exists(worktree_path, &format!("refs/heads/{expected_branch}"))? {
-        crate::team::task_loop::log_worktree_mutation_audit(
-            worktree_path,
+        &ops::ResetPolicy {
             subsystem,
-            "git checkout -b",
-            &[],
-        );
-        let checkout = run_git(worktree_path, ["checkout", "-b", expected_branch])?;
-        if !checkout.status.success() {
-            bail!(
-                "failed to create '{}' from stray branch '{}' in {}: {}",
-                expected_branch,
-                label,
-                worktree_path.display(),
-                String::from_utf8_lossy(&checkout.stderr).trim()
-            );
-        }
-    }
-    info!(
-        worktree = %worktree_path.display(),
-        stray_branch = label,
-        expected_branch,
-        archive = archive.as_deref().unwrap_or("-"),
-        carried_over = same_task,
-        "healed worktree checked out on stray branch"
-    );
-    Ok(archive)
-}
-
-fn archive_preserved_base_branch_head(worktree_path: &Path, base_branch: &str) -> Result<String> {
-    let slug = base_branch.replace('/', "-");
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let branch = format!("preserved/{slug}-{stamp}");
-    let create = run_git(worktree_path, ["branch", branch.as_str(), "HEAD"])?;
-    if !create.status.success() {
-        bail!(
-            "failed to archive preserved work on '{}' in {}: {}",
-            branch,
-            worktree_path.display(),
-            String::from_utf8_lossy(&create.stderr).trim()
-        );
-    }
-    Ok(branch)
-}
-
-/// Iterate sub-repos (or the single repo at `worktree_path`) and archive any
-/// commits on `base_branch` that are ahead of each repo's default branch
-/// before a destructive `checkout -B`. Any archive failure is returned so the
-/// caller aborts the reset instead of rewriting a branch it could not save.
-///
-/// In multi-repo mode (worktree root is not a git repo), each sub-repo is
-/// processed independently. The default branch is resolved per-repo so
-/// repos with different conventions (mainline vs main) are both handled.
-fn archive_branch_if_commits_ahead_across_repos(
-    worktree_path: &Path,
-    base_branch: &str,
-    trunk_branch: &str,
-    subsystem: &str,
-) -> Result<()> {
-    for repo in iter_repos_for_mutation(worktree_path) {
-        let base_ref = effective_trunk_branch_for_repo(&repo, trunk_branch);
-        archive_branch_if_commits_ahead(&repo, base_branch, &base_ref, subsystem).with_context(
-            || {
-                format!(
-                    "aborting reset of '{}' in {}: could not archive its commits",
-                    base_branch,
-                    repo.display()
-                )
+            dirty: ops::DirtyPolicy::Preserve {
+                commit_message: &commit_message,
+                timeout: Duration::from_secs(5),
+                on_failure: PreserveFailureMode::SkipReset,
             },
-        )?;
-    }
-    Ok(())
-}
-
-/// Run `git checkout -B <base_branch> <default>` in each sub-repo (or the
-/// single repo at `worktree_path`). Multi-repo-aware replacement for the
-/// historic hardcoded `run_git(worktree_path, ["checkout", "-B", base_branch, "main"])`.
-///
-/// Failure modes:
-/// - Multi-repo with no sub-repos at all: returns Ok (nothing to do). Old
-///   code would have bailed with `fatal: not a git repository` here; the new
-///   behavior is a no-op consistent with an empty workspace.
-/// - Single-repo or per-sub-repo checkout failure: bails with the same
-///   "failed to recreate '<branch>' from '<default>' in <path>: <stderr>"
-///   shape as the legacy error (just with the resolved default branch name
-///   instead of hardcoded "main").
-fn checkout_base_branch_across_repos(
-    worktree_path: &Path,
-    base_branch: &str,
-    trunk_branch: &str,
-    subsystem: &str,
-) -> Result<()> {
-    let dirty_paths = crate::team::task_loop::current_worktree_user_change_paths(worktree_path)
-        .unwrap_or_default();
-    let repos = iter_repos_for_mutation(worktree_path);
-    if repos.is_empty() {
-        // Multi-repo container with zero sub-repos: nothing to check out. This
-        // is the exact shape that used to emit `fatal: not a git repository`
-        // and block the lane. Treat it as a no-op and let higher layers decide.
-        info!(
-            subsystem,
-            worktree = %worktree_path.display(),
-            "skipping checkout -B: no git repos found at worktree root or in immediate sub-dirs"
-        );
-        return Ok(());
-    }
-    for repo in repos {
-        let start = effective_trunk_branch_for_repo(&repo, trunk_branch);
-        crate::team::task_loop::log_worktree_mutation_audit(
-            &repo,
-            subsystem,
-            "git checkout -B",
-            &dirty_paths,
-        );
-        let checkout = run_git(&repo, ["checkout", "-B", base_branch, &start])?;
-        if !checkout.status.success() {
-            bail!(
-                "failed to recreate '{}' from '{}' in {}: {}",
-                base_branch,
-                start,
-                repo.display(),
-                String::from_utf8_lossy(&checkout.stderr).trim()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn effective_trunk_branch_for_repo(repo: &Path, trunk_branch: &str) -> String {
-    if trunk_branch == "main" {
-        crate::team::git_cmd::default_branch_name(repo).unwrap_or_else(|| "main".to_string())
-    } else {
-        trunk_branch.to_string()
-    }
-}
-
-/// Enumerate the set of repos to mutate for a worktree path. Returns
-/// `[worktree_path]` for single-repo worktrees, or the immediate sub-repos
-/// discovered by `git_cmd::discover_sub_repos` for multi-repo worktrees.
-/// Returns empty when the path is neither a git repo nor a container with
-/// git sub-repos — callers decide how to handle that (usually a no-op).
-fn iter_repos_for_mutation(worktree_path: &Path) -> Vec<PathBuf> {
-    if crate::team::git_cmd::is_git_repo(worktree_path) {
-        vec![worktree_path.to_path_buf()]
-    } else {
-        crate::team::git_cmd::discover_sub_repos(worktree_path)
-    }
-}
-
-/// Archive a branch to `preserved/<slug>-<timestamp>` if it has commits ahead
-/// of `base_ref`. Returns `Ok(None)` when the branch is missing or has no
-/// commits ahead; otherwise returns `Ok(Some(<archive_branch>))`.
-///
-/// Used to preserve engineer work before any destructive `git checkout -B
-/// <branch> <base>` that would rewrite the branch ref. See issue #659.
-pub(crate) fn archive_branch_if_commits_ahead(
-    worktree_path: &Path,
-    branch_name: &str,
-    base_ref: &str,
-    subsystem: &str,
-) -> Result<Option<String>> {
-    if !ref_exists(worktree_path, &format!("refs/heads/{branch_name}"))? {
-        return Ok(None);
-    }
-    let range = format!("{base_ref}..{branch_name}");
-    // Fail closed: if we cannot tell whether the branch carries unmerged
-    // commits, the caller must not rewrite it.
-    let ahead = rev_list_count(worktree_path, range.as_str()).with_context(|| {
-        format!(
-            "failed to count commits on '{}' ahead of '{}' in {} before archiving",
-            branch_name,
-            base_ref,
-            worktree_path.display()
-        )
-    })?;
-    if ahead == 0 {
-        return Ok(None);
-    }
-    let slug = branch_name.replace('/', "-");
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut archive_branch = format!("preserved/{slug}-{stamp}");
-    let mut suffix: u32 = 0;
-    while ref_exists(worktree_path, &format!("refs/heads/{archive_branch}"))? {
-        suffix += 1;
-        archive_branch = format!("preserved/{slug}-{stamp}-{suffix}");
-        if suffix > 100 {
-            bail!(
-                "exhausted preserve-branch suffixes for '{}' in {}",
-                branch_name,
-                worktree_path.display()
-            );
-        }
-    }
-    let create = run_git(
-        worktree_path,
-        ["branch", archive_branch.as_str(), branch_name],
-    )?;
-    if !create.status.success() {
-        bail!(
-            "failed to archive branch '{}' as '{}' in {}: {}",
-            branch_name,
-            archive_branch,
-            worktree_path.display(),
-            String::from_utf8_lossy(&create.stderr).trim()
-        );
-    }
-    info!(
-        subsystem,
-        worktree = %worktree_path.display(),
-        branch = branch_name,
-        base_ref,
-        commits_ahead = ahead,
-        archive = %archive_branch,
-        "archived branch commits ahead of base before destructive reset (#659)"
-    );
-    Ok(Some(archive_branch))
+            archive_current_branch: true,
+        },
+    )
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
