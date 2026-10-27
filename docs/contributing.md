@@ -20,7 +20,6 @@ Site URL (default): <http://127.0.0.1:8000>
 Generated files:
 
 - `docs/reference/cli.md`
-- `docs/reference/config.md`
 
 Generation is deterministic; rerunning should not change output unless CLI/config source changed.
 

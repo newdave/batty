@@ -20,13 +20,13 @@ Default windows and thresholds:
 
 ## Customization
 
-To tune an alert, edit both of these sections in [`stall-detection.yaml`](/Users/zedmor/batty/.batty/worktrees/eng-1-2/grafana/provisioning/alerting/stall-detection.yaml):
+To tune an alert, edit both of these sections in [`stall-detection.yaml`](https://github.com/battysh/batty/blob/main/grafana/provisioning/alerting/stall-detection.yaml):
 
 - `relativeTimeRange.from`: lookback window in seconds.
 - `model.conditions[0].evaluator.params[0]`: numeric threshold.
 - `for`: how long Grafana keeps the condition firing before notifying.
 
-Notification routing lives in [`notification-channels.yaml`](/Users/zedmor/batty/.batty/worktrees/eng-1-2/grafana/provisioning/alerting/notification-channels.yaml). By default, alerts go to the local orchestrator log webhook at `http://127.0.0.1:8787/grafana-alerts`.
+Notification routing lives in [`notification-channels.yaml`](https://github.com/battysh/batty/blob/main/grafana/provisioning/alerting/notification-channels.yaml). By default, alerts go to the local orchestrator log webhook at `http://127.0.0.1:8787/grafana-alerts`.
 
 Telegram is intentionally left as an opt-in example. Uncomment the `batty-telegram` contact point and the `routes` block, then set:
 

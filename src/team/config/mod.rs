@@ -221,9 +221,36 @@ impl TeamConfig {
     /// serialized by serde (so it cannot drift from the struct), plus the
     /// config path and resolved member count. Secrets are skipped by serde.
     pub fn to_inspection_json(&self, config_path: &Path, members: usize) -> Result<String> {
+        // Legacy top-level keys (upstream 5637f78) stay for script compatibility;
+        // `schema_version` and the full `config` object are the new surface.
         let output = serde_json::json!({
+            "schema_version": 2,
             "config_path": config_path.display().to_string(),
+            "team": self.name,
+            "roles": self.roles.len(),
             "members": members,
+            "board": {
+                "rotation_threshold": self.board.rotation_threshold,
+                "auto_dispatch": self.board.auto_dispatch,
+            },
+            "standup": {
+                "interval_secs": self.standup.interval_secs,
+                "output_lines": self.standup.output_lines,
+            },
+            "automation": {
+                "timeout_nudges": self.automation.timeout_nudges,
+                "standups": self.automation.standups,
+                "failure_pattern_detection": self.automation.failure_pattern_detection,
+                "triage_interventions": self.automation.triage_interventions,
+                "review_interventions": self.automation.review_interventions,
+                "owned_task_interventions": self.automation.owned_task_interventions,
+                "manager_dispatch_interventions": self.automation.manager_dispatch_interventions,
+                "architect_utilization_interventions": self.automation.architect_utilization_interventions,
+            },
+            "workflow": {
+                "mode": self.workflow_mode.as_str(),
+                "orchestrator_pane": self.orchestrator_pane,
+            },
             "config": self,
         });
         Ok(serde_json::to_string_pretty(&output)?)

@@ -1,8 +1,7 @@
 # Team Config Reference
 
 This page documents the human-edited `team.yaml` surface under
-`.batty/team_config/`. For lower-level runtime defaults in `.batty/config.toml`,
-see [reference/config.md](reference/config.md).
+`.batty/team_config/`.
 
 ## Complete Example
 
@@ -237,6 +236,16 @@ Common fields:
 - `nudge_interval_secs`, `receives_standup`, `standup_interval_secs`
 - `provider_overlay` and `instance_overrides` for per-member specialization
 - `auth_mode` / `auth_env` when a backend needs explicit auth posture
+
+### openclaw provider compatibility
+
+With `provider: openclaw` and no bot token, Batty runs
+`openclaw message send --channel telegram --target <id> --message <text>`.
+If the provider rejects `--channel` or `--target` (`unknown option`), Batty retries
+once with the legacy `--to <id>` form and uses that form for the rest of the run.
+The `--target` form was verified against openclaw 2026.5.26; the exact first
+release that introduced it is not documented. `batty validate` warns (never errors)
+when `<provider> --version` reports something older than 2026.5.26.
 
 ## Recommended Defaults For Unattended Teams
 

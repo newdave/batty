@@ -32,7 +32,7 @@ Contributor-facing map of Batty source modules.
 | `src/worktree.rs`       | Git worktree creation, reuse, sync, and cleanup helpers.                  |
 | `src/task/mod.rs`       | Task parsing utilities for kanban-backed work items.                      |
 | `src/paths.rs`          | Shared filesystem path helpers under `.batty/`.                           |
-| `src/bin/docsgen.rs`    | Generator for `docs/reference/cli.md` and `docs/reference/config.md`.     |
+| `src/bin/docsgen.rs`    | Generator for `docs/reference/cli.md`.                                    |
 
 ## Key Traits and Types
 

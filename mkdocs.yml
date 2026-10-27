@@ -19,9 +19,9 @@ nav:
   - Demo: demo.md
   - Getting Started: getting-started.md
   - Workflow Migration: workflow-migration.md
+  - Team Config Reference: config-reference.md
   - Reference:
       - CLI Reference: reference/cli.md
-      - Runtime Config: reference/config.md
       - Agent Efficiency: reference/agent-efficiency.md
       - Codex: reference/codex.md
       - Environment Variables: reference/environment-variables.md

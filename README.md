@@ -371,7 +371,6 @@ Pre-configured alerts:
 - [CLI Reference](docs/cli-reference.md)
 - [Team Config Reference](docs/config-reference.md)
 - [Generated CLI Reference](docs/reference/cli.md)
-- [Runtime Config Reference](docs/reference/config.md)
 - [Module Reference](docs/reference/modules.md)
 - [Scheduled Tasks & Cron](docs/scheduled-tasks.md)
 - [Intervention System](docs/interventions.md)

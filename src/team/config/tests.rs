@@ -105,6 +105,33 @@ fn inspection_json_serializes_resolved_config_without_secrets() {
     assert!(value["config"]["workflow_policy"].is_object());
 }
 
+/// Fixture mirrors the keys and shape printed by upstream 5637f78
+/// `batty config --json`, so scripts written against it keep working.
+#[test]
+fn inspection_json_keeps_legacy_keys_and_adds_schema_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("team.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            "{}\nboard:\n  rotation_threshold: 7\n  auto_dispatch: false\nstandup:\n  interval_secs: 123\n  output_lines: 17\nautomation:\n  timeout_nudges: false\n  standups: false\n  failure_pattern_detection: false\n  triage_interventions: false\n  review_interventions: false\n  owned_task_interventions: false\n  manager_dispatch_interventions: false\n  architect_utilization_interventions: false\nworkflow_mode: hybrid\norchestrator_pane: false\n",
+            minimal_yaml()
+        ),
+    )
+    .unwrap();
+    let config = TeamConfig::load_existing(&path).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(&config.to_inspection_json(&path, 5).unwrap()).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/legacy_config_inspection.json")).unwrap();
+    for (key, expected) in fixture.as_object().unwrap() {
+        assert_eq!(&value[key], expected, "legacy key `{key}` changed");
+    }
+    assert_eq!(value["schema_version"], 2);
+    assert!(value["config_path"].is_string());
+    assert_eq!(value["config"]["name"], "test-team");
+}
+
 #[test]
 fn inspection_json_omits_telegram_bot_token() {
     let channel = ChannelConfig {

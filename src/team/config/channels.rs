@@ -12,6 +12,11 @@ use super::{RoleType, TeamConfig};
 pub const KNOWN_CHANNELS: &[&str] = &["telegram", "discord"];
 
 const TELEGRAM_TOKEN_ENV: &str = "BATTY_TELEGRAM_BOT_TOKEN";
+/// Oldest openclaw release known to accept `--target`/`--channel` (last
+/// verified against 2026.5.26). Older providers still work through batty's
+/// legacy `--to` fallback, so validate only warns.
+pub const MIN_OPENCLAW_VERSION: &str = "2026.5.26";
+
 const DISCORD_TOKEN_ENV: &str = "BATTY_DISCORD_BOT_TOKEN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +55,26 @@ fn find_binary(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Extract the first dotted numeric version (e.g. `2026.5.26`) from `--version` output.
+fn parse_version(text: &str) -> Option<Vec<u64>> {
+    text.split_whitespace().find_map(|word| {
+        let word = word.trim_start_matches('v');
+        let parts: Option<Vec<u64>> = word.split('.').map(|p| p.parse().ok()).collect();
+        parts.filter(|p| p.len() >= 2)
+    })
+}
+
+/// Run `<provider> --version`; `None` when it fails or prints nothing.
+fn provider_version_output(path: &Path) -> Option<String> {
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn env_token_present(var: &str) -> bool {
     std::env::var(var).is_ok_and(|value| !value.trim().is_empty())
 }
@@ -57,13 +82,14 @@ fn env_token_present(var: &str) -> bool {
 impl TeamConfig {
     /// Check every role that configures a channel.
     pub fn channel_checks(&self) -> Vec<ChannelCheck> {
-        self.channel_checks_with(&find_binary, &env_token_present)
+        self.channel_checks_with(&find_binary, &env_token_present, &provider_version_output)
     }
 
     fn channel_checks_with(
         &self,
         find_binary: &dyn Fn(&str) -> Option<PathBuf>,
         env_present: &dyn Fn(&str) -> bool,
+        provider_version: &dyn Fn(&Path) -> Option<String>,
     ) -> Vec<ChannelCheck> {
         use ChannelCheckLevel::{Error, Pass, Warn};
 
@@ -134,12 +160,26 @@ impl TeamConfig {
                         ));
                     } else {
                         match find_binary(provider) {
-                            Some(path) => checks.push(ChannelCheck::new(
-                                name,
-                                "credentials",
-                                Pass,
-                                format!("role '{name}' telegram has no bot token; will use CLI provider '{provider}' at {}", path.display()),
-                            )),
+                            Some(path) => {
+                                checks.push(ChannelCheck::new(
+                                    name,
+                                    "credentials",
+                                    Pass,
+                                    format!("role '{name}' telegram has no bot token; will use CLI provider '{provider}' at {}", path.display()),
+                                ));
+                                let found = provider_version(&path).and_then(|v| parse_version(&v));
+                                let minimum = parse_version(MIN_OPENCLAW_VERSION);
+                                if let (Some(found), Some(minimum)) = (found, minimum)
+                                    && found < minimum
+                                {
+                                    checks.push(ChannelCheck::new(
+                                        name,
+                                        "provider_version",
+                                        Warn,
+                                        format!("role '{name}' telegram provider '{provider}' is older than {MIN_OPENCLAW_VERSION}; batty will fall back to the legacy `--to` argument form"),
+                                    ));
+                                }
+                            }
                             None => checks.push(ChannelCheck::new(
                                 name,
                                 "credentials",
@@ -246,11 +286,53 @@ mod tests {
     }
 
     fn run(config: &TeamConfig, bin: Option<&str>, env: bool) -> Vec<ChannelCheck> {
-        config.channel_checks_with(&|_| bin.map(PathBuf::from), &|_| env)
+        config.channel_checks_with(&|_| bin.map(PathBuf::from), &|_| env, &|_| None)
     }
 
     fn levels(checks: &[ChannelCheck]) -> Vec<ChannelCheckLevel> {
         checks.iter().map(|c| c.level).collect()
+    }
+
+    fn run_versioned(config: &TeamConfig, version: &str) -> Vec<ChannelCheck> {
+        let version = version.to_string();
+        config.channel_checks_with(
+            &|_| Some(PathBuf::from("/bin/provider")),
+            &|_| false,
+            &|_| Some(version.clone()),
+        )
+    }
+
+    #[test]
+    fn parse_version_extracts_dotted_numbers() {
+        assert_eq!(
+            parse_version("OpenClaw 2026.5.26 (10ad3aa)"),
+            Some(vec![2026, 5, 26])
+        );
+        assert_eq!(parse_version("v1.2"), Some(vec![1, 2]));
+        assert_eq!(parse_version("no version here"), None);
+        assert_eq!(parse_version("7"), None);
+    }
+
+    #[test]
+    fn old_openclaw_version_warns_but_current_does_not() {
+        let config = team(Some("telegram"), Some(cc("1", "openclaw", None)));
+        let old = run_versioned(&config, "OpenClaw 2025.1.3 (abc)");
+        assert!(
+            old.iter()
+                .any(|c| c.level == ChannelCheckLevel::Warn && c.detail.contains("legacy `--to`")),
+            "{old:?}"
+        );
+        assert!(!old.iter().any(|c| c.level == ChannelCheckLevel::Error));
+
+        let current = run_versioned(&config, "OpenClaw 2026.5.26 (abc)");
+        assert!(!current.iter().any(|c| c.detail.contains("legacy `--to`")));
+
+        let unparseable = run_versioned(&config, "garbage");
+        assert!(
+            !unparseable
+                .iter()
+                .any(|c| c.detail.contains("legacy `--to`"))
+        );
     }
 
     #[test]

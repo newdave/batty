@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
@@ -153,6 +154,9 @@ pub struct TelegramChannel {
     provider: String,
     recent_sends: RecentTelegramSends,
     backoff: SendBackoff,
+    /// Set once the provider has rejected `--channel`/`--target`; later sends
+    /// go straight to the legacy `--to` form.
+    use_legacy_args: AtomicBool,
 }
 
 impl TelegramChannel {
@@ -180,6 +184,7 @@ impl TelegramChannel {
             provider,
             recent_sends: RecentTelegramSends::new(ttl, capacity),
             backoff: SendBackoff::default(),
+            use_legacy_args: AtomicBool::new(false),
         }
     }
 }
@@ -209,9 +214,31 @@ impl TelegramChannel {
     ) -> std::result::Result<(), DeliveryError> {
         debug!(target = %self.target, provider = %self.provider, len = message.len(), "sending via telegram channel");
 
-        let output = std::process::Command::new(&self.provider)
-            .args(provider_send_args(&self.target, message))
-            .output();
+        let run = |legacy: bool| {
+            let args: Vec<&str> = if legacy {
+                provider_send_args_legacy(&self.target, message).to_vec()
+            } else {
+                provider_send_args(&self.target, message).to_vec()
+            };
+            std::process::Command::new(&self.provider)
+                .args(args)
+                .output()
+        };
+
+        let legacy = self.use_legacy_args.load(Ordering::Relaxed);
+        let mut output = run(legacy);
+        if !legacy
+            && let Ok(out) = &output
+            && !out.status.success()
+            && is_unknown_modern_flag(&String::from_utf8_lossy(&out.stderr))
+        {
+            debug!(provider = %self.provider, "provider rejected --target; retrying with legacy --to form");
+            let retry = run(true);
+            if matches!(&retry, Ok(out) if out.status.success()) {
+                self.use_legacy_args.store(true, Ordering::Relaxed);
+            }
+            output = retry;
+        }
 
         match output {
             Ok(out) if out.status.success() => {
@@ -250,6 +277,19 @@ fn provider_send_args<'a>(target: &'a str, message: &'a str) -> [&'a str; 8] {
         "--message",
         message,
     ]
+}
+
+/// Legacy openclaw contract (`--to <target>` and no `--channel`).
+fn provider_send_args_legacy<'a>(target: &'a str, message: &'a str) -> [&'a str; 6] {
+    ["message", "send", "--to", target, "--message", message]
+}
+
+/// True when stderr says the provider does not know `--channel` or `--target`.
+fn is_unknown_modern_flag(stderr: &str) -> bool {
+    ["--channel", "--target"].iter().any(|flag| {
+        stderr.contains(&format!("unknown option '{flag}'"))
+            || stderr.contains(&format!("unknown option \"{flag}\""))
+    })
 }
 
 /// Native Telegram channel using the Bot API directly (no CLI provider).
@@ -630,6 +670,68 @@ mod tests {
             ]
         );
         assert!(!args.contains(&"--to"));
+    }
+
+    /// Fake provider that rejects `--target` like an old openclaw would.
+    fn write_legacy_only_provider(dir: &std::path::Path, log_path: &std::path::Path) -> String {
+        let script_path = dir.join("legacy-provider.sh");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *--target*|*--channel*) echo \"error: unknown option '--target'\" >&2; exit 1;;\nesac\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script_path.display().to_string()
+    }
+
+    #[test]
+    fn telegram_send_falls_back_to_legacy_to_flag_and_remembers_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("provider.log");
+        let provider = write_legacy_only_provider(tmp.path(), &log_path);
+        let ch = TelegramChannel::new("12345".into(), provider);
+
+        ch.send("one").unwrap();
+        ch.send("two").unwrap();
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "message send --channel telegram --target 12345 --message one",
+                "message send --to 12345 --message one",
+                "message send --to 12345 --message two",
+            ],
+            "second send must skip the modern form"
+        );
+    }
+
+    #[test]
+    fn telegram_send_does_not_retry_on_unrelated_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("provider.log");
+        let provider = write_fake_provider(tmp.path(), &log_path, 1);
+        let ch = TelegramChannel::new("12345".into(), provider);
+        assert!(ch.send("x").is_err());
+        assert_eq!(fs::read_to_string(&log_path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn unknown_flag_detection_matches_channel_and_target_only() {
+        assert!(is_unknown_modern_flag("error: unknown option '--target'"));
+        assert!(is_unknown_modern_flag(
+            "error: unknown option '--channel'\n"
+        ));
+        assert!(!is_unknown_modern_flag("error: unknown option '--to'"));
+        assert!(!is_unknown_modern_flag("network unreachable"));
     }
 
     #[test]

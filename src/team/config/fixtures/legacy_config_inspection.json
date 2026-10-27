@@ -1,0 +1,27 @@
+{
+  "team": "test-team",
+  "roles": 3,
+  "members": 5,
+  "board": {
+    "rotation_threshold": 7,
+    "auto_dispatch": false
+  },
+  "standup": {
+    "interval_secs": 123,
+    "output_lines": 17
+  },
+  "automation": {
+    "timeout_nudges": false,
+    "standups": false,
+    "failure_pattern_detection": false,
+    "triage_interventions": false,
+    "review_interventions": false,
+    "owned_task_interventions": false,
+    "manager_dispatch_interventions": false,
+    "architect_utilization_interventions": false
+  },
+  "workflow": {
+    "mode": "hybrid",
+    "orchestrator_pane": false
+  }
+}

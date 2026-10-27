@@ -304,4 +304,4 @@ jobs:
         run: mkdocs build --strict
 
       - name: Verify generated docs are committed
-        run: git diff --exit-code -- docs/reference/cli.md docs/reference/config.md
+        run: git diff --exit-code -- docs/reference/cli.md
