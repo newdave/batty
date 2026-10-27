@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 
 use super::dispatch::DispatchQueueEntry;
+use super::merge_queue::PersistedMergeQueue;
 use super::{TeamDaemon, now_unix, standup};
 use crate::team::standup::MemberState;
 
@@ -75,7 +76,7 @@ impl<'de> Deserialize<'de> for PersistedReleaseRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(super) struct PersistedDaemonState {
     pub clean_shutdown: bool,
     pub saved_at: u64,
@@ -123,6 +124,11 @@ pub(super) struct PersistedDaemonState {
     /// queued to re-run when the daemon stopped; re-run after restart.
     #[serde(default)]
     pub pending_verifications: HashMap<String, u32>,
+    /// Queued merges and the merge awaiting post-merge verification, so a
+    /// crash or restart neither drops queued work nor leaves an unverified
+    /// merge on trunk.
+    #[serde(default)]
+    pub merge_queue: PersistedMergeQueue,
 }
 
 impl TeamDaemon {
@@ -170,6 +176,7 @@ impl TeamDaemon {
         }
         self.pipeline_starvation_fired = state.pipeline_starvation_fired;
         self.background_tests.retriggers = state.pending_verifications;
+        self.merge_queue.restore(state.merge_queue);
         self.restore_optional_subsystem_budget_state(
             &state.optional_subsystem_backoff,
             &state.optional_subsystem_disabled_remaining_secs,
@@ -295,6 +302,7 @@ impl TeamDaemon {
                 })
                 .collect(),
             pending_verifications: self.background_tests.pending_verifications(),
+            merge_queue: self.merge_queue.snapshot(),
         };
         save_daemon_state(&self.config.project_root, &state)
     }

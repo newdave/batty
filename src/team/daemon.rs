@@ -1019,6 +1019,11 @@ impl TeamDaemon {
         if !policy.enabled {
             return Ok(());
         }
+        // Post-merge verification runs on the root checkout; a concurrent
+        // smoke run would test (and race) the same tree. Run once it is done.
+        if self.merge_queue.is_verifying() {
+            return Ok(());
+        }
 
         let interval = Duration::from_secs(policy.interval_secs);
         if self.last_main_smoke_check.elapsed() < interval {
@@ -1681,7 +1686,20 @@ impl TeamDaemon {
 
     #[cfg(test)]
     pub(crate) fn process_merge_queue_for_test(&mut self) -> Result<()> {
-        self.process_merge_queue()
+        // Post-merge verification runs in the background; poll until the
+        // merge it started has been finalized or reverted.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            self.process_merge_queue()?;
+            if !self.merge_queue.is_verifying() {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "post-merge verification did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     pub(super) fn increment_retry(&mut self, engineer: &str) -> u32 {

@@ -42,6 +42,10 @@ impl TeamDaemon {
         self.spawn_all_agents(resume)?;
         if resume {
             self.restore_runtime_state();
+        } else {
+            // Queued merges and a landed-but-unverified merge survive even a
+            // fresh start; the rest of the runtime state does not.
+            self.restore_merge_queue_state();
         }
         // After a hot-reload, agents are freshly spawned and have no memory of
         // their prior tasks. Clear active_tasks so the board becomes the source

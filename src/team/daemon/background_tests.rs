@@ -153,6 +153,14 @@ impl TeamDaemon {
                 .retriggers
                 .insert(engineer, job.task_id());
         }
+        // A merge that already landed keeps its in-flight record (persisted
+        // by the caller); its verification re-runs after restart.
+        if let Some(task_id) = self.merge_queue.suspend_in_flight() {
+            info!(
+                task_id,
+                "stopping post-merge verification; it will re-run after restart"
+            );
+        }
         if let Some(smoke) = self.background_tests.main_smoke.take() {
             info!(command = %smoke.command, "stopping background main smoke check");
             smoke.job.kill();

@@ -1,90 +1,174 @@
 //! File-based merge lock and merge outcome types.
 //!
-//! `MergeLock` serializes concurrent merge attempts using an O_EXCL lock file
-//! that records the holder's PID, so a lock left by a killed process can be
-//! detected and reclaimed.
+//! `MergeLock` serializes merge attempts with an advisory `flock` on
+//! `.batty/merge.lock`. The kernel releases the lock when the holder exits,
+//! so a lock left by a killed process never needs reclaiming, and two
+//! waiters can never both "reclaim" a stale lock and end up as concurrent
+//! holders. The file is never deleted while in use (deleting a locked file
+//! lets a later opener lock a fresh inode alongside the old holder); it is
+//! only truncated on release. The holder's PID is written into the file for
+//! diagnostics and for `merge_lock_is_held` callers in other processes.
 //! `MergeOutcome` encodes the three possible results of a merge attempt.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
-use tracing::warn;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
-/// A lock file with no readable PID is only treated as stale once it is this
-/// old, so a holder that has created the file but not yet written its PID is
-/// not mistaken for a dead one.
+/// A non-empty lock file without a readable PID (written by an older batty
+/// or another tool) is treated as held until it is this old.
 const UNOWNED_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
+/// How long the blocking [`MergeLock::acquire`] waits before giving up.
+const BLOCKING_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(crate) struct MergeLock {
-    path: PathBuf,
+    // Keeping the file open keeps the flock; dropping it releases the lock.
+    file: File,
 }
 
 pub(crate) fn merge_lock_path(project_root: &Path) -> PathBuf {
     project_root.join(".batty").join("merge.lock")
 }
 
-/// True if a merge lock exists and its holder still appears to be alive.
+/// True if a merge lock is currently held: either some open file holds the
+/// flock, or the file carries a holder marker that still looks live (a PID
+/// of a running process, or an unparseable marker younger than 30s).
 pub(crate) fn merge_lock_is_held(project_root: &Path) -> bool {
     let path = merge_lock_path(project_root);
-    path.exists() && !merge_lock_is_stale(&path)
+    let Ok(file) = OpenOptions::new().read(true).open(&path) else {
+        return false;
+    };
+    match try_flock(&file, false) {
+        Ok(true) => unlock(&file),
+        Ok(false) => return true,
+        Err(_) => {}
+    }
+    legacy_marker_is_live(&path)
 }
 
-fn merge_lock_is_stale(path: &Path) -> bool {
-    let holder = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|content| content.trim().parse::<u32>().ok())
-        .filter(|pid| *pid > 0);
-    match holder {
-        Some(pid) => !crate::team::daemon_mgmt::process_exists(pid),
+fn legacy_marker_is_live(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let content = content.trim();
+    if content.is_empty() {
+        return false;
+    }
+    match content.parse::<u32>().ok().filter(|pid| *pid > 0) {
+        Some(pid) => crate::team::daemon_mgmt::process_exists(pid),
         None => std::fs::metadata(path)
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > UNOWNED_LOCK_STALE_AFTER),
+            .is_none_or(|age| age <= UNOWNED_LOCK_STALE_AFTER),
     }
 }
 
+/// Try to take the advisory lock without blocking. `Ok(false)` means another
+/// open file description holds it.
+#[cfg(unix)]
+fn try_flock(file: &File, exclusive: bool) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let mode = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    loop {
+        // SAFETY: flock on a valid file descriptor owned by `file`.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(code) if code == libc::EWOULDBLOCK => return Ok(false),
+            Some(libc::EINTR) => continue,
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unlock(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: flock on a valid file descriptor owned by `file`.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+#[cfg(not(unix))]
+fn try_flock(_file: &File, _exclusive: bool) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn unlock(_file: &File) {}
+
 impl MergeLock {
-    pub fn acquire(project_root: &Path) -> Result<Self> {
+    /// Take the merge lock if it is free. Returns `Ok(None)` when another
+    /// holder has it; poll-loop callers retry on a later tick instead of
+    /// blocking the daemon.
+    pub(crate) fn try_acquire(project_root: &Path) -> Result<Option<Self>> {
         let path = merge_lock_path(project_root);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open merge lock {}", path.display()))?;
+        if !try_flock(&file, true)
+            .with_context(|| format!("failed to lock merge lock {}", path.display()))?
+        {
+            return Ok(None);
+        }
+        // We hold the lock: replace any marker left by a dead holder.
+        file.set_len(0)?;
+        writeln!(file, "{}", std::process::id())?;
+        file.flush()?;
+        Ok(Some(Self { file }))
+    }
+
+    /// Blocking acquire (up to 60s) for one-shot callers outside the
+    /// daemon's merge queue.
+    pub fn acquire(project_root: &Path) -> Result<Self> {
         let start = std::time::Instant::now();
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    let lock = Self { path };
-                    writeln!(file, "{}", std::process::id())?;
-                    return Ok(lock);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if merge_lock_is_stale(&path) {
-                        warn!(path = %path.display(), "removing stale merge lock left by a dead process");
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    if start.elapsed() > Duration::from_secs(60) {
-                        bail!("merge lock timeout after 60s: {}", path.display());
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                Err(error) => bail!("failed to acquire merge lock: {error}"),
+            if let Some(lock) = Self::try_acquire(project_root)? {
+                return Ok(lock);
             }
+            if start.elapsed() > BLOCKING_ACQUIRE_TIMEOUT {
+                bail!(
+                    "merge lock timeout after 60s: {}",
+                    merge_lock_path(project_root).display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 }
 
 impl Drop for MergeLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Clear the PID marker while still holding the lock; closing the
+        // file releases it. Never unlink: see the module docs.
+        let _ = self.file.set_len(0);
+        unlock(&self.file);
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum MergeMode {
     DirectRoot,
     IsolatedIntegration,
@@ -125,6 +209,11 @@ pub(crate) enum MergeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::thread;
 
     #[test]
     fn merge_lock_records_pid_and_releases_on_drop() {
@@ -134,8 +223,10 @@ mod tests {
         assert_eq!(content.trim(), std::process::id().to_string());
         assert!(merge_lock_is_held(tmp.path()));
         drop(lock);
-        assert!(!merge_lock_path(tmp.path()).exists());
         assert!(!merge_lock_is_held(tmp.path()));
+        // The file is kept (never unlinked) but its marker is cleared.
+        let content = std::fs::read_to_string(merge_lock_path(tmp.path())).unwrap();
+        assert!(content.trim().is_empty());
     }
 
     #[test]
@@ -150,49 +241,91 @@ mod tests {
         std::fs::write(&path, format!("{dead_pid}\n")).unwrap();
         assert!(!merge_lock_is_held(tmp.path()));
 
-        let start = std::time::Instant::now();
-        let _lock = MergeLock::acquire(tmp.path()).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(5));
+        let lock = MergeLock::try_acquire(tmp.path()).unwrap();
+        assert!(lock.is_some(), "dead holder's marker must not block");
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content.trim(), std::process::id().to_string());
     }
 
     #[test]
-    fn fresh_lock_without_pid_is_treated_as_held() {
+    fn fresh_unowned_marker_is_treated_as_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = merge_lock_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "active merge\n").unwrap();
+        assert!(merge_lock_is_held(tmp.path()));
+    }
+
+    #[test]
+    fn empty_unlocked_lock_file_is_not_held() {
         let tmp = tempfile::tempdir().unwrap();
         let path = merge_lock_path(tmp.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "").unwrap();
-        assert!(merge_lock_is_held(tmp.path()));
+        assert!(!merge_lock_is_held(tmp.path()));
     }
 
     #[test]
-    fn lock_held_by_live_process_is_not_stale() {
+    fn try_acquire_returns_none_while_held_and_some_after_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = MergeLock::try_acquire(tmp.path()).unwrap().unwrap();
+        assert!(MergeLock::try_acquire(tmp.path()).unwrap().is_none());
+        drop(first);
+        assert!(MergeLock::try_acquire(tmp.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn holder_drop_does_not_release_another_holders_lock() {
+        // Old design: a waiter that reclaimed a "stale" lock could delete a
+        // fresh holder's file, and Drop removed the file unconditionally.
+        let tmp = tempfile::tempdir().unwrap();
+        let held = MergeLock::try_acquire(tmp.path()).unwrap().unwrap();
+        // A stale-looking marker from a dead process must not let anyone in.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        std::fs::write(merge_lock_path(tmp.path()), format!("{dead_pid}\n")).unwrap();
+        assert!(MergeLock::try_acquire(tmp.path()).unwrap().is_none());
+        assert!(merge_lock_is_held(tmp.path()));
+        drop(held);
+        assert!(MergeLock::try_acquire(tmp.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn concurrent_try_acquire_has_exactly_one_holder() {
         let tmp = tempfile::tempdir().unwrap();
         let path = merge_lock_path(tmp.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
-        assert!(merge_lock_is_held(tmp.path()));
-    }
-    use std::sync::{
-        Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
-    };
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn merge_lock_acquire_release() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".batty")).unwrap();
-        let lock_path = tmp.path().join(".batty").join("merge.lock");
-
-        {
-            let lock = MergeLock::acquire(tmp.path()).unwrap();
-            assert!(lock_path.exists());
-            drop(lock);
+        // Start from a stale marker so every contender sees a "dead" holder.
+        std::fs::write(&path, "999999999\n").unwrap();
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+        let holders = Arc::new(AtomicUsize::new(0));
+        let max_holders = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let root = tmp.path().to_path_buf();
+                let barrier = Arc::clone(&barrier);
+                let holders = Arc::clone(&holders);
+                let max_holders = Arc::clone(&max_holders);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..20 {
+                        if let Some(lock) = MergeLock::try_acquire(&root).unwrap() {
+                            let now = holders.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_holders.fetch_max(now, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(1));
+                            holders.fetch_sub(1, Ordering::SeqCst);
+                            drop(lock);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
         }
-        assert!(!lock_path.exists());
+        assert_eq!(max_holders.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -215,12 +348,20 @@ mod tests {
         });
 
         barrier.wait();
-        thread::sleep(Duration::from_millis(600));
+        thread::sleep(Duration::from_millis(300));
         assert!(!acquired.load(Ordering::SeqCst));
 
         drop(first_lock);
         handle.join().unwrap();
         assert!(acquired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn merge_mode_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&MergeMode::IsolatedIntegration).unwrap(),
+            "\"isolated_integration\""
+        );
     }
 
     #[test]
