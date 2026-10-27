@@ -324,7 +324,7 @@ pub(crate) fn attention_items(view: &StatusView<'_>) -> Vec<AttentionItem> {
                 push(
                     Some(name),
                     format!("{name} looks stalled{for_how_long}{on_task}{why}"),
-                    Some("batty attach".into()),
+                    Some(format!("batty attach {name}")),
                 );
             }
             if !row.health.backend_health.is_healthy() {
@@ -913,7 +913,7 @@ Team demo · session running (view it with `batty attach`)
 Members: 3 working · 2 idle · 1 need attention
 Needs attention:
   ! eng-1-2 looks stalled for 25m on #41: no output for 25m
-      -> run `batty attach`
+      -> run `batty attach eng-1-2`
 
 MEMBER     ROLE       STATE      WORKING ON             FOR  NOTE
 human      user       you        -                        -  -
@@ -1021,7 +1021,7 @@ eng-1-3    engineer   ○ idle     -                        -  -
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].member.as_deref(), Some("eng-1-2"));
         assert!(items[0].text.contains("stalled for 25m on #41"));
-        assert_eq!(items[0].command.as_deref(), Some("batty attach"));
+        assert_eq!(items[0].command.as_deref(), Some("batty attach eng-1-2"));
     }
 
     #[test]
