@@ -14,6 +14,7 @@ use super::daemon_mgmt::{
     DAEMON_SHUTDOWN_GRACE_PERIOD, daemon_shutdown_budget, force_kill_daemon,
     request_graceful_daemon_shutdown, resume_marker_path,
 };
+use super::status_render;
 use super::{
     config, estimation, events, hierarchy, now_unix, status, team_config_dir, team_config_path,
     team_events_path,
@@ -332,8 +333,86 @@ pub fn attach_team(project_root: &Path) -> Result<()> {
     tmux::attach(&session)
 }
 
-/// Show team status.
-pub fn team_status(project_root: &Path, json: bool, detail: bool, health: bool) -> Result<()> {
+/// Options for `batty status`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatusOptions {
+    pub json: bool,
+    pub detail: bool,
+    pub health: bool,
+    pub wide: bool,
+    pub no_color: bool,
+    pub watch: Option<u64>,
+}
+
+/// Show team status (once, or refreshing in place with `--watch`).
+pub fn team_status(project_root: &Path, options: StatusOptions) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    let is_tty = std::io::stdout().is_terminal();
+    let color = status_render::resolve_color(
+        options.no_color,
+        std::env::var("NO_COLOR").ok().as_deref(),
+        is_tty,
+    );
+    let Some(interval) = options.watch else {
+        let (cols, _) = status_render::tty_size().unzip();
+        let width = status_render::resolve_width(std::env::var("COLUMNS").ok().as_deref(), cols);
+        print!(
+            "{}",
+            render_team_status(project_root, options, width, color, false)?
+        );
+        return Ok(());
+    };
+
+    loop {
+        let (cols, rows) = status_render::tty_size().unzip();
+        let width = status_render::resolve_width(std::env::var("COLUMNS").ok().as_deref(), cols);
+        let mut frame = match render_team_status(project_root, options, width, color, true) {
+            Ok(frame) => frame,
+            Err(error) => format!("status unavailable: {error:#}\n"),
+        };
+        frame.push_str(&format!(
+            "Updated {} · refreshing every {interval}s\n",
+            chrono::Local::now().format("%H:%M:%S")
+        ));
+        if is_tty {
+            // Keep the frame within the pane so the top is never scrolled away.
+            if let Some(height) = rows.filter(|h| *h > 2) {
+                let lines: Vec<&str> = frame.lines().collect();
+                if lines.len() >= height {
+                    let mut kept: Vec<&str> = lines[..height - 2].to_vec();
+                    kept.push("… (pane too short; enlarge it to see more)");
+                    kept.push(lines[lines.len() - 1]);
+                    frame = kept.join("\n") + "\n";
+                }
+            }
+            // Home the cursor, draw, then clear anything left from a longer frame.
+            print!("\x1b[H{}\x1b[J", frame.replace('\n', "\x1b[K\n"));
+        } else {
+            println!("{frame}");
+        }
+        std::io::stdout().flush().ok();
+        std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+fn render_team_status(
+    project_root: &Path,
+    options: StatusOptions,
+    width: usize,
+    color: bool,
+    watching: bool,
+) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let StatusOptions {
+        json,
+        detail,
+        health,
+        wide,
+        ..
+    } = options;
+    let mut out = String::new();
     let config_path = team_config_path(project_root);
     if !config_path.exists() {
         bail!("no team config found at {}", config_path.display());
@@ -457,76 +536,34 @@ pub fn team_status(project_root: &Path, json: bool, detail: bool, health: bool) 
             engineer_profiles,
             members: rows,
         });
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&report)?)?;
     } else {
-        println!("Team: {}", team_config.name);
-        println!(
-            "Session: {} ({})",
-            session,
-            if session_running {
-                "running"
-            } else {
-                "stopped"
-            }
-        );
-        println!("Watchdog: {}", status::format_watchdog_summary(&watchdog));
-        if let Some(main_smoke) = main_smoke.as_ref() {
-            println!(
-                "Main smoke: {}",
-                status::format_main_smoke_summary(main_smoke)
-            );
-        }
+        let render_opts = status_render::RenderOptions { width, color, wide };
+        let view = status_render::StatusView {
+            team: &team_config.name,
+            session: &session,
+            session_running,
+            paused,
+            main_smoke: main_smoke.as_ref(),
+            watchdog: &watchdog,
+            publish_handoff: publish_handoff.as_ref(),
+            active_tasks: &active_tasks,
+            review_queue: &review_queue,
+            rows: &rows,
+        };
+        out.push_str(&status_render::render_summary(&view, &render_opts));
         let running_tests = status::load_running_test_summaries(project_root);
         if !running_tests.is_empty() {
-            println!("Background tests: {}", running_tests.join(", "));
+            out.push_str(&format!("Background tests: {}\n", running_tests.join(", ")));
         }
-        if let Some(handoff) = publish_handoff.as_ref() {
-            println!(
-                "Publish handoff: {}",
-                status::format_publish_handoff_summary(handoff)
-            );
-        }
-        println!();
-        println!(
-            "{:<20} {:<12} {:<10} {:<12} {:>5} {:>6} {:>7} {:<14} {:<14} {:<16} {:<18} {:<24} {:<20}",
-            "MEMBER",
-            "ROLE",
-            "AGENT",
-            "STATE",
-            "INBOX",
-            "TRIAGE",
-            "STALE",
-            "ACTIVE",
-            "REVIEW",
-            "ETA",
-            "HEALTH",
-            "SIGNAL",
-            "REPORTS TO"
-        );
-        println!("{}", "-".repeat(203));
-        for row in &rows {
-            println!(
-                "{:<20} {:<12} {:<10} {:<12} {:>5} {:>6} {:>7} {:<14} {:<14} {:<16} {:<18} {:<24} {:<20}",
-                row.name,
-                row.role,
-                row.agent.as_deref().unwrap_or("-"),
-                row.state,
-                row.pending_inbox,
-                row.triage_backlog,
-                row.worktree_staleness
-                    .map(|count| count.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                status::format_owned_tasks_summary(&row.active_owned_tasks),
-                status::format_owned_tasks_summary(&row.review_owned_tasks),
-                row.eta,
-                row.health_summary,
-                row.signal.as_deref().unwrap_or("-"),
-                row.reports_to.as_deref().unwrap_or("-"),
-            );
-        }
+        out.push('\n');
+        out.push_str(&status_render::render_members(&view, &render_opts));
+        // Detail sections below are plain text; keep them inside the pane
+        // unless the user asked for the full-width view.
+        let mut details = String::new();
         if let Some((formatted, _)) = workflow_metrics {
-            println!();
-            println!("{formatted}");
+            details.push('\n');
+            writeln!(details, "{formatted}")?;
         }
         let failed_test_tasks = active_tasks
             .iter()
@@ -534,39 +571,52 @@ pub fn team_status(project_root: &Path, json: bool, detail: bool, health: bool) 
             .filter_map(status::format_failed_test_task)
             .collect::<Vec<_>>();
         if !failed_test_tasks.is_empty() {
-            println!();
-            println!("Failed Tests");
+            details.push('\n');
+            writeln!(details, "Failed Tests")?;
             for line in failed_test_tasks {
-                println!("- {line}");
+                writeln!(details, "- {line}")?;
             }
         }
         if let Some(formatted) = status::format_review_blocks(&review_queue) {
-            println!();
-            println!("{formatted}");
+            details.push('\n');
+            writeln!(details, "{formatted}")?;
         }
         if let Some(optional_subsystems) = optional_subsystems {
-            println!();
-            println!(
+            details.push('\n');
+            writeln!(
+                details,
                 "{}",
                 status::format_optional_subsystem_statuses(&optional_subsystems)
-            );
+            )?;
         }
         if detail {
             if let Some(profiles) = engineer_profiles {
-                println!();
-                println!("{}", status::format_engineer_profiles(&profiles));
+                details.push('\n');
+                writeln!(details, "{}", status::format_engineer_profiles(&profiles))?;
             } else {
-                println!();
-                println!("Engineer Profiles\nNo engineer performance telemetry recorded yet.");
+                details.push('\n');
+                writeln!(
+                    details,
+                    "Engineer Profiles\nNo engineer performance telemetry recorded yet."
+                )?;
             }
         }
         if let Some(formatted) = status::format_benched_engineers(&bench_state) {
-            println!();
-            println!("{formatted}");
+            details.push('\n');
+            writeln!(details, "{formatted}")?;
         }
+        if wide {
+            out.push_str(&details);
+        } else {
+            out.push_str(&status_render::truncate_lines(&details, width));
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&status_render::render_hint(&render_opts, watching));
+        out.push('\n');
     }
 
-    Ok(())
+    Ok(out)
 }
 
 fn workflow_mode_declared(config_path: &Path) -> Result<bool> {

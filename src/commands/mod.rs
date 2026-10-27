@@ -10,6 +10,7 @@ mod misc;
 mod project;
 
 use crate::cli::Command;
+use crate::team;
 use anyhow::Result;
 use std::path::Path;
 
@@ -32,7 +33,20 @@ pub fn dispatch(root: &Path, command: Command) -> Result<()> {
             json,
             detail,
             health,
-        } => lifecycle::run_status(root, json, detail, health)?,
+            wide,
+            no_color,
+            watch,
+        } => lifecycle::run_status(
+            root,
+            team::StatusOptions {
+                json,
+                detail,
+                health,
+                wide,
+                no_color,
+                watch,
+            },
+        )?,
         Command::Bench { engineer, reason } => lifecycle::run_bench(root, engineer, reason)?,
         Command::Unbench { engineer } => lifecycle::run_unbench(root, engineer)?,
         Command::OpenClaw { command } => integrations::run_open_claw(root, command)?,

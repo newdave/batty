@@ -2167,6 +2167,15 @@ Options:
       --health
           Show optional subsystem health and error-budget state
 
+      --wide
+          Show every column (inbox, triage, stale, ETA, health, signal, reports-to)
+
+      --no-color
+          Disable coloured output (colour is also off when piped or NO_COLOR is set)
+
+      --watch [<SECS>]
+          Refresh the status in place every SECS seconds (default 5); Ctrl-C to exit
+
   -v, --verbose...
           Verbosity level (-v, -vv, -vvv)
 

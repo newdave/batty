@@ -10,7 +10,7 @@ exhaustive clap-generated output, see [reference/cli.md](reference/cli.md).
 | `batty init`                   | Scaffold `.batty/team_config/` with a team template and prompts |
 | `batty start`                  | Launch the daemon and tmux session                              |
 | `batty attach`                 | Attach to the running tmux session                              |
-| `batty status`                 | Show current member state and hierarchy                         |
+| `batty status`                 | Show a plain-language summary, what needs attention, and members |
 | `batty stop`                   | Stop the daemon and tmux session                                |
 | `batty validate --show-checks` | Validate `team.yaml` with per-check output                      |
 
@@ -87,6 +87,9 @@ In a second shell:
 
 ```sh
 batty send architect "Build the first milestone and keep tests green."
-batty status
+batty status            # summary, "Needs attention" list, compact members table
+batty status --wide     # every column (inbox, triage, ETA, health, signal, ...)
+batty status --watch    # refresh in place every 5s (or --watch 10); Ctrl-C exits
+batty status --json     # machine-readable; unchanged by the human layout
 batty board health
 ```

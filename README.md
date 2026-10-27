@@ -265,7 +265,11 @@ batty telemetry summary
 batty grafana status
 ```
 
-- `batty status` gives the quickest liveness view.
+- `batty status` gives the quickest liveness view: a short summary, a
+  "Needs attention" list with the command to run for each item, and a compact
+  members table sized to your terminal (`COLUMNS` is honoured). Add `--wide`
+  for every column, `--watch [SECS]` to refresh in place (handy in a small tmux
+  pane), `--no-color` (or `NO_COLOR=1`) to drop colour, and `--json` for scripts.
 - `batty board health` shows stale tasks, dependency problems, and queue health.
 - `batty metrics` and `batty telemetry` summarize throughput, review latency,
   and agent utilization.

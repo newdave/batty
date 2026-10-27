@@ -62,6 +62,7 @@ pub mod layout;
 pub mod learnings;
 pub use daemon_mgmt::*;
 mod session;
+mod status_render;
 pub use session::*;
 pub mod autoresearch;
 pub mod legacy_command_queue;

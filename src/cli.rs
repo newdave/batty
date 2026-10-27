@@ -79,6 +79,22 @@ pub enum Command {
         /// Show optional subsystem health and error-budget state
         #[arg(long, default_value_t = false)]
         health: bool,
+        /// Show every column (inbox, triage, stale, ETA, health, signal, reports-to)
+        #[arg(long, default_value_t = false)]
+        wide: bool,
+        /// Disable coloured output (colour is also off when piped or NO_COLOR is set)
+        #[arg(long = "no-color", default_value_t = false)]
+        no_color: bool,
+        /// Refresh the status in place every SECS seconds (default 5); Ctrl-C to exit
+        #[arg(
+            long,
+            value_name = "SECS",
+            num_args = 0..=1,
+            default_missing_value = "5",
+            value_parser = clap::value_parser!(u64).range(1..=3600),
+            conflicts_with = "json"
+        )]
+        watch: Option<u64>,
     },
 
     /// Safely rebuild and restart the daemon only when its binary is stale
@@ -1516,6 +1532,7 @@ mod tests {
                 json,
                 detail,
                 health,
+                ..
             } => {
                 assert!(!json);
                 assert!(!detail);
@@ -1533,6 +1550,7 @@ mod tests {
                 json,
                 detail,
                 health,
+                ..
             } => {
                 assert!(json);
                 assert!(!detail);
@@ -1550,6 +1568,7 @@ mod tests {
                 json,
                 detail,
                 health,
+                ..
             } => {
                 assert!(!json);
                 assert!(detail);
@@ -1567,6 +1586,7 @@ mod tests {
                 json,
                 detail,
                 health,
+                ..
             } => {
                 assert!(!json);
                 assert!(!detail);
@@ -1574,6 +1594,43 @@ mod tests {
             }
             other => panic!("expected status command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_subcommand_presentation_flags() {
+        let cli = Cli::parse_from(["batty", "status", "--wide", "--no-color", "--watch"]);
+        match cli.command {
+            Command::Status {
+                wide,
+                no_color,
+                watch,
+                ..
+            } => {
+                assert!(wide);
+                assert!(no_color);
+                assert_eq!(watch, Some(5));
+            }
+            other => panic!("expected status command, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["batty", "status", "--watch", "2"]);
+        match cli.command {
+            Command::Status { watch, .. } => assert_eq!(watch, Some(2)),
+            other => panic!("expected status command, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["batty", "status"]);
+        match cli.command {
+            Command::Status { watch, wide, .. } => {
+                assert_eq!(watch, None);
+                assert!(!wide);
+            }
+            other => panic!("expected status command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_watch_conflicts_with_json_and_rejects_zero() {
+        assert!(Cli::try_parse_from(["batty", "status", "--watch", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["batty", "status", "--watch", "0"]).is_err());
     }
 
     #[test]

@@ -231,8 +231,8 @@ pub(super) fn run_attach(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run_status(root: &Path, json: bool, detail: bool, health: bool) -> Result<()> {
-    team::team_status(root, json, detail, health)?;
+pub(super) fn run_status(root: &Path, options: team::StatusOptions) -> Result<()> {
+    team::team_status(root, options)?;
     Ok(())
 }
 
