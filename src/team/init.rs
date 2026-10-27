@@ -1142,15 +1142,29 @@ mod tests {
     };
 
     #[test]
-    fn default_templates_do_not_enable_auto_merge() {
+    fn default_templates_leave_auto_merge_at_upstream_default() {
+        // Upstream's templates set no auto_merge block, so auto-merge
+        // follows AutoMergePolicy::default(); keep the fork's templates the
+        // same. The interactive `batty init` prompt still defaults to "no".
         for template in ["simple", "mixed"] {
+            let raw = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/team/templates")
+                    .join(format!("team_{template}.yaml")),
+            )
+            .unwrap();
+            assert!(
+                !raw.contains("auto_merge:"),
+                "{template} template must not set auto_merge"
+            );
             let tmp = tempfile::tempdir().unwrap();
             init_team(tmp.path(), template, None, None, false).unwrap();
             let config =
                 crate::team::config::TeamConfig::load(&team_config_path(tmp.path())).unwrap();
-            assert!(
-                !config.workflow_policy.auto_merge.enabled,
-                "{template} template must not enable auto-merge"
+            assert_eq!(
+                config.workflow_policy.auto_merge.enabled,
+                crate::team::config::AutoMergePolicy::default().enabled,
+                "{template} template must inherit the default auto_merge.enabled"
             );
         }
     }

@@ -109,5 +109,3 @@ workflow_policy:
     max_iterations: 2
     auto_run_tests: true
     require_evidence: true
-  auto_merge:
-    enabled: false
