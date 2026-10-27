@@ -442,8 +442,13 @@ impl TeamDaemon {
         self.run_recoverable_step("maybe_notify_failure_patterns", |daemon| {
             daemon.maybe_notify_failure_patterns()
         });
+        let board_tasks = self.board_tasks().unwrap_or_else(|error| {
+            debug!(error = %error, "board snapshot unavailable for pane status labels");
+            Default::default()
+        });
         status::update_pane_status_labels(status::PaneStatusLabelUpdateContext {
             project_root: &self.config.project_root,
+            board_tasks: &board_tasks,
             members: &self.config.members,
             pane_map: &self.config.pane_map,
             states: &self.states,

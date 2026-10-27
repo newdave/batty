@@ -281,7 +281,7 @@ impl TeamDaemon {
     }
 
     fn meta_conversation_nudge_message(
-        &self,
+        &mut self,
         member_name: &str,
         member: &MemberInstance,
     ) -> String {

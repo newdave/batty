@@ -14,7 +14,6 @@ use super::TeamDaemon;
 use super::deferred::PendingRemoval;
 use super::helpers::{kill_pid, reap_if_exited, signalable_pid};
 use crate::shim::protocol::ShimState;
-use crate::task::load_tasks_from_dir;
 use crate::team::config::{RoleType, TeamConfig};
 use crate::team::config_diff::TopologyDiff;
 use crate::team::events::TeamEvent;
@@ -393,12 +392,12 @@ impl TeamDaemon {
         Ok(())
     }
 
-    fn removed_member_still_owns_board_work(&self, name: &str) -> Result<bool> {
+    fn removed_member_still_owns_board_work(&mut self, name: &str) -> Result<bool> {
         let tasks_dir = self.board_dir().join("tasks");
         if !tasks_dir.exists() {
             return Ok(false);
         }
-        Ok(load_tasks_from_dir(&tasks_dir)?.into_iter().any(|task| {
+        Ok(self.board_tasks()?.iter().any(|task| {
             task.claimed_by.as_deref() == Some(name) && !task_is_finished(&task.status)
         }))
     }
@@ -502,7 +501,8 @@ impl TeamDaemon {
             return Ok(());
         }
 
-        for task in load_tasks_from_dir(&tasks_dir)? {
+        let tasks = self.board_tasks()?;
+        for task in tasks.iter() {
             if task.claimed_by.as_deref() != Some(name) || task_is_finished(&task.status) {
                 continue;
             }

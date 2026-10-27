@@ -107,6 +107,12 @@ impl BoardSnapshotCache {
         self.snapshot = None;
         #[cfg(test)]
         SNAPSHOT_LOADS.with(|count| count.set(count.get() + 1));
+        // Frontmatter repair runs once per real reload, not once per consumer.
+        if let Some(board_dir) = tasks_dir.parent() {
+            crate::team::status::repair_board_frontmatter_logged(board_dir, "board_snapshot")?;
+        }
+        // Repairs are board writes of our own; do not count them as staleness.
+        let generation = write_generation(&tasks_dir);
         let tasks = Arc::new(crate::task::load_tasks_from_dir(&tasks_dir)?);
         // Fingerprint after loading so frontmatter repairs made during the
         // parse do not invalidate the snapshot on the next call.

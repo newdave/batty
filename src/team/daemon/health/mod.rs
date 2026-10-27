@@ -55,18 +55,12 @@ impl TeamDaemon {
         self.restart_member(member_name)
     }
 
-    pub(super) fn active_task(&self, member_name: &str) -> Result<Option<crate::task::Task>> {
+    pub(super) fn active_task(&mut self, member_name: &str) -> Result<Option<crate::task::Task>> {
         let Some(task_id) = self.active_task_id(member_name) else {
             return Ok(None);
         };
-        let board_dir = self
-            .config
-            .project_root
-            .join(".batty")
-            .join("team_config")
-            .join("board");
-        let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
-        Ok(tasks.into_iter().find(|task| task.id == task_id))
+        let tasks = self.board_tasks()?;
+        Ok(tasks.iter().find(|task| task.id == task_id).cloned())
     }
 
     pub(super) fn context_restart_cooldown_key(member_name: &str) -> String {
@@ -588,7 +582,7 @@ mod tests {
     fn active_task_returns_none_when_no_active_task_id() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".batty").join("team_config")).unwrap();
-        let daemon = make_test_daemon(tmp.path(), vec![]);
+        let mut daemon = make_test_daemon(tmp.path(), vec![]);
         let result = daemon.active_task("eng-1").unwrap();
         assert!(result.is_none());
     }

@@ -249,6 +249,7 @@ impl TeamDaemon {
                 &idle_active_reports,
                 &idle_unassigned_reports,
                 &unassigned_open_tasks,
+                &tasks,
             );
             info!(
                 member = %name,
@@ -459,6 +460,7 @@ impl TeamDaemon {
         idle_active_reports: &[&ReportDispatchSnapshot],
         idle_unassigned_reports: &[&ReportDispatchSnapshot],
         unassigned_open_tasks: &[&crate::task::Task],
+        board_tasks: &[crate::task::Task],
     ) -> String {
         let board_dir = self
             .config
@@ -507,18 +509,14 @@ impl TeamDaemon {
             .iter()
             .flat_map(|snapshot| snapshot.active_task_ids.iter().copied())
             .collect::<std::collections::HashSet<_>>();
-        let github_blockers = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))
-            .map(|tasks| {
-                let active_tasks = tasks
-                    .iter()
-                    .filter(|task| active_ids.contains(&task.id))
-                    .collect::<Vec<_>>();
-                crate::team::github_feedback::active_github_blockers_for_tasks(
-                    &self.config.project_root,
-                    &active_tasks,
-                )
-            })
-            .unwrap_or_default();
+        let active_tasks = board_tasks
+            .iter()
+            .filter(|task| active_ids.contains(&task.id))
+            .collect::<Vec<_>>();
+        let github_blockers = crate::team::github_feedback::active_github_blockers_for_tasks(
+            &self.config.project_root,
+            &active_tasks,
+        );
 
         let mut message = format!(
             "Dispatch recovery needed: you are idle, your reports are idle, and the lane has no triage/review backlog. Idle reports still holding active work: {active_report_summary}. Idle reports with no active task: {unassigned_report_summary}. Unassigned open board work: {open_task_summary}.\n\

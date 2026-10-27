@@ -27,12 +27,25 @@ use serde::Deserialize;
 /// transitively), because persisting it would close a cycle. Returns
 /// the edges that can be safely appended and the rejected ones for
 /// logging.
+#[cfg(test)]
 fn split_acyclic_blocking_ids(
     board_dir: &Path,
     candidate_id: u32,
     blocking_task_ids: &[u32],
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+    Ok(split_acyclic_blocking_ids_in(
+        &tasks,
+        candidate_id,
+        blocking_task_ids,
+    ))
+}
+
+fn split_acyclic_blocking_ids_in(
+    tasks: &[crate::task::Task],
+    candidate_id: u32,
+    blocking_task_ids: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
     let deps_by_id: HashMap<u32, Vec<u32>> = tasks
         .iter()
         .map(|task| (task.id, task.depends_on.clone()))
@@ -72,7 +85,7 @@ fn split_acyclic_blocking_ids(
             safe.push(*id);
         }
     }
-    Ok((safe, rejected))
+    (safe, rejected)
 }
 
 /// Tokens that are hyphen-lowercase-shaped but are NOT engineer roles —
@@ -285,6 +298,7 @@ fn worktree_on_clean_own_task_branch(worktree_dir: &Path, engineer: &str, task_i
     }) && crate::team::task_loop::worktree_has_user_changes(worktree_dir).is_ok_and(|dirty| !dirty)
 }
 
+#[cfg(test)]
 fn board_tasks_dir(project_root: &Path) -> std::path::PathBuf {
     project_root
         .join(".batty")
@@ -401,13 +415,24 @@ fn describe_overlap(left: &str, right: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn predicted_files(task: &crate::task::Task, project_root: &Path) -> Vec<String> {
+    let board = crate::task::load_tasks_from_dir(&board_tasks_dir(project_root)).ok();
+    predicted_files_with_board(task, project_root, board.as_deref())
+}
+
+/// `predicted_files` against an already-loaded board (`None` when it could not be read).
+fn predicted_files_with_board(
+    task: &crate::task::Task,
+    project_root: &Path,
+    board: Option<&[crate::task::Task]>,
+) -> Vec<String> {
     let mut paths = predict_task_file_paths(project_root, task)
         .unwrap_or_default()
         .into_iter()
         .map(|path| normalize_predicted_path(&path))
         .collect::<Vec<_>>();
-    if let Ok(tasks) = crate::task::load_tasks_from_dir(&board_tasks_dir(project_root)) {
+    if let Some(tasks) = board {
         for historical in tasks {
             if historical.id == task.id || historical.tags.is_empty() {
                 continue;
@@ -444,19 +469,30 @@ fn overlapping_files(candidate_paths: &[String], active_paths: &[String]) -> Vec
     overlaps.into_iter().collect()
 }
 
+#[cfg(test)]
 pub fn find_overlapping_tasks(
     candidate: &crate::task::Task,
     in_progress: &[crate::task::Task],
     project_root: &Path,
 ) -> Vec<OverlapConflict> {
-    let candidate_paths = predicted_files(candidate, project_root);
+    let board = crate::task::load_tasks_from_dir(&board_tasks_dir(project_root)).ok();
+    find_overlapping_tasks_with_board(candidate, in_progress, project_root, board.as_deref())
+}
+
+fn find_overlapping_tasks_with_board(
+    candidate: &crate::task::Task,
+    in_progress: &[crate::task::Task],
+    project_root: &Path,
+    board: Option<&[crate::task::Task]>,
+) -> Vec<OverlapConflict> {
+    let candidate_paths = predicted_files_with_board(candidate, project_root, board);
     let mut conflicts = Vec::new();
 
     for active_task in in_progress {
         if active_task.id == candidate.id {
             continue;
         }
-        let active_paths = predicted_files(active_task, project_root);
+        let active_paths = predicted_files_with_board(active_task, project_root, board);
         let conflicting_files = overlapping_files(&candidate_paths, &active_paths);
         if conflicting_files.is_empty() {
             continue;
@@ -476,21 +512,20 @@ pub fn find_overlapping_tasks(
 }
 
 fn available_dispatch_tasks(
-    board_dir: &Path,
+    tasks: &[crate::task::Task],
     queued_task_ids: &HashSet<u32>,
     excluded_tags: &[String],
     non_engineer_assignees: &HashSet<String>,
     rescued_task_ids: &HashSet<u32>,
     verification_retry_task_ids: &HashSet<u32>,
 ) -> Result<Vec<crate::task::Task>> {
-    let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
     let task_status_by_id: HashMap<u32, String> = tasks
         .iter()
         .map(|task| (task.id, task.status.clone()))
         .collect();
 
     let mut available: Vec<crate::task::Task> = tasks
-        .into_iter()
+        .iter()
         .filter(|task| {
             matches!(task.status.as_str(), "backlog" | "todo")
                 || verification_retry_task_ids.contains(&task.id)
@@ -548,6 +583,7 @@ fn available_dispatch_tasks(
             })
         })
         .filter(|task| body_dependencies_satisfied(task, &task_status_by_id))
+        .cloned()
         .collect();
 
     available.sort_by_key(|task| (dispatch_priority_rank(&task.priority), task.id));
@@ -620,14 +656,14 @@ fn verification_retry_assignment_context(task: &crate::task::Task) -> Option<Str
 impl TeamDaemon {
     fn verification_retry_dispatchable_task_ids(
         &self,
-        board_dir: &Path,
+        tasks: &[crate::task::Task],
         allow_peer_pickup: bool,
-    ) -> Result<HashSet<u32>> {
-        Ok(crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?
-            .into_iter()
+    ) -> HashSet<u32> {
+        tasks
+            .iter()
             .filter(|task| self.verification_retry_dispatchable_task(task, allow_peer_pickup))
             .map(|task| task.id)
-            .collect())
+            .collect()
     }
 
     fn verification_retry_dispatchable_task(
@@ -658,6 +694,7 @@ impl TeamDaemon {
     fn serialize_overlapping_candidate(
         &mut self,
         board_dir: &Path,
+        board_tasks: &[crate::task::Task],
         candidate: &crate::task::Task,
         conflicts: &[OverlapConflict],
         persist_dependency: bool,
@@ -692,7 +729,7 @@ impl TeamDaemon {
         // #554 depends_on [553] ("prevented overlapping dispatch"),
         // producing `dependency cycle detected: #553 -> #554 -> #553`.
         let (safe_blocking_ids, rejected_blocking_ids) = if persist_dependency {
-            split_acyclic_blocking_ids(board_dir, candidate.id, &blocking_task_ids)?
+            split_acyclic_blocking_ids_in(board_tasks, candidate.id, &blocking_task_ids)
         } else {
             (blocking_task_ids.clone(), Vec::new())
         };
@@ -762,11 +799,11 @@ impl TeamDaemon {
     #[cfg_attr(not(test), allow(dead_code))]
     fn next_dispatch_task(
         &self,
-        board_dir: &Path,
+        tasks: &[crate::task::Task],
         queued_task_ids: &HashSet<u32>,
     ) -> Result<Option<crate::task::Task>> {
         let normal_available = available_dispatch_tasks(
-            board_dir,
+            tasks,
             queued_task_ids,
             &self.config.team_config.board.dispatch_excluded_tags,
             &self.non_engineer_member_names(),
@@ -778,14 +815,14 @@ impl TeamDaemon {
         let allow_peer_pickup =
             normal_available.is_empty() && !self.idle_engineer_names().is_empty();
         Ok(available_dispatch_tasks(
-            board_dir,
+            tasks,
             queued_task_ids,
             &self.config.team_config.board.dispatch_excluded_tags,
             &self.non_engineer_member_names(),
             &self
                 .dispatch
                 .rescued_task_ids(self.orphan_rescue_cooldown()),
-            &self.verification_retry_dispatchable_task_ids(board_dir, allow_peer_pickup)?,
+            &self.verification_retry_dispatchable_task_ids(tasks, allow_peer_pickup),
         )?
         .into_iter()
         .next())
@@ -826,12 +863,13 @@ impl TeamDaemon {
         board_dir: &std::path::Path,
         queued: &HashSet<u32>,
     ) -> Result<Option<crate::task::Task>> {
-        self.next_dispatch_task(board_dir, queued)
+        let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+        self.next_dispatch_task(&tasks, queued)
     }
 
     pub(in super::super) fn enqueue_dispatch_candidates(&mut self) -> Result<()> {
         let board_dir = self.board_dir();
-        let board_tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+        let board_tasks = self.board_tasks()?;
         let benched_engineers = crate::team::bench::benched_engineer_names(self.project_root())?;
         let dedup_window =
             Duration::from_secs(self.config.team_config.board.dispatch_dedup_window_secs);
@@ -918,7 +956,7 @@ impl TeamDaemon {
         }
 
         let allow_peer_retry_pickup = available_dispatch_tasks(
-            &board_dir,
+            &board_tasks,
             &queued_task_ids,
             &self.config.team_config.board.dispatch_excluded_tags,
             &non_engineer_names,
@@ -941,10 +979,13 @@ impl TeamDaemon {
             let mut unavailable_task_ids = queued_task_ids.clone();
             unavailable_task_ids.extend(file_locked_task_ids.iter().copied());
             unavailable_task_ids.extend(eligibility_excluded_task_ids.iter().copied());
-            let verification_retry_task_ids =
-                self.verification_retry_dispatchable_task_ids(&board_dir, allow_peer_retry_pickup)?;
+            // Overlap serialization below writes the board; the snapshot is
+            // invalidated by that write, so each pass sees fresh tasks.
+            let board_tasks = self.board_tasks()?;
+            let verification_retry_task_ids = self
+                .verification_retry_dispatchable_task_ids(&board_tasks, allow_peer_retry_pickup);
             let available_tasks = available_dispatch_tasks(
-                &board_dir,
+                &board_tasks,
                 &unavailable_task_ids,
                 &self.config.team_config.board.dispatch_excluded_tags,
                 &non_engineer_names,
@@ -955,11 +996,11 @@ impl TeamDaemon {
                 break;
             }
 
-            let in_progress_tasks: Vec<crate::task::Task> =
-                crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?
-                    .into_iter()
-                    .filter(|task| task.status == "in-progress")
-                    .collect();
+            let in_progress_tasks: Vec<crate::task::Task> = board_tasks
+                .iter()
+                .filter(|task| task.status == "in-progress")
+                .cloned()
+                .collect();
             let mut selected_task = None;
             let mut least_conflicted: Option<(crate::task::Task, Vec<OverlapConflict>)> = None;
             let file_level_locks_enabled = self.config.team_config.workflow_policy.file_level_locks;
@@ -981,8 +1022,12 @@ impl TeamDaemon {
                     break;
                 }
 
-                let conflicts =
-                    find_overlapping_tasks(&task, &in_progress_tasks, self.project_root());
+                let conflicts = find_overlapping_tasks_with_board(
+                    &task,
+                    &in_progress_tasks,
+                    self.project_root(),
+                    Some(&board_tasks),
+                );
                 if conflicts.is_empty() {
                     selected_task = Some(task);
                     break;
@@ -997,7 +1042,13 @@ impl TeamDaemon {
                 }
 
                 if file_level_locks_enabled {
-                    self.serialize_overlapping_candidate(&board_dir, &task, &conflicts, false)?;
+                    self.serialize_overlapping_candidate(
+                        &board_dir,
+                        &board_tasks,
+                        &task,
+                        &conflicts,
+                        false,
+                    )?;
                     file_locked_task_ids.insert(task.id);
                     continue;
                 }
@@ -1013,7 +1064,13 @@ impl TeamDaemon {
             let task = if let Some(task) = selected_task {
                 task
             } else if let Some((task, conflicts)) = least_conflicted {
-                self.serialize_overlapping_candidate(&board_dir, &task, &conflicts, true)?;
+                self.serialize_overlapping_candidate(
+                    &board_dir,
+                    &board_tasks,
+                    &task,
+                    &conflicts,
+                    true,
+                )?;
                 continue;
             } else {
                 break;
@@ -1073,29 +1130,31 @@ impl TeamDaemon {
 
     fn task_for_dispatch_entry(
         &self,
-        board_dir: &Path,
+        tasks: &[crate::task::Task],
         entry: &DispatchQueueEntry,
-    ) -> Result<Option<crate::task::Task>> {
-        let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
+    ) -> Option<crate::task::Task> {
         let task_status_by_id: HashMap<u32, String> = tasks
             .iter()
             .map(|task| (task.id, task.status.clone()))
             .collect();
-        Ok(tasks.into_iter().find(|task| {
-            let retry_dispatchable = self.verification_retry_dispatchable_task(task, true);
-            task.id == entry.task_id
-                && (matches!(task.status.as_str(), "backlog" | "todo") || retry_dispatchable)
-                && (task.claimed_by.is_none() || retry_dispatchable)
-                && task.blocked.is_none()
-                && task.blocked_on.is_none()
-                && !task.is_schedule_blocked()
-                && task.depends_on.iter().all(|dep_id| {
-                    task_status_by_id
-                        .get(dep_id)
-                        .is_none_or(|status| dep_status_satisfied(status))
-                })
-                && body_dependencies_satisfied(task, &task_status_by_id)
-        }))
+        tasks
+            .iter()
+            .find(|task| {
+                let retry_dispatchable = self.verification_retry_dispatchable_task(task, true);
+                task.id == entry.task_id
+                    && (matches!(task.status.as_str(), "backlog" | "todo") || retry_dispatchable)
+                    && (task.claimed_by.is_none() || retry_dispatchable)
+                    && task.blocked.is_none()
+                    && task.blocked_on.is_none()
+                    && !task.is_schedule_blocked()
+                    && task.depends_on.iter().all(|dep_id| {
+                        task_status_by_id
+                            .get(dep_id)
+                            .is_none_or(|status| dep_status_satisfied(status))
+                    })
+                    && body_dependencies_satisfied(task, &task_status_by_id)
+            })
+            .cloned()
     }
 
     pub(in super::super) fn process_dispatch_queue(&mut self) -> Result<()> {
@@ -1122,8 +1181,9 @@ impl TeamDaemon {
                 // Prune stale entries first: if the task is done, claimed by someone
                 // else, or no longer exists, drop the entry regardless of engineer
                 // state. Without this, entries for non-idle engineers persist forever.
+                let board_tasks = self.board_tasks()?;
                 let task_still_dispatchable =
-                    self.task_for_dispatch_entry(&board_dir, &entry)?.is_some();
+                    self.task_for_dispatch_entry(&board_tasks, &entry).is_some();
                 if !task_still_dispatchable {
                     debug!(
                         engineer = %entry.engineer,
@@ -1190,7 +1250,7 @@ impl TeamDaemon {
                     continue;
                 }
 
-                let Some(task) = self.task_for_dispatch_entry(&board_dir, &entry)? else {
+                let Some(task) = self.task_for_dispatch_entry(&board_tasks, &entry) else {
                     continue;
                 };
 
@@ -1210,8 +1270,7 @@ impl TeamDaemon {
                 // Skip if the task body has unmet text dependencies
                 // (e.g. "Blocked on: #65, #66" where those tasks aren't done)
                 if let Some(blocked_ids) = parse_body_dependency_ids(&task.description) {
-                    let all_tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))
-                        .unwrap_or_default();
+                    let all_tasks = &board_tasks;
                     let unmet: Vec<u32> = blocked_ids
                         .iter()
                         .filter(|id| {

@@ -706,6 +706,12 @@ fn load_board_tasks_for_status(board_dir: &Path, context: &str) -> Result<Vec<ta
         return Ok(Vec::new());
     }
 
+    repair_board_frontmatter_logged(board_dir, context)?;
+    task::load_tasks_from_dir(&tasks_dir)
+}
+
+/// Repair malformed task frontmatter under `board_dir`, logging what changed.
+pub(crate) fn repair_board_frontmatter_logged(board_dir: &Path, context: &str) -> Result<()> {
     let repairs = crate::team::task_cmd::repair_board_frontmatter_compat(board_dir)?;
     if !repairs.is_empty() {
         let repaired_tasks = repairs
@@ -728,8 +734,7 @@ fn load_board_tasks_for_status(board_dir: &Path, context: &str) -> Result<Vec<ta
             "repaired malformed board task frontmatter during status scan"
         );
     }
-
-    task::load_tasks_from_dir(&tasks_dir)
+    Ok(())
 }
 
 pub(crate) fn branch_mismatch_by_member(
@@ -1779,8 +1784,6 @@ pub(crate) fn owned_task_buckets(
         return HashMap::new();
     }
 
-    let member_names: HashSet<&str> = members.iter().map(|member| member.name.as_str()).collect();
-    let mut owned = HashMap::<String, OwnedTaskBuckets>::new();
     let tasks = match load_board_tasks_for_status(
         tasks_dir.parent().unwrap_or(&tasks_dir),
         "owned_task_buckets",
@@ -1791,8 +1794,19 @@ pub(crate) fn owned_task_buckets(
             return HashMap::new();
         }
     };
+    owned_task_buckets_from_tasks(project_root, members, &tasks)
+}
 
-    for task in &tasks {
+/// Bucket already-loaded board tasks by owner (see [`owned_task_buckets`]).
+pub(crate) fn owned_task_buckets_from_tasks(
+    project_root: &Path,
+    members: &[MemberInstance],
+    tasks: &[task::Task],
+) -> HashMap<String, OwnedTaskBuckets> {
+    let member_names: HashSet<&str> = members.iter().map(|member| member.name.as_str()).collect();
+    let mut owned = HashMap::<String, OwnedTaskBuckets>::new();
+
+    for task in tasks {
         let Some(claimed_by) = task.claimed_by.as_deref() else {
             continue;
         };
@@ -1816,7 +1830,7 @@ pub(crate) fn owned_task_buckets(
         if is_active {
             entry.active.push(task.id);
         } else {
-            match super::review::classify_review_task(project_root, task, &tasks) {
+            match super::review::classify_review_task(project_root, task, tasks) {
                 ReviewQueueState::Current => entry.review.push(task.id),
                 ReviewQueueState::Stale(_) => entry.stale_review.push(task.id),
             }
@@ -3038,6 +3052,8 @@ where
     F: Fn(&str) -> Option<Duration>,
 {
     pub(crate) project_root: &'a Path,
+    /// Board tasks from the daemon's per-tick snapshot.
+    pub(crate) board_tasks: &'a [task::Task],
     pub(crate) members: &'a [MemberInstance],
     pub(crate) pane_map: &'a HashMap<String, String>,
     pub(crate) states: &'a HashMap<String, MemberState>,
@@ -3053,6 +3069,7 @@ where
 {
     let PaneStatusLabelUpdateContext {
         project_root,
+        board_tasks,
         members,
         pane_map,
         states,
@@ -3064,7 +3081,7 @@ where
     let globally_paused = pause_marker_path(project_root).exists();
     let inbox_root = inbox::inboxes_root(project_root);
     let direct_reports = direct_reports_by_member(members);
-    let owned_task_buckets = owned_task_buckets(project_root, members);
+    let owned_task_buckets = owned_task_buckets_from_tasks(project_root, members, board_tasks);
 
     for member in members {
         if member.role_type == RoleType::User {

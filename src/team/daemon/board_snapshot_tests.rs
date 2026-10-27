@@ -121,3 +121,39 @@ fn board_write_invalidates_every_daemon_snapshot_of_that_board_only() {
     other.board_tasks().unwrap();
     assert_eq!(parses() - before, 0, "a write to another board is ignored");
 }
+
+#[test]
+fn tick_with_dispatch_and_pane_labels_parses_board_at_most_once() {
+    use crate::team::test_support::{engineer_member, manager_member};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tasks_dir = board(&tmp);
+    write_task(&tasks_dir, 1, "todo");
+    write_task(&tasks_dir, 2, "todo");
+    write_task(&tasks_dir, 3, "in-progress");
+    let members = vec![
+        manager_member("manager", None),
+        engineer_member("eng-1", Some("manager"), false),
+    ];
+    let pane_map = [("eng-1".to_string(), "%999".to_string())].into();
+    let mut daemon = TestDaemonBuilder::new(tmp.path())
+        .members(members)
+        .pane_map(pane_map)
+        .build();
+
+    // Warm up: the first ticks may assign, enqueue, and write the board.
+    daemon.tick();
+    daemon.tick();
+    let before = parses();
+    let loads = snapshot_loads();
+    // Exercise the converted paths directly as well as through the tick.
+    daemon.enqueue_dispatch_candidates().unwrap();
+    daemon.tick();
+    let per_run = parses() - before;
+    assert!(
+        per_run <= 1,
+        "dispatch + pane labels must share one board parse when nothing changes, got {per_run} \
+         parses ({} snapshot loads)",
+        snapshot_loads() - loads
+    );
+}
