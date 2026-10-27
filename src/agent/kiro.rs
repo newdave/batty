@@ -3,14 +3,12 @@
 //! Batty creates a per-member agent config in `.kiro/agents/` and launches
 //! kiro with `--agent batty-<member>`. The agent config carries the system
 //! prompt, model selection, and tool permissions so kiro loads them natively.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::Path;
 
 use uuid::Uuid;
 
-use crate::agent::{AgentAdapter, SpawnConfig};
-use crate::prompt::PromptPatterns;
+use crate::agent::AgentAdapter;
 
 /// Default model for Kiro agents.
 pub const KIRO_DEFAULT_MODEL: &str = "claude-opus-4.6-1m";
@@ -67,39 +65,6 @@ impl AgentAdapter for KiroCliAdapter {
         "kiro-cli"
     }
 
-    fn spawn_config(&self, task_description: &str, work_dir: &Path) -> SpawnConfig {
-        SpawnConfig {
-            program: self.program.clone(),
-            args: vec![
-                "chat".to_string(),
-                "--trust-all-tools".to_string(),
-                task_description.to_string(),
-            ],
-            work_dir: work_dir.to_string_lossy().to_string(),
-            env: vec![],
-        }
-    }
-
-    fn prompt_patterns(&self) -> PromptPatterns {
-        PromptPatterns::kiro_cli()
-    }
-
-    fn instruction_candidates(&self) -> &'static [&'static str] {
-        &["AGENTS.md", "CLAUDE.md"]
-    }
-
-    fn wrap_launch_prompt(&self, prompt: &str) -> String {
-        format!(
-            "You are running as Kiro under Batty supervision.\n\
-             Treat the launch context below as authoritative session context.\n\n\
-             {prompt}"
-        )
-    }
-
-    fn format_input(&self, response: &str) -> String {
-        format!("{response}\n")
-    }
-
     fn launch_command(
         &self,
         prompt: &str,
@@ -129,11 +94,6 @@ impl AgentAdapter for KiroCliAdapter {
         Some(Uuid::new_v4().to_string())
     }
 
-    fn supports_resume(&self) -> bool {
-        // ACP supports session/load for session resumption
-        true
-    }
-
     fn health_check(&self) -> super::BackendHealth {
         super::check_binary_available(&self.program)
     }
@@ -152,45 +112,6 @@ impl KiroCliAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_program_is_kiro() {
-        let adapter = KiroCliAdapter::new(None);
-        let config = adapter.spawn_config("test", Path::new("/tmp"));
-        assert_eq!(config.program, "kiro-cli");
-    }
-
-    #[test]
-    fn spawn_uses_chat_with_trust_all_tools() {
-        let adapter = KiroCliAdapter::new(None);
-        let config = adapter.spawn_config("ship the patch", Path::new("/tmp/worktree"));
-        assert_eq!(
-            config.args,
-            vec![
-                "chat".to_string(),
-                "--trust-all-tools".to_string(),
-                "ship the patch".to_string()
-            ]
-        );
-        assert_eq!(config.work_dir, "/tmp/worktree");
-    }
-
-    #[test]
-    fn kiro_prefers_agents_md_instruction_order() {
-        let adapter = KiroCliAdapter::new(None);
-        assert_eq!(
-            adapter.instruction_candidates(),
-            &["AGENTS.md", "CLAUDE.md"]
-        );
-    }
-
-    #[test]
-    fn kiro_wraps_launch_prompt() {
-        let adapter = KiroCliAdapter::new(None);
-        let wrapped = adapter.wrap_launch_prompt("Launch body");
-        assert!(wrapped.contains("Kiro under Batty supervision"));
-        assert!(wrapped.contains("Launch body"));
-    }
 
     #[test]
     fn launch_command_with_agent_name() {
@@ -284,12 +205,6 @@ mod tests {
         let sid = adapter.new_session_id();
         assert!(sid.is_some());
         assert!(!sid.unwrap().is_empty());
-    }
-
-    #[test]
-    fn supports_resume_is_true() {
-        let adapter = KiroCliAdapter::new(None);
-        assert!(adapter.supports_resume());
     }
 
     // --- SDK launch command tests ---

@@ -1,26 +1,16 @@
 //! Agent adapter layer.
 //!
-//! Each coding agent (Claude Code, Codex CLI, Aider) is wrapped in an adapter
-//! that knows how to:
-//! - Build the command to spawn the agent in a PTY
-//! - Provide prompt detection patterns for its output
-//! - Format input to inject into the agent's stdin
-//!
-//! The supervisor uses this trait to control agents without knowing their
-//! specific CLI conventions.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Each coding agent (Claude Code, Codex CLI, Kiro CLI) is wrapped in an adapter
+//! that knows how to build its launch command, manage session IDs, and report
+//! backend health, so callers do not need to know specific CLI conventions.
 
 pub mod claude;
 pub mod codex;
 pub mod kiro;
-pub mod mock;
 
-use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
-
-use crate::prompt::PromptPatterns;
 
 /// Health state of an agent backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,19 +58,6 @@ fn check_binary_available(program: &str) -> BackendHealth {
     }
 }
 
-/// Configuration for spawning an agent process.
-#[derive(Debug, Clone)]
-pub struct SpawnConfig {
-    /// The program to execute (e.g., "claude", "codex", "aider").
-    pub program: String,
-    /// Arguments to pass to the program.
-    pub args: Vec<String>,
-    /// Working directory for the agent process.
-    pub work_dir: String,
-    /// Environment variables to set (key, value pairs).
-    pub env: Vec<(String, String)>,
-}
-
 /// Trait that all agent adapters must implement.
 ///
 /// An adapter translates between Batty's supervisor and a specific agent CLI.
@@ -89,36 +66,6 @@ pub struct SpawnConfig {
 pub trait AgentAdapter: Send + Sync {
     /// Human-readable name of the agent (e.g., "claude-code", "codex", "aider").
     fn name(&self) -> &str;
-
-    /// Build the spawn configuration for this agent.
-    ///
-    /// `task_description` is the task text to pass to the agent.
-    /// `work_dir` is the worktree path where the agent should operate.
-    fn spawn_config(&self, task_description: &str, work_dir: &Path) -> SpawnConfig;
-
-    /// Get the compiled prompt detection patterns for this agent.
-    fn prompt_patterns(&self) -> PromptPatterns;
-
-    /// Preferred project-root instruction file candidates for this agent.
-    ///
-    /// The first existing file is used as launch context. Adapters can
-    /// override this to prefer agent-specific steering docs.
-    fn instruction_candidates(&self) -> &'static [&'static str] {
-        &["CLAUDE.md", "AGENTS.md"]
-    }
-
-    /// Allow adapters to wrap or transform the composed launch context.
-    ///
-    /// Default behavior is passthrough. Adapters can prepend guardrails or
-    /// framing tailored to their CLI behavior.
-    fn wrap_launch_prompt(&self, prompt: &str) -> String {
-        prompt.to_string()
-    }
-
-    /// Format a response to send to the agent's stdin.
-    ///
-    /// Some agents need a trailing newline, some don't. The adapter handles it.
-    fn format_input(&self, response: &str) -> String;
 
     // --- Launch lifecycle methods (Backend trait) ---
 
@@ -141,11 +88,6 @@ pub trait AgentAdapter: Send + Sync {
     /// `Some(uuid)`. Backends without session management return `None`.
     fn new_session_id(&self) -> Option<String> {
         None
-    }
-
-    /// Whether this backend supports resuming a previous session.
-    fn supports_resume(&self) -> bool {
-        false
     }
 
     /// Check if this agent's backend is healthy (binary available, etc.).
@@ -190,31 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn spawn_config_has_work_dir() {
-        let adapter = claude::ClaudeCodeAdapter::new(None);
-        let config = adapter.spawn_config("Fix the bug", Path::new("/tmp/worktree"));
-        assert_eq!(config.work_dir, "/tmp/worktree");
-    }
-
-    #[test]
-    fn spawn_config_includes_task_in_args() {
-        let adapter = claude::ClaudeCodeAdapter::new(None);
-        let config = adapter.spawn_config("Fix the bug", Path::new("/tmp/worktree"));
-        let args_joined = config.args.join(" ");
-        assert!(
-            args_joined.contains("Fix the bug"),
-            "task description should appear in args: {args_joined}"
-        );
-    }
-
-    #[test]
-    fn format_input_appends_newline() {
-        let adapter = claude::ClaudeCodeAdapter::new(None);
-        let input = adapter.format_input("y");
-        assert_eq!(input, "y\n");
-    }
-
-    #[test]
     fn lookup_adapter_by_name() {
         let adapter = adapter_from_name("claude").unwrap();
         assert_eq!(adapter.name(), "claude-code");
@@ -237,22 +154,6 @@ mod tests {
         assert!(adapter_from_name("unknown-agent").is_none());
     }
 
-    #[test]
-    fn default_instruction_candidates_include_claude_and_agents() {
-        let adapter = claude::ClaudeCodeAdapter::new(None);
-        assert_eq!(
-            adapter.instruction_candidates(),
-            &["CLAUDE.md", "AGENTS.md"]
-        );
-    }
-
-    #[test]
-    fn default_wrap_launch_prompt_is_passthrough() {
-        let adapter = claude::ClaudeCodeAdapter::new(None);
-        let prompt = "test launch prompt";
-        assert_eq!(adapter.wrap_launch_prompt(prompt), prompt);
-    }
-
     // --- Backend trait dispatch tests ---
 
     #[test]
@@ -271,16 +172,6 @@ mod tests {
                 backend.name()
             );
         }
-    }
-
-    #[test]
-    fn supports_resume_varies_by_backend() {
-        let claude = adapter_from_name("claude").unwrap();
-        let codex = adapter_from_name("codex").unwrap();
-        let kiro = adapter_from_name("kiro").unwrap();
-        assert!(claude.supports_resume());
-        assert!(codex.supports_resume());
-        assert!(kiro.supports_resume()); // ACP supports session/load
     }
 
     #[test]

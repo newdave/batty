@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -9,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::board::WorkflowMetadata;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactType {
@@ -18,6 +17,7 @@ pub enum ArtifactType {
     Other,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactRecord {
     pub path: String,
@@ -26,6 +26,7 @@ pub struct ArtifactRecord {
     pub verified: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MergeRecord {
     pub task_id: u32,
@@ -48,6 +49,7 @@ pub struct TestTimingRecord {
     pub regression_detected: bool,
 }
 
+#[cfg(test)]
 pub fn record_merge(log_path: &Path, record: &MergeRecord) -> Result<()> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)
@@ -69,40 +71,6 @@ pub fn record_merge(log_path: &Path, record: &MergeRecord) -> Result<()> {
     file.write_all(b"\n")
         .with_context(|| format!("failed to append newline to {}", log_path.display()))?;
     Ok(())
-}
-
-pub fn read_merge_log(log_path: &Path) -> Result<Vec<MergeRecord>> {
-    if !log_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let file =
-        File::open(log_path).with_context(|| format!("failed to open {}", log_path.display()))?;
-    let reader = BufReader::new(file);
-    let mut records = Vec::new();
-
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| {
-            format!(
-                "failed to read line {} from {}",
-                index + 1,
-                log_path.display()
-            )
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record = serde_json::from_str::<MergeRecord>(&line).with_context(|| {
-            format!(
-                "failed to parse merge record line {} from {}",
-                index + 1,
-                log_path.display()
-            )
-        })?;
-        records.push(record);
-    }
-
-    Ok(records)
 }
 
 pub fn record_test_timing(log_path: &Path, record: &TestTimingRecord) -> Result<()> {
@@ -282,18 +250,6 @@ mod tests {
         assert_eq!(content.lines().count(), 2);
         assert!(content.contains("\"task_id\":29"));
         assert!(content.contains("\"task_id\":30"));
-    }
-
-    #[test]
-    fn read_merge_log_parses_back() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log_path = tmp.path().join("merge-log.jsonl");
-        let record = sample_merge_record();
-
-        record_merge(&log_path, &record).unwrap();
-
-        let parsed = read_merge_log(&log_path).unwrap();
-        assert_eq!(parsed, vec![record]);
     }
 
     #[test]

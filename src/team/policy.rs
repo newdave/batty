@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::config::{RoleType, WorkflowPolicy};
 
 pub fn check_wip_limit(policy: &WorkflowPolicy, role_type: RoleType, active_count: u32) -> bool {
@@ -15,10 +13,12 @@ pub fn check_wip_limit(policy: &WorkflowPolicy, role_type: RoleType, active_coun
     }
 }
 
+#[cfg(test)]
 pub fn is_review_nudge_due(policy: &WorkflowPolicy, review_age_secs: u64) -> bool {
     review_age_secs >= policy.review_nudge_threshold_secs
 }
 
+#[cfg(test)]
 pub fn is_review_stale(policy: &WorkflowPolicy, review_age_secs: u64) -> bool {
     review_age_secs >= policy.review_timeout_secs
 }

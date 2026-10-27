@@ -334,15 +334,6 @@ pub(super) fn kill_pid(pid: u32, signal: libc::c_int) -> bool {
     unsafe { libc::kill(pid, signal) == 0 }
 }
 
-/// Send `signal` to the process group led by `pid`, ignoring invalid pids.
-pub(super) fn kill_process_group(pid: u32, signal: libc::c_int) -> bool {
-    let Some(pid) = signalable_pid(pid) else {
-        return false;
-    };
-    // SAFETY: pid is validated positive, so `-pid` is a specific group.
-    unsafe { libc::kill(-pid, signal) == 0 }
-}
-
 /// Non-blocking exit check for a child of this process. Reaps the child when
 /// it has exited (so it does not linger as a zombie). For pids that are not
 /// our children, falls back to an existence check.
@@ -377,7 +368,6 @@ mod tests {
     fn invalid_pids_are_never_signalled() {
         assert!(!pid_alive(0));
         assert!(!kill_pid(0, libc::SIGKILL));
-        assert!(!kill_process_group(0, libc::SIGKILL));
         assert!(reap_if_exited(0));
     }
 

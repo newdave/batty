@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::{Path, PathBuf};
 
 /// Resolve the kanban root directory for a project.

@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 //! Dependency-aware nudge target selection.
 
 use std::collections::{BTreeMap, HashMap};

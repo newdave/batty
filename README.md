@@ -251,8 +251,7 @@ roles:
 ```
 
 See [docs/config-reference.md](docs/config-reference.md) for the hand-written
-`team.yaml` guide and [docs/reference/config.md](docs/reference/config.md) for
-the lower-level `.batty/config.toml` runtime defaults.
+`team.yaml` guide.
 
 ## Monitoring
 

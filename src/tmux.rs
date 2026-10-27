@@ -3,11 +3,8 @@
 //! Wraps tmux CLI commands for session lifecycle, output capture via pipe-pane,
 //! input injection via send-keys, and pane management. This replaces the
 //! portable-pty direct approach from Phase 1 with tmux-based supervision.
-#![allow(dead_code)]
 
-use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -15,13 +12,9 @@ use tracing::{debug, info, warn};
 
 use crate::team::errors::TmuxError;
 
-static PROBE_COUNTER: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
 const SUPERVISOR_CONTROL_OPTION: &str = "@batty_supervisor_control";
 
-/// Default tmux-prefix hotkey for pausing Batty supervision.
-pub const SUPERVISOR_PAUSE_HOTKEY: &str = "C-b P";
-/// Default tmux-prefix hotkey for resuming Batty supervision.
-pub const SUPERVISOR_RESUME_HOTKEY: &str = "C-b R";
 const SEND_KEYS_SUBMIT_DELAY_MS: u64 = 100;
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -36,131 +29,13 @@ fn tmux_command_timeout() -> Duration {
     TMUX_COMMAND_TIMEOUT
 }
 
-/// Known split strategies for creating the orchestrator log pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SplitMode {
-    Lines,
-    Percent,
-    Disabled,
-}
-
-/// tmux capability probe result used by orchestrator startup.
-#[derive(Debug, Clone)]
-pub struct TmuxCapabilities {
-    pub version_raw: String,
-    pub version: Option<(u32, u32)>,
-    pub pipe_pane: bool,
-    pub pipe_pane_only_if_missing: bool,
-    pub status_style: bool,
-    pub split_mode: SplitMode,
-}
-
-impl TmuxCapabilities {
-    /// Known-good range documented for Batty runtime behavior.
-    ///
-    /// Current matrix:
-    /// - 3.2+ known-good
-    /// - 3.1 supported with fallbacks
-    /// - older versions unsupported
-    pub fn known_good(&self) -> bool {
-        matches!(self.version, Some((major, minor)) if major > 3 || (major == 3 && minor >= 2))
-    }
-
-    pub fn remediation_message(&self) -> String {
-        format!(
-            "tmux capability check failed (detected '{}'). Batty requires working `pipe-pane` support. \
-Install or upgrade tmux (recommended >= 3.2) and re-run `batty start`.",
-            self.version_raw
-        )
-    }
-}
-
-/// Metadata for a tmux pane.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaneDetails {
-    pub id: String,
-    pub command: String,
-    pub active: bool,
-    pub dead: bool,
-}
-
-fn check_tmux_with_program(program: &str) -> Result<String> {
-    let output = Command::new(program).arg("-V").output().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            TmuxError::NotInstalled
-        } else {
-            TmuxError::exec("tmux -V", error)
-        }
-    })?;
-
-    if !output.status.success() {
-        return Err(TmuxError::command_failed(
-            "tmux -V",
-            None,
-            &String::from_utf8_lossy(&output.stderr),
-        )
-        .into());
-    }
-
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    debug!(version = %version, "tmux found");
-    Ok(version)
-}
-
-/// Check that tmux is installed and reachable.
-pub fn check_tmux() -> Result<String> {
-    check_tmux_with_program("tmux")
-}
-
+#[cfg(test)]
 /// Return whether the tmux binary is available in the current environment.
 pub fn tmux_available() -> bool {
-    check_tmux().is_ok()
-}
-
-fn parse_tmux_version(version_raw: &str) -> Option<(u32, u32)> {
-    let raw = version_raw.trim();
-    let ver = raw.strip_prefix("tmux ")?;
-    let mut chars = ver.chars().peekable();
-
-    let mut major = String::new();
-    while let Some(c) = chars.peek() {
-        if c.is_ascii_digit() {
-            major.push(*c);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    if major.is_empty() {
-        return None;
-    }
-
-    if chars.next()? != '.' {
-        return None;
-    }
-
-    let mut minor = String::new();
-    while let Some(c) = chars.peek() {
-        if c.is_ascii_digit() {
-            minor.push(*c);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    if minor.is_empty() {
-        return None;
-    }
-
-    Some((major.parse().ok()?, minor.parse().ok()?))
-}
-
-fn run_tmux<I, S>(args: I) -> Result<Output>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    run_tmux_with_timeout(args, "tmux", None)
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 pub(crate) fn run_tmux_with_timeout<I, S>(
@@ -254,116 +129,6 @@ fn command_output_with_timeout(
     }
 }
 
-/// Probe tmux capabilities used by Batty and choose compatible behavior.
-pub fn probe_capabilities() -> Result<TmuxCapabilities> {
-    let version_raw = check_tmux()?;
-    let version = parse_tmux_version(&version_raw);
-
-    let probe_id = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let session = format!("batty-cap-probe-{}-{probe_id}", std::process::id());
-    let _ = kill_session(&session);
-    create_session(&session, "sleep", &["20".to_string()], "/tmp")
-        .with_context(|| format!("failed to create tmux probe session '{session}'"))?;
-    let pane = pane_id(&session)?;
-
-    let cleanup = || {
-        let _ = kill_session(&session);
-    };
-
-    let pipe_cmd = "cat >/dev/null";
-    let pipe_pane = match run_tmux(["pipe-pane", "-t", pane.as_str(), pipe_cmd]) {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
-    };
-
-    let pipe_pane_only_if_missing =
-        match run_tmux(["pipe-pane", "-o", "-t", pane.as_str(), pipe_cmd]) {
-            Ok(out) => out.status.success(),
-            Err(_) => false,
-        };
-
-    // Stop piping in probe session (best-effort).
-    let _ = run_tmux(["pipe-pane", "-t", pane.as_str()]);
-
-    let status_style = match run_tmux([
-        "set",
-        "-t",
-        session.as_str(),
-        "status-style",
-        "bg=colour235,fg=colour136",
-    ]) {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
-    };
-
-    let split_lines = match run_tmux([
-        "split-window",
-        "-v",
-        "-l",
-        "3",
-        "-t",
-        session.as_str(),
-        "sleep",
-        "1",
-    ]) {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
-    };
-    let split_percent = if split_lines {
-        false
-    } else {
-        match run_tmux([
-            "split-window",
-            "-v",
-            "-p",
-            "20",
-            "-t",
-            session.as_str(),
-            "sleep",
-            "1",
-        ]) {
-            Ok(out) => out.status.success(),
-            Err(_) => false,
-        }
-    };
-
-    cleanup();
-
-    let split_mode = if split_lines {
-        SplitMode::Lines
-    } else if split_percent {
-        SplitMode::Percent
-    } else {
-        SplitMode::Disabled
-    };
-
-    Ok(TmuxCapabilities {
-        version_raw,
-        version,
-        pipe_pane,
-        pipe_pane_only_if_missing,
-        status_style,
-        split_mode,
-    })
-}
-
-/// Convention for session names: `batty-<phase>`.
-pub fn session_name(phase: &str) -> String {
-    // tmux target parsing treats '.' as pane separators, so session names
-    // should avoid dots and other punctuation that can be interpreted.
-    let sanitized: String = phase
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("batty-{sanitized}")
-}
-
 /// Check if a tmux session exists.
 pub fn session_exists(session: &str) -> bool {
     run_tmux_with_timeout(["has-session", "-t", session], "has-session", Some(session))
@@ -406,24 +171,6 @@ pub fn pane_dead(target: &str) -> Result<bool> {
             &stderr,
         )
         .into());
-    }
-
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(value == "1")
-}
-
-/// Check whether a pane currently has an active `pipe-pane` command.
-pub fn pane_pipe_enabled(target: &str) -> Result<bool> {
-    let output = run_tmux_with_timeout(
-        ["display-message", "-p", "-t", target, "#{pane_pipe}"],
-        "display-message #{pane_pipe}",
-        Some(target),
-    )
-    .with_context(|| format!("failed to query pane_pipe for target '{target}'"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tmux display-message pane_pipe failed: {stderr}");
     }
 
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -523,27 +270,6 @@ pub fn pane_current_path(target: &str) -> Result<String> {
     Ok(path)
 }
 
-/// Get the configured session working directory path.
-pub fn session_path(session: &str) -> Result<String> {
-    let output = run_tmux_with_timeout(
-        ["display-message", "-p", "-t", session, "#{session_path}"],
-        "display-message #{session_path}",
-        Some(session),
-    )
-    .with_context(|| format!("failed to resolve session path for '{session}'"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tmux display-message session_path failed: {stderr}");
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        bail!("tmux returned empty session path for '{session}'");
-    }
-    Ok(path)
-}
-
 /// Create a detached tmux session running the given command.
 ///
 /// The session is created with `new-session -d` so it starts in the background.
@@ -592,6 +318,7 @@ pub fn create_session(session: &str, program: &str, args: &[String], work_dir: &
     Ok(())
 }
 
+#[cfg(test)]
 /// Create a detached tmux window in an existing session running the given command.
 pub fn create_window(
     session: &str,
@@ -652,6 +379,7 @@ pub fn rename_window(target: &str, new_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 /// Select a tmux window target (e.g. `session:agent-1`).
 pub fn select_window(target: &str) -> Result<()> {
     let output = run_tmux_with_timeout(
@@ -669,11 +397,12 @@ pub fn select_window(target: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 /// Set up pipe-pane to capture all output from the target pane to a log file.
 ///
 /// Uses `tmux pipe-pane -t <session> "cat >> <log_path>"` to stream all PTY
 /// output to a file. This is the foundation for event extraction.
-pub fn setup_pipe_pane(target: &str, log_path: &Path) -> Result<()> {
+pub fn setup_pipe_pane(target: &str, log_path: &std::path::Path) -> Result<()> {
     // Ensure log directory exists
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)
@@ -694,34 +423,6 @@ pub fn setup_pipe_pane(target: &str, log_path: &Path) -> Result<()> {
     }
 
     info!(target = target, log = %log_path.display(), "pipe-pane configured");
-    Ok(())
-}
-
-/// Set up pipe-pane only if none is configured yet (`tmux pipe-pane -o`).
-pub fn setup_pipe_pane_if_missing(target: &str, log_path: &Path) -> Result<()> {
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create log directory: {}", parent.display()))?;
-    }
-
-    let pipe_cmd = format!("cat >> {}", log_path.display());
-    let output = run_tmux_with_timeout(
-        ["pipe-pane", "-o", "-t", target, &pipe_cmd],
-        "pipe-pane -o",
-        Some(target),
-    )
-    .with_context(|| format!("failed to set up pipe-pane (-o) for target '{target}'"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tmux pipe-pane -o failed: {stderr}");
-    }
-
-    info!(
-        target = target,
-        log = %log_path.display(),
-        "pipe-pane ensured (only-if-missing)"
-    );
     Ok(())
 }
 
@@ -822,6 +523,7 @@ pub fn list_sessions_with_prefix(prefix: &str) -> Vec<String> {
     }
 }
 
+#[cfg(test)]
 /// RAII guard that kills a tmux session on drop.
 ///
 /// Ensures test sessions are cleaned up even on panic/assert failure.
@@ -830,7 +532,9 @@ pub struct TestSession {
     name: String,
 }
 
+#[cfg(test)]
 impl TestSession {
+    #[cfg(test)]
     /// Create a new test session guard wrapping an existing session name.
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
@@ -838,12 +542,14 @@ impl TestSession {
         Self { name }
     }
 
+    #[cfg(test)]
     /// The session name.
     pub fn name(&self) -> &str {
         &self.name
     }
 }
 
+#[cfg(test)]
 impl Drop for TestSession {
     fn drop(&mut self) {
         let _ = kill_session(&self.name);
@@ -913,6 +619,7 @@ pub fn set_mouse(session: &str, enabled: bool) -> Result<()> {
     tmux_set(session, "mouse", value)
 }
 
+#[cfg(test)]
 fn bind_supervisor_hotkey(session: &str, key: &str, action: &str) -> Result<()> {
     let output = run_tmux_with_timeout(
         [
@@ -939,6 +646,7 @@ fn bind_supervisor_hotkey(session: &str, key: &str, action: &str) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
 /// Configure per-session supervisor hotkeys:
 /// - `Prefix + Shift+P` -> pause automation
 /// - `Prefix + Shift+R` -> resume automation
@@ -947,37 +655,6 @@ pub fn configure_supervisor_hotkeys(session: &str) -> Result<()> {
     bind_supervisor_hotkey(session, "P", "pause")?;
     bind_supervisor_hotkey(session, "R", "resume")?;
     Ok(())
-}
-
-/// Read and clear a queued supervisor hotkey action for the session.
-///
-/// Returns `Some("pause")` / `Some("resume")` when set, or `None` when idle.
-pub fn take_supervisor_hotkey_action(session: &str) -> Result<Option<String>> {
-    let output = run_tmux_with_timeout(
-        [
-            "show-options",
-            "-v",
-            "-t",
-            session,
-            SUPERVISOR_CONTROL_OPTION,
-        ],
-        "show-options",
-        Some(session),
-    )
-    .with_context(|| format!("failed to read supervisor control option for session '{session}'"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tmux show-options supervisor control failed: {stderr}");
-    }
-
-    let action = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if action.is_empty() {
-        return Ok(None);
-    }
-
-    tmux_set(session, SUPERVISOR_CONTROL_OPTION, "")?;
-    Ok(Some(action))
 }
 
 /// List panes in a session.
@@ -1024,46 +701,6 @@ fn list_window_names(session: &str) -> Result<Vec<String>> {
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .collect())
-}
-
-/// List panes in a session with command/active/dead metadata.
-pub fn list_pane_details(session: &str) -> Result<Vec<PaneDetails>> {
-    let output = run_tmux_with_timeout(
-        [
-            "list-panes",
-            "-t",
-            session,
-            "-F",
-            "#{pane_id}\t#{pane_current_command}\t#{pane_active}\t#{pane_dead}",
-        ],
-        "list-panes details",
-        Some(session),
-    )
-    .with_context(|| format!("failed to list pane details for session '{session}'"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tmux list-panes details failed: {stderr}");
-    }
-
-    let mut panes = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut parts = line.split('\t');
-        let Some(id) = parts.next() else { continue };
-        let Some(command) = parts.next() else {
-            continue;
-        };
-        let Some(active) = parts.next() else { continue };
-        let Some(dead) = parts.next() else { continue };
-        panes.push(PaneDetails {
-            id: id.to_string(),
-            command: command.to_string(),
-            active: active == "1",
-            dead: dead == "1",
-        });
-    }
-
-    Ok(panes)
 }
 
 /// Helper: run `tmux set -t <session> <option> <value>`.
@@ -1153,61 +790,6 @@ pub fn select_layout_even(target_pane: &str) -> Result<()> {
     Ok(())
 }
 
-/// Load text into a tmux paste buffer.
-/// Named buffer used by batty to avoid clobbering the user's paste buffer.
-const BATTY_BUFFER_NAME: &str = "batty-inject";
-
-/// Load text into a named tmux paste buffer.
-///
-/// Uses a dedicated buffer name so we never clobber the user's default
-/// paste buffer (which is what Ctrl-] / middle-click uses).
-pub fn load_buffer(content: &str) -> Result<()> {
-    let tmp = std::env::temp_dir().join(format!("batty-buf-{}", std::process::id()));
-    std::fs::write(&tmp, content)
-        .with_context(|| format!("failed to write buffer file {}", tmp.display()))?;
-
-    let output = run_tmux_with_timeout(
-        [
-            "load-buffer",
-            "-b",
-            BATTY_BUFFER_NAME,
-            &tmp.to_string_lossy(),
-        ],
-        "load-buffer",
-        Some(BATTY_BUFFER_NAME),
-    )
-    .context("failed to run tmux load-buffer")?;
-
-    let _ = std::fs::remove_file(&tmp);
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tmux load-buffer failed: {stderr}");
-    }
-
-    Ok(())
-}
-
-/// Paste the named batty buffer into a target pane and delete the buffer.
-///
-/// The `-d` flag deletes the buffer after pasting so it doesn't linger.
-/// The `-b` flag selects the batty-specific buffer (never the user's default).
-pub fn paste_buffer(target: &str) -> Result<()> {
-    let output = run_tmux_with_timeout(
-        ["paste-buffer", "-d", "-b", BATTY_BUFFER_NAME, "-t", target],
-        "paste-buffer",
-        Some(target),
-    )
-    .with_context(|| format!("failed to paste buffer into '{target}'"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tmux paste-buffer failed: {stderr}");
-    }
-
-    Ok(())
-}
-
 /// Kill a specific tmux pane.
 pub fn kill_pane(target: &str) -> Result<()> {
     let output = run_tmux_with_timeout(["kill-pane", "-t", target], "kill-pane", Some(target))
@@ -1283,33 +865,6 @@ mod tests {
         }
         eprintln!("skipping tmux integration test: tmux binary unavailable");
         false
-    }
-
-    #[test]
-    fn session_name_convention() {
-        assert_eq!(session_name("phase-1"), "batty-phase-1");
-        assert_eq!(session_name("phase-2"), "batty-phase-2");
-        assert_eq!(session_name("phase-2.5"), "batty-phase-2-5");
-        assert_eq!(session_name("phase 3"), "batty-phase-3");
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "integration"), ignore)]
-    fn check_tmux_finds_binary() {
-        let _env_lock = env_lock();
-        let version = check_tmux().unwrap();
-        assert!(
-            version.starts_with("tmux"),
-            "expected tmux version, got: {version}"
-        );
-    }
-
-    #[test]
-    fn parse_tmux_version_supports_minor_suffixes() {
-        assert_eq!(parse_tmux_version("tmux 3.4"), Some((3, 4)));
-        assert_eq!(parse_tmux_version("tmux 3.3a"), Some((3, 3)));
-        assert_eq!(parse_tmux_version("tmux 2.9"), Some((2, 9)));
-        assert_eq!(parse_tmux_version("tmux unknown"), None);
     }
 
     #[test]
@@ -1415,45 +970,6 @@ mod tests {
     }
 
     #[test]
-    fn check_tmux_reports_missing_binary() {
-        assert!(check_tmux_with_program("__batty_missing_tmux__").is_err());
-    }
-
-    #[test]
-    fn capabilities_known_good_matrix() {
-        let good = TmuxCapabilities {
-            version_raw: "tmux 3.2".to_string(),
-            version: Some((3, 2)),
-            pipe_pane: true,
-            pipe_pane_only_if_missing: true,
-            status_style: true,
-            split_mode: SplitMode::Lines,
-        };
-        assert!(good.known_good());
-
-        let fallback = TmuxCapabilities {
-            version_raw: "tmux 3.1".to_string(),
-            version: Some((3, 1)),
-            pipe_pane: true,
-            pipe_pane_only_if_missing: false,
-            status_style: true,
-            split_mode: SplitMode::Percent,
-        };
-        assert!(!fallback.known_good());
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "integration"), ignore)]
-    fn capability_probe_reports_pipe_pane() {
-        let _env_lock = env_lock();
-        let caps = probe_capabilities().unwrap();
-        assert!(
-            caps.pipe_pane,
-            "pipe-pane should be available for batty runtime"
-        );
-    }
-
-    #[test]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn nonexistent_session_does_not_exist() {
         let _env_lock = env_lock();
@@ -1478,20 +994,6 @@ mod tests {
         // Kill
         kill_session(session).unwrap();
         assert!(!session_exists(session));
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "integration"), ignore)]
-    fn session_path_returns_working_directory() {
-        let _env_lock = env_lock();
-        let session = "batty-test-session-path";
-        let _ = kill_session(session);
-
-        create_session(session, "sleep", &["10".to_string()], "/tmp").unwrap();
-        let path = session_path(session).unwrap();
-        assert_eq!(path, "/tmp");
-
-        kill_session(session).unwrap();
     }
 
     #[test]
@@ -1794,28 +1296,6 @@ mod tests {
 
     #[test]
     #[cfg_attr(not(feature = "integration"), ignore)]
-    fn list_pane_details_includes_active_flag() {
-        let _env_lock = env_lock();
-        let session = "batty-test-pane-details";
-        let _ = kill_session(session);
-
-        create_session(session, "sleep", &["10".to_string()], "/tmp").unwrap();
-
-        let panes = list_pane_details(session).unwrap();
-        assert!(
-            !panes.is_empty(),
-            "expected at least one pane detail record"
-        );
-        assert!(
-            panes.iter().any(|p| p.active),
-            "expected one active pane, got: {panes:?}"
-        );
-
-        kill_session(session).unwrap();
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "integration"), ignore)]
     fn configure_supervisor_hotkeys_initializes_control_option() {
         let _env_lock = env_lock();
         let session = "batty-test-supervisor-hotkeys";
@@ -1836,26 +1316,6 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty());
-
-        kill_session(session).unwrap();
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "integration"), ignore)]
-    fn take_supervisor_hotkey_action_reads_and_clears() {
-        let _env_lock = env_lock();
-        let session = "batty-test-supervisor-action";
-        let _ = kill_session(session);
-
-        create_session(session, "sleep", &["10".to_string()], "/tmp").unwrap();
-        configure_supervisor_hotkeys(session).unwrap();
-        tmux_set(session, SUPERVISOR_CONTROL_OPTION, "pause").unwrap();
-
-        let first = take_supervisor_hotkey_action(session).unwrap();
-        assert_eq!(first.as_deref(), Some("pause"));
-
-        let second = take_supervisor_hotkey_action(session).unwrap();
-        assert!(second.is_none(), "expected action to be cleared");
 
         kill_session(session).unwrap();
     }
@@ -1929,190 +1389,13 @@ mod tests {
 
     // --- parse_tmux_version edge cases ---
 
-    #[test]
-    fn parse_tmux_version_empty_string() {
-        assert_eq!(parse_tmux_version(""), None);
-    }
-
-    #[test]
-    fn parse_tmux_version_no_prefix() {
-        // Missing "tmux " prefix
-        assert_eq!(parse_tmux_version("3.4"), None);
-    }
-
-    #[test]
-    fn parse_tmux_version_major_only_no_dot() {
-        assert_eq!(parse_tmux_version("tmux 3"), None);
-    }
-
-    #[test]
-    fn parse_tmux_version_multi_digit() {
-        assert_eq!(parse_tmux_version("tmux 10.12"), Some((10, 12)));
-    }
-
-    #[test]
-    fn parse_tmux_version_trailing_whitespace() {
-        assert_eq!(parse_tmux_version("  tmux 3.4  "), Some((3, 4)));
-    }
-
-    #[test]
-    fn parse_tmux_version_next_suffix() {
-        // "next-3.5" style dev builds
-        assert_eq!(parse_tmux_version("tmux next-3.5"), None);
-    }
-
-    #[test]
-    fn parse_tmux_version_dot_no_minor() {
-        assert_eq!(parse_tmux_version("tmux 3."), None);
-    }
-
-    #[test]
-    fn parse_tmux_version_double_suffix_letters() {
-        assert_eq!(parse_tmux_version("tmux 3.3ab"), Some((3, 3)));
-    }
-
     // --- TmuxCapabilities edge cases ---
-
-    #[test]
-    fn capabilities_known_good_version_4() {
-        let caps = TmuxCapabilities {
-            version_raw: "tmux 4.0".to_string(),
-            version: Some((4, 0)),
-            pipe_pane: true,
-            pipe_pane_only_if_missing: true,
-            status_style: true,
-            split_mode: SplitMode::Lines,
-        };
-        assert!(caps.known_good(), "4.0 should be known good");
-    }
-
-    #[test]
-    fn capabilities_known_good_version_2_9() {
-        let caps = TmuxCapabilities {
-            version_raw: "tmux 2.9".to_string(),
-            version: Some((2, 9)),
-            pipe_pane: true,
-            pipe_pane_only_if_missing: false,
-            status_style: true,
-            split_mode: SplitMode::Percent,
-        };
-        assert!(!caps.known_good(), "2.9 should not be known good");
-    }
-
-    #[test]
-    fn capabilities_known_good_version_3_0() {
-        let caps = TmuxCapabilities {
-            version_raw: "tmux 3.0".to_string(),
-            version: Some((3, 0)),
-            pipe_pane: true,
-            pipe_pane_only_if_missing: false,
-            status_style: true,
-            split_mode: SplitMode::Percent,
-        };
-        assert!(!caps.known_good(), "3.0 should not be known good");
-    }
-
-    #[test]
-    fn capabilities_known_good_none_version() {
-        let caps = TmuxCapabilities {
-            version_raw: "tmux unknown".to_string(),
-            version: None,
-            pipe_pane: false,
-            pipe_pane_only_if_missing: false,
-            status_style: false,
-            split_mode: SplitMode::Disabled,
-        };
-        assert!(!caps.known_good(), "None version should not be known good");
-    }
-
-    #[test]
-    fn capabilities_remediation_message_includes_version() {
-        let caps = TmuxCapabilities {
-            version_raw: "tmux 2.8".to_string(),
-            version: Some((2, 8)),
-            pipe_pane: false,
-            pipe_pane_only_if_missing: false,
-            status_style: false,
-            split_mode: SplitMode::Disabled,
-        };
-        let msg = caps.remediation_message();
-        assert!(
-            msg.contains("tmux 2.8"),
-            "message should include detected version"
-        );
-        assert!(
-            msg.contains("pipe-pane"),
-            "message should mention pipe-pane requirement"
-        );
-        assert!(msg.contains("3.2"), "message should recommend >= 3.2");
-    }
 
     // --- session_name edge cases ---
 
-    #[test]
-    fn session_name_empty_input() {
-        assert_eq!(session_name(""), "batty-");
-    }
-
-    #[test]
-    fn session_name_preserves_underscores() {
-        assert_eq!(session_name("my_session"), "batty-my_session");
-    }
-
-    #[test]
-    fn session_name_replaces_colons_and_slashes() {
-        assert_eq!(session_name("a:b/c"), "batty-a-b-c");
-    }
-
-    #[test]
-    fn session_name_replaces_multiple_dots() {
-        assert_eq!(session_name("v1.2.3"), "batty-v1-2-3");
-    }
-
     // --- PaneDetails struct ---
 
-    #[test]
-    fn pane_details_clone_and_eq() {
-        let pd = PaneDetails {
-            id: "%5".to_string(),
-            command: "bash".to_string(),
-            active: true,
-            dead: false,
-        };
-        let cloned = pd.clone();
-        assert_eq!(pd, cloned);
-        assert_eq!(pd.id, "%5");
-        assert!(pd.active);
-        assert!(!pd.dead);
-    }
-
-    #[test]
-    fn pane_details_not_equal_different_id() {
-        let a = PaneDetails {
-            id: "%1".to_string(),
-            command: "bash".to_string(),
-            active: true,
-            dead: false,
-        };
-        let b = PaneDetails {
-            id: "%2".to_string(),
-            command: "bash".to_string(),
-            active: true,
-            dead: false,
-        };
-        assert_ne!(a, b);
-    }
-
     // --- SplitMode ---
-
-    #[test]
-    fn split_mode_debug_and_eq() {
-        assert_eq!(SplitMode::Lines, SplitMode::Lines);
-        assert_ne!(SplitMode::Lines, SplitMode::Percent);
-        assert_ne!(SplitMode::Percent, SplitMode::Disabled);
-        let copied = SplitMode::Lines;
-        assert_eq!(format!("{:?}", copied), "Lines");
-    }
 
     // --- TestSession ---
 
@@ -2261,31 +1544,6 @@ mod tests {
 
     #[test]
     #[cfg_attr(not(feature = "integration"), ignore)]
-    fn load_buffer_and_paste_buffer_injects_text() {
-        let _env_lock = env_lock();
-        if !require_tmux_integration() {
-            return;
-        }
-        let session = "batty-test-paste-buf";
-        let _guard = TestSession::new(session);
-        create_session(session, "cat", &[], "/tmp").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let pane = pane_id(session).unwrap();
-        load_buffer("hello-from-buffer").unwrap();
-        paste_buffer(&pane).unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let live_pane = pane_id(session).unwrap_or(pane);
-        let content = capture_pane(&live_pane).unwrap();
-        assert!(
-            content.contains("hello-from-buffer"),
-            "paste-buffer should inject text into pane, got: {content:?}"
-        );
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "integration"), ignore)]
     fn kill_pane_removes_pane() {
         let _env_lock = env_lock();
         if !require_tmux_integration() {
@@ -2401,34 +1659,6 @@ mod tests {
 
     #[test]
     #[cfg_attr(not(feature = "integration"), ignore)]
-    fn setup_pipe_pane_if_missing_works() {
-        let _env_lock = env_lock();
-        if !require_tmux_integration() {
-            return;
-        }
-        let session = "batty-test-pipe-if-missing";
-        let _guard = TestSession::new(session);
-        let tmp = tempfile::tempdir().unwrap();
-        let log_path = tmp.path().join("pipe-if-missing.log");
-
-        create_session(
-            session,
-            "bash",
-            &["-c".to_string(), "sleep 10".to_string()],
-            "/tmp",
-        )
-        .unwrap();
-
-        // Use session target instead of pane ID for reliability
-        // First call should set up pipe-pane
-        setup_pipe_pane_if_missing(session, &log_path).unwrap();
-
-        // Second call should be a no-op (not error)
-        setup_pipe_pane_if_missing(session, &log_path).unwrap();
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "integration"), ignore)]
     fn select_layout_even_after_splits() {
         let _env_lock = env_lock();
         if !require_tmux_integration() {
@@ -2507,27 +1737,6 @@ mod tests {
             content.contains("zero-lines-test"),
             "should capture full content with lines=0, got: {content:?}"
         );
-    }
-
-    #[test]
-    #[cfg_attr(not(feature = "integration"), ignore)]
-    fn list_pane_details_shows_command_info() {
-        let _env_lock = env_lock();
-        if !require_tmux_integration() {
-            return;
-        }
-        let session = "batty-test-pane-details-cmd";
-        let _guard = TestSession::new(session);
-        create_session(session, "sleep", &["10".to_string()], "/tmp").unwrap();
-
-        let details = list_pane_details(session).unwrap();
-        assert_eq!(details.len(), 1);
-        assert!(details[0].id.starts_with('%'));
-        assert!(
-            details[0].command == "sleep" || !details[0].command.is_empty(),
-            "command should be reported"
-        );
-        assert!(!details[0].dead, "sleep pane should not be dead");
     }
 
     #[test]

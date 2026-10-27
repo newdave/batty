@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 //! Resolve board tasks into runnable workflow states.
 
 use std::collections::{HashMap, HashSet};
@@ -10,10 +8,12 @@ use serde::Deserialize;
 
 use crate::task::{Task, load_tasks_from_dir};
 
+#[cfg(test)]
 use super::capability::WorkflowCapability;
 use super::config::RoleType;
 use super::hierarchy::MemberInstance;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionStatus {
     Runnable,
@@ -22,6 +22,7 @@ pub enum ResolutionStatus {
     NeedsAction,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskResolution {
     pub task_id: u32,
@@ -35,10 +36,12 @@ pub struct TaskResolution {
 
 #[derive(Debug, Default, Deserialize)]
 struct WorkflowMetadata {
+    #[cfg(test)]
     #[serde(default)]
     execution_owner: Option<String>,
     #[serde(default)]
     blocked_on: Option<String>,
+    #[cfg(test)]
     #[serde(default)]
     review_owner: Option<String>,
     #[serde(default)]
@@ -49,6 +52,7 @@ struct WorkflowMetadata {
     artifacts: Vec<String>,
 }
 
+#[cfg(test)]
 pub fn resolve_board(board_dir: &Path, members: &[MemberInstance]) -> Result<Vec<TaskResolution>> {
     let tasks = load_tasks_from_dir(&board_dir.join("tasks"))?;
     let done: HashSet<u32> = tasks
@@ -92,6 +96,7 @@ pub fn resolve_board(board_dir: &Path, members: &[MemberInstance]) -> Result<Vec
     Ok(resolutions)
 }
 
+#[cfg(test)]
 pub fn runnable_tasks(resolutions: &[TaskResolution]) -> Vec<TaskResolution> {
     resolutions
         .iter()
@@ -245,6 +250,7 @@ pub fn is_engineer_dispatchable(task: &Task, non_engineer_names: &HashSet<String
     }
 }
 
+#[cfg(test)]
 fn acting_capability(
     task: &Task,
     metadata: &WorkflowMetadata,
@@ -348,6 +354,7 @@ fn load_workflow_metadata(task: &Task) -> Result<WorkflowMetadata> {
     serde_yaml::from_str(frontmatter).context("failed to parse workflow metadata")
 }
 
+#[cfg(test)]
 fn has_planner(members: &[MemberInstance]) -> bool {
     members
         .iter()
@@ -355,6 +362,7 @@ fn has_planner(members: &[MemberInstance]) -> bool {
         || has_executor(members)
 }
 
+#[cfg(test)]
 fn has_dispatcher(members: &[MemberInstance]) -> bool {
     members
         .iter()
@@ -362,6 +370,7 @@ fn has_dispatcher(members: &[MemberInstance]) -> bool {
         || has_executor(members)
 }
 
+#[cfg(test)]
 fn has_executor(members: &[MemberInstance]) -> bool {
     members
         .iter()
@@ -371,6 +380,7 @@ fn has_executor(members: &[MemberInstance]) -> bool {
             .any(|member| matches!(member.role_type, RoleType::Manager | RoleType::Architect))
 }
 
+#[cfg(test)]
 fn has_reviewer(members: &[MemberInstance]) -> bool {
     members
         .iter()

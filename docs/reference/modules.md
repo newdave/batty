@@ -28,13 +28,10 @@ Contributor-facing map of Batty source modules.
 | `src/agent/mod.rs`      | `AgentAdapter` trait, registry, and shared spawn contract.                |
 | `src/agent/claude.rs`   | Claude Code adapter implementation.                                       |
 | `src/agent/codex.rs`    | Codex CLI adapter implementation.                                         |
-| `src/prompt/mod.rs`     | Prompt detection patterns and ANSI-safe matching helpers.                 |
+| `src/prompt/mod.rs`     | ANSI escape stripping for agent PTY output.                               |
 | `src/worktree.rs`       | Git worktree creation, reuse, sync, and cleanup helpers.                  |
 | `src/task/mod.rs`       | Task parsing utilities for kanban-backed work items.                      |
-| `src/events.rs`         | Event extraction from captured agent output.                              |
-| `src/log/mod.rs`        | Structured JSONL logging primitives.                                      |
 | `src/paths.rs`          | Shared filesystem path helpers under `.batty/`.                           |
-| `src/config/mod.rs`     | Optional `.batty/config.toml` runtime defaults loader.                    |
 | `src/bin/docsgen.rs`    | Generator for `docs/reference/cli.md` and `docs/reference/config.md`.     |
 
 ## Key Traits and Types
@@ -55,8 +52,6 @@ Contributor-facing map of Batty source modules.
 | `AgentHandle`    | `src/team/daemon/agent_handle.rs` | Runtime handle that tracks member state and parent-side shim communication.   |
 | `Task`           | `src/task/mod.rs`                 | Parsed task metadata from the shared board.                                   |
 | `PhaseWorktree`  | `src/worktree.rs`                 | Worktree metadata used for engineer isolation and merge flow.                 |
-| `LogEntry`       | `src/log/mod.rs`                  | Structured JSONL runtime event persisted for debugging and audits.            |
-| `PipeWatcher`    | `src/events.rs`                   | Incremental output reader that extracts structured events from pane logs.     |
 
 ## Contributor Notes
 

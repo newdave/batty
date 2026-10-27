@@ -29,6 +29,7 @@ mod messaging;
 pub use messaging::*;
 pub mod board_cmd;
 pub mod board_health;
+#[cfg(test)]
 pub mod capability;
 pub mod checkpoint;
 pub mod comms;
@@ -69,6 +70,7 @@ pub mod merge;
 pub mod metrics;
 pub mod metrics_cmd;
 pub mod multi_provider;
+#[cfg(test)]
 pub mod nudge;
 pub mod openclaw;
 pub mod openclaw_contract;

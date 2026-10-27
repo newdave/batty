@@ -6,8 +6,6 @@ use serde::{Deserialize, Deserializer};
 use serde_yaml::{Mapping, Value};
 use std::path::{Path, PathBuf};
 
-use crate::config::Policy;
-
 /// Accept either a string reason or a boolean flag for the `blocked` field.
 ///
 /// kanban-md writes `blocked: true` alongside a separate `block_reason` string,
@@ -71,6 +69,16 @@ pub struct Task {
     pub description: String,
     pub batty_config: Option<TaskBattyConfig>,
     pub source_path: PathBuf,
+}
+
+/// Per-task autonomy policy override.
+#[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Policy {
+    #[default]
+    Observe,
+    Suggest,
+    Act,
 }
 
 /// Per-task overrides from `## Batty Config` section.

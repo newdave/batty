@@ -207,7 +207,7 @@ impl MergeQueue {
         self.queue.len()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn active_task_id(&self) -> Option<u32> {
         self.active.as_ref().map(|request| request.task_id)
     }
@@ -217,7 +217,7 @@ impl MergeQueue {
         self.in_flight.is_some()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn in_flight_task_id(&self) -> Option<u32> {
         self.in_flight.as_ref().map(|merge| merge.request.task_id)
     }

@@ -11,45 +11,6 @@ use tracing::{debug, info, warn};
 use super::agent_handle::AgentHandle;
 use crate::shim::protocol::{self, Channel};
 
-/// Kill any orphaned shim processes from previous daemon sessions.
-///
-/// DISABLED: cross-project kills when multiple batty projects run simultaneously.
-/// The pgrep pattern matches shims from ALL projects, not just this one.
-/// Shim lifecycle is managed by auto_respawn_on_crash instead.
-#[allow(dead_code)]
-pub(in crate::team) fn kill_orphan_shims(member_name: &str) {
-    let pattern = format!("batty shim --id {member_name}");
-    let output = match std::process::Command::new("pgrep")
-        .args(["-f", &pattern])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return,
-    };
-    if !output.status.success() {
-        return; // no matches
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let my_pid = std::process::id();
-    for line in stdout.lines() {
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            if pid == my_pid {
-                continue;
-            }
-            warn!(
-                member = member_name,
-                pid, "killing orphan shim process from previous session"
-            );
-            // Kill the process group to also terminate the child agent
-            super::helpers::kill_process_group(pid, libc::SIGTERM);
-            // Give it a moment, then force kill
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            super::helpers::kill_process_group(pid, libc::SIGKILL);
-            super::helpers::kill_pid(pid, libc::SIGKILL);
-        }
-    }
-}
-
 /// Query the tmux pane dimensions for a member by looking up their pane ID
 /// in the current session.
 fn query_pane_size(member_name: &str) -> Option<(u16, u16)> {
