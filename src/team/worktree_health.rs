@@ -378,18 +378,7 @@ fn behind_trunk_count(project_root: &Path, path: &Path, trunk_branch: &str) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn git_ok(repo: &Path, args: &[&str]) {
-        assert!(
-            Command::new(git_program())
-                .args(args)
-                .current_dir(repo)
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
-
+    use crate::team::test_support::git_ok;
     fn init_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         assert!(

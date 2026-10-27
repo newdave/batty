@@ -545,36 +545,8 @@ pub fn discord_status(project_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::{EnvVarGuard, env_lock};
     use crate::team::{board, inbox, team_config_dir, team_config_path};
-    use serial_test::serial;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn unset(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.original.as_deref() {
-                Some(value) => unsafe {
-                    std::env::set_var(self.key, value);
-                },
-                None => unsafe {
-                    std::env::remove_var(self.key);
-                },
-            }
-        }
-    }
 
     fn write_team_config(project_root: &Path, yaml: &str) {
         std::fs::create_dir_all(team_config_dir(project_root)).unwrap();
@@ -738,25 +710,13 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn send_message_ignores_detected_sender_outside_project() {
+        let _env_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _member = EnvVarGuard::unset("TMUX_PANE");
-        let original_member = std::env::var("BATTY_MEMBER").ok();
-        unsafe {
-            std::env::set_var("BATTY_MEMBER", "foreign-engineer-9-9");
-        }
+        let _sender = EnvVarGuard::set("BATTY_MEMBER", "foreign-engineer-9-9");
 
         send_message(tmp.path(), "architect", "hello").unwrap();
-
-        match original_member.as_deref() {
-            Some(value) => unsafe {
-                std::env::set_var("BATTY_MEMBER", value);
-            },
-            None => unsafe {
-                std::env::remove_var("BATTY_MEMBER");
-            },
-        }
 
         let root = inbox::inboxes_root(tmp.path());
         let pending = inbox::pending_messages(&root, "architect").unwrap();
@@ -829,8 +789,8 @@ roles:
     }
 
     #[test]
-    #[serial]
     fn send_message_delivers_to_unique_instance_inbox() {
+        let _env_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _tmux_pane = EnvVarGuard::unset("TMUX_PANE");
         let _batty_member = EnvVarGuard::unset("BATTY_MEMBER");
@@ -856,20 +816,8 @@ roles:
 "#,
         );
 
-        let original_tmux_pane = std::env::var_os("TMUX_PANE");
-        unsafe {
-            std::env::remove_var("TMUX_PANE");
-        }
-        let send_result = send_message(tmp.path(), "sam-designer", "hello");
-        match original_tmux_pane {
-            Some(value) => unsafe {
-                std::env::set_var("TMUX_PANE", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TMUX_PANE");
-            },
-        }
-        send_result.unwrap();
+        let _tmux_pane = EnvVarGuard::unset("TMUX_PANE");
+        send_message(tmp.path(), "sam-designer", "hello").unwrap();
 
         let root = inbox::inboxes_root(tmp.path());
         assert!(

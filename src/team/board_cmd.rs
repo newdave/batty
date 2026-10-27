@@ -344,36 +344,42 @@ fn extract_task_id(text: &str, prefix: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::CwdGuard;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-    use std::sync::{LazyLock, Mutex};
 
     use tempfile::TempDir;
 
-    static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    const REAL_KANBAN_MD: &str = "/opt/homebrew/bin/kanban-md";
-
-    fn with_process_cwd<T>(cwd: &Path, action: impl FnOnce() -> T) -> T {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(cwd).unwrap();
-        let result = catch_unwind(AssertUnwindSafe(action));
-        std::env::set_current_dir(original).unwrap();
-        match result {
-            Ok(value) => value,
-            Err(panic) => resume_unwind(panic),
-        }
+    fn real_kanban_path() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("kanban-md"))
+            .find(|candidate| candidate.is_file())
     }
 
     fn real_kanban_available() -> bool {
-        Path::new(REAL_KANBAN_MD).is_file()
+        if real_kanban_path().is_some() {
+            return true;
+        }
+        eprintln!("skipping: kanban-md not found on PATH");
+        false
+    }
+
+    fn with_process_cwd<T>(cwd: &Path, action: impl FnOnce() -> T) -> T {
+        let _guard = CwdGuard::set(cwd);
+        action()
     }
 
     fn run_real_board(board_dir: &Path, args: &[&str]) -> Result<BoardOutput, BoardError> {
-        run_board_with_program(REAL_KANBAN_MD, board_dir, args)
+        run_board_with_program(
+            real_kanban_path()
+                .expect("kanban-md on PATH")
+                .to_str()
+                .expect("utf-8 path"),
+            board_dir,
+            args,
+        )
     }
 
     fn create_task_real(

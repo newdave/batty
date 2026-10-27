@@ -14,7 +14,63 @@ use crate::team::hierarchy::MemberInstance;
 use crate::team::standup::MemberState;
 use crate::team::watcher::SessionWatcher;
 
-pub(crate) static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+thread_local! {
+    static ENV_LOCK_STATE: std::cell::RefCell<(usize, Option<std::sync::MutexGuard<'static, ()>>)> =
+        const { std::cell::RefCell::new((0, None)) };
+}
+
+/// Token proving the process-wide environment lock is held by this thread.
+///
+/// The one global lock serializes every test that mutates or depends on
+/// process-global state (env vars, cwd, PATH). It is reentrant per thread, so
+/// a test may hold `env_lock()` and also create several `EnvVarGuard`s.
+pub(crate) struct EnvLock {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+pub(crate) fn env_lock() -> EnvLock {
+    ENV_LOCK_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.0 == 0 {
+            state.1 = Some(ENV_MUTEX.lock().unwrap_or_else(|error| error.into_inner()));
+        }
+        state.0 += 1;
+    });
+    EnvLock {
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        // try_with: a lock parked in another thread-local may drop during
+        // thread teardown after this state is gone (which already unlocked).
+        let _ = ENV_LOCK_STATE.try_with(|state| {
+            let mut state = state.borrow_mut();
+            state.0 -= 1;
+            if state.0 == 0 {
+                state.1 = None;
+            }
+        });
+    }
+}
+
+/// Poll `cond` until it returns true or `deadline` elapses. Returns whether
+/// the condition was met. Use instead of fixed sleeps.
+pub(crate) fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + deadline;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 const ISOLATED_TEST_CHILD_ENV: &str = "BATTY_ISOLATED_TEST_CHILD";
 
@@ -48,18 +104,39 @@ pub(crate) fn run_in_isolated_process(test_path: &str, env: &[(&str, &str)]) -> 
     false
 }
 
+/// Sets (or unsets) an environment variable for the guard's lifetime while
+/// holding the global env lock; restores the original value on drop.
 pub(crate) struct EnvVarGuard {
     key: &'static str,
-    original: Option<String>,
+    original: Option<std::ffi::OsString>,
+    _lock: EnvLock,
 }
 
 impl EnvVarGuard {
-    pub(crate) fn set(key: &'static str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let lock = env_lock();
+        let original = std::env::var_os(key);
         unsafe {
             std::env::set_var(key, value);
         }
-        Self { key, original }
+        Self {
+            key,
+            original,
+            _lock: lock,
+        }
+    }
+
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let lock = env_lock();
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self {
+            key,
+            original,
+            _lock: lock,
+        }
     }
 }
 
@@ -73,6 +150,31 @@ impl Drop for EnvVarGuard {
                 std::env::remove_var(self.key);
             },
         }
+    }
+}
+
+/// Changes the process cwd for the guard's lifetime while holding the global
+/// env lock; restores the original cwd on drop.
+pub(crate) struct CwdGuard {
+    original: PathBuf,
+    _lock: EnvLock,
+}
+
+impl CwdGuard {
+    pub(crate) fn set(dir: &Path) -> Self {
+        let lock = env_lock();
+        let original = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(dir).expect("set cwd");
+        Self {
+            original,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
     }
 }
 
@@ -374,30 +476,14 @@ pub(crate) fn inferred_role_defs(members: &[MemberInstance]) -> Vec<RoleDef> {
             .iter()
             .any(|candidate| candidate.role_name == member.role_name && candidate.use_worktrees);
         roles.push(RoleDef {
-            effort: None,
-            on_demand: false,
-            docs_only_evidence: false,
-            name: member.role_name.clone(),
-            role_type: member.role_type,
             agent: member.agent.clone(),
             model: member.model.clone(),
-            auth_mode: None,
-            auth_env: vec![],
             instances,
-            prompt: None,
             posture: member.posture.clone(),
             model_class: member.model_class.clone(),
             provider_overlay: member.provider_overlay.clone(),
-            instance_overrides: HashMap::new(),
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
             use_worktrees,
+            ..RoleDef::test(member.role_name.clone(), member.role_type)
         });
     }
     roles
@@ -415,6 +501,7 @@ pub(crate) struct TestDaemonBuilder<'a> {
     board: BoardConfig,
     automation: AutomationConfig,
     orchestrator_pane: bool,
+    roles: Option<Vec<RoleDef>>,
 }
 
 impl<'a> TestDaemonBuilder<'a> {
@@ -447,6 +534,7 @@ impl<'a> TestDaemonBuilder<'a> {
                 ..AutomationConfig::default()
             },
             orchestrator_pane: true,
+            roles: None,
         }
     }
 
@@ -490,6 +578,17 @@ impl<'a> TestDaemonBuilder<'a> {
         self
     }
 
+    pub(crate) fn automation(mut self, automation: AutomationConfig) -> Self {
+        self.automation = automation;
+        self
+    }
+
+    /// Override the role definitions (default: inferred from the members).
+    pub(crate) fn roles(mut self, roles: Vec<RoleDef>) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
     pub(crate) fn orchestrator_pane(mut self, orchestrator_pane: bool) -> Self {
         self.orchestrator_pane = orchestrator_pane;
         self
@@ -524,7 +623,9 @@ impl<'a> TestDaemonBuilder<'a> {
                 pending_queue_max_age_secs: 600,
                 event_log_max_bytes: crate::team::DEFAULT_EVENT_LOG_MAX_BYTES,
                 retro_min_duration_secs: 60,
-                roles: inferred_role_defs(&self.members),
+                roles: self
+                    .roles
+                    .unwrap_or_else(|| inferred_role_defs(&self.members)),
             },
             session: self.session,
             members: self.members,
@@ -578,23 +679,10 @@ fn test_role_defs(members: &[MemberInstance]) -> Vec<RoleDef> {
         }
 
         roles.push(RoleDef {
-            name: member.role_name.clone(),
-            role_type: member.role_type,
             agent: member.agent.clone(),
-            auth_mode: None,
-            auth_env: Vec::new(),
-            instances: 1,
             prompt: member.prompt.clone(),
-            talks_to: Vec::new(),
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
             use_worktrees: member.use_worktrees,
-            ..Default::default()
+            ..RoleDef::test(member.role_name.clone(), member.role_type)
         });
     }
     roles

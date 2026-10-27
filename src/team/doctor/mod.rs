@@ -429,10 +429,10 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
 
     use super::util::{launch_state_path, strip_nudge_section};
     use super::*;
+    use crate::team::test_support::git_ok;
 
     fn write_team_config(root: &Path) {
         write_named_team_config(root, "test");
@@ -478,22 +478,6 @@ roles:
         git_ok(root, &["add", "README.md"]);
         git_ok(root, &["commit", "-m", "initial"]);
     }
-
-    fn git_ok(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap_or_else(|error| panic!("git {:?} failed to run: {error}", args));
-        assert!(
-            output.status.success(),
-            "git {:?} failed: stdout={} stderr={}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     fn write_board_task(
         root: &Path,
         id: u32,

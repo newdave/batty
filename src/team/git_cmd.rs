@@ -353,24 +353,8 @@ pub fn for_each_ref_branches(repo: &Path) -> Result<Vec<String>, GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::git_ok;
     use tempfile::TempDir;
-
-    fn git_ok(repo: &Path, args: &[&str]) {
-        let output = Command::new(git_program())
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .unwrap_or_else(|error| panic!("git {:?} failed to run: {error}", args));
-        assert!(
-            output.status.success(),
-            "git {:?} failed: stdout={} stderr={}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     fn init_repo() -> TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();

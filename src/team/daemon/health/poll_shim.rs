@@ -1864,8 +1864,8 @@ mod tests {
     use super::*;
     use crate::team::inbox;
     use crate::team::test_support::{
-        EnvVarGuard, PATH_LOCK, TestDaemonBuilder, architect_member, engineer_member,
-        init_git_repo, manager_member, setup_fake_backend, write_owned_task_file_with_context,
+        EnvVarGuard, TestDaemonBuilder, architect_member, engineer_member, env_lock, init_git_repo,
+        manager_member, setup_fake_backend, write_owned_task_file_with_context,
     };
     use std::collections::HashMap;
 
@@ -2610,7 +2610,7 @@ mod tests {
 
     #[test]
     fn check_working_state_timeouts_restarts_stale_claude_agents() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _fake_log) = setup_fake_backend(&tmp, "batty", "fake-batty.log");
         let original_path = std::env::var("PATH").unwrap_or_default();
@@ -2663,7 +2663,7 @@ mod tests {
 
     #[test]
     fn check_working_state_timeouts_restarts_stale_claude_management_agents() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _fake_log) = setup_fake_backend(&tmp, "batty", "fake-batty.log");
         let original_path = std::env::var("PATH").unwrap_or_default();
@@ -2798,7 +2798,7 @@ mod tests {
 
     #[test]
     fn supervisory_restart_handoff_requeues_inflight_message_and_marks_shutdown_reason() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _fake_log) = setup_fake_backend(&tmp, "batty", "fake-batty.log");
         let original_path = std::env::var("PATH").unwrap_or_default();
@@ -2883,7 +2883,7 @@ mod tests {
 
     #[test]
     fn check_working_state_timeouts_escalates_repeated_supervisory_stalls() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _fake_log) = setup_fake_backend(&tmp, "batty", "fake-batty.log");
         let original_path = std::env::var("PATH").unwrap_or_default();
@@ -3204,7 +3204,7 @@ mod tests {
 
     #[test]
     fn cold_respawn_plan_rebuilds_active_task_context_for_codex_engineer() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "batty-cold-respawn-plan");
         std::fs::create_dir_all(repo.join(".batty").join("team_config")).unwrap();

@@ -1017,12 +1017,11 @@ mod tests {
     use crate::team::standup::MemberState;
     use crate::team::task_loop::setup_engineer_worktree;
     use crate::team::test_helpers::make_test_daemon;
-    use crate::team::test_support::{EnvVarGuard, PATH_LOCK, setup_fake_backend};
+    use crate::team::test_support::{EnvVarGuard, env_lock, setup_fake_backend};
     use crate::team::test_support::{
         TestDaemonBuilder, architect_member, engineer_member, git_ok, git_stdout, init_git_repo,
         manager_member,
     };
-    use serial_test::serial;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1109,16 +1108,15 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn check_backend_health_emits_event_on_transition() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".batty").join("team_config")).unwrap();
         let (fake_bin, _fake_log) = setup_fake_backend(&tmp, "claude", "health-claude.log");
         let original_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvVarGuard::set(
             "PATH",
-            &format!("{}:{original_path}", fake_bin.to_string_lossy()),
+            format!("{}:{original_path}", fake_bin.to_string_lossy()),
         );
         // Keep the real ~/.claude/.credentials.json out of the test.
         let _home = EnvVarGuard::set("HOME", tmp.path().to_str().unwrap());
@@ -1148,16 +1146,15 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn check_backend_health_no_event_when_state_unchanged() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".batty").join("team_config")).unwrap();
         let (fake_bin, _fake_log) = setup_fake_backend(&tmp, "claude", "health-claude.log");
         let original_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvVarGuard::set(
             "PATH",
-            &format!("{}:{original_path}", fake_bin.to_string_lossy()),
+            format!("{}:{original_path}", fake_bin.to_string_lossy()),
         );
         // Keep the real ~/.claude/.credentials.json out of the test.
         let _home = EnvVarGuard::set("HOME", tmp.path().to_str().unwrap());

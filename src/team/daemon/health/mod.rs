@@ -314,11 +314,11 @@ pub(super) mod test_helpers {
     };
     use std::path::PathBuf;
 
-    // Re-export the shared PATH_LOCK and EnvVarGuard so preflight tests share
+    // Re-export the shared env_lock and EnvVarGuard so preflight tests share
     // the same lock as other suites that toggle PATH. A duplicate LazyLock
     // here would allow parallel tests to race on the PATH environment variable
     // and fail `which` lookups intermittently on heavily loaded CI runners.
-    pub(crate) use crate::team::test_support::{EnvVarGuard, PATH_LOCK};
+    pub(crate) use crate::team::test_support::{EnvVarGuard, env_lock};
 
     pub fn setup_fake_kanban(tmp: &tempfile::TempDir, script_name: &str) -> PathBuf {
         let fake_bin = tmp.path().join(format!("{script_name}-bin"));

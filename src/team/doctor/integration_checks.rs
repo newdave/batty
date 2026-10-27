@@ -97,11 +97,9 @@ mod tests {
         let yaml = "name: t\nroles: []\n";
         let mut config: TeamConfig = serde_yaml::from_str(yaml).unwrap();
         config.roles.push(RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
             channel: Some(channel.to_string()),
             channel_config: Some(channel_config),
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         });
         config
     }

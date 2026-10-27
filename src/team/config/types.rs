@@ -991,6 +991,19 @@ impl Default for RoleDef {
     }
 }
 
+#[cfg(test)]
+impl RoleDef {
+    /// Test constructor: a role with only `name` and `role_type` set, so new
+    /// `RoleDef` fields never require editing every test literal.
+    pub(crate) fn test(name: impl Into<String>, role_type: RoleType) -> Self {
+        Self {
+            name: name.into(),
+            role_type,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoleInstanceOverride {
     #[serde(default)]

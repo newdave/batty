@@ -8,13 +8,12 @@ use crate::team::config::{
 use crate::team::events::EventSink;
 use crate::team::test_helpers::make_test_daemon;
 use crate::team::test_support::{
-    EnvVarGuard, PATH_LOCK, TestDaemonBuilder, architect_member, backdate_idle_grace,
-    engineer_member, git_ok, init_git_repo, manager_member, write_board_task_file,
-    write_open_task_file, write_owned_task_file, write_owned_task_file_with_context,
+    EnvVarGuard, TestDaemonBuilder, architect_member, backdate_idle_grace, engineer_member,
+    env_lock, git_ok, init_git_repo, manager_member, write_board_task_file, write_open_task_file,
+    write_owned_task_file, write_owned_task_file_with_context,
 };
 use std::time::UNIX_EPOCH;
 
-use serial_test::serial;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -237,42 +236,14 @@ fn daemon_registers_per_role_nudge_intervals_from_prompt_sections() {
             retro_min_duration_secs: 60,
             roles: vec![
                 RoleDef {
-                    name: "manager".to_string(),
-                    role_type: RoleType::Manager,
                     agent: Some("claude".to_string()),
-                    auth_mode: None,
-                    auth_env: vec![],
-                    instances: 1,
-                    prompt: None,
-                    talks_to: vec![],
-                    channel: None,
-                    channel_config: None,
                     nudge_interval_secs: Some(120),
-                    receives_standup: None,
-                    standup_interval_secs: None,
-                    owns: Vec::new(),
-                    barrier_group: None,
-                    use_worktrees: false,
-                    ..Default::default()
+                    ..RoleDef::test("manager", RoleType::Manager)
                 },
                 RoleDef {
-                    name: "engineer".to_string(),
-                    role_type: RoleType::Engineer,
                     agent: Some("codex".to_string()),
-                    auth_mode: None,
-                    auth_env: vec![],
-                    instances: 1,
-                    prompt: None,
-                    talks_to: vec![],
-                    channel: None,
-                    channel_config: None,
                     nudge_interval_secs: Some(300),
-                    receives_standup: None,
-                    standup_interval_secs: None,
-                    owns: Vec::new(),
-                    barrier_group: None,
-                    use_worktrees: false,
-                    ..Default::default()
+                    ..RoleDef::test("engineer", RoleType::Engineer)
                 },
             ],
         },
@@ -596,80 +567,20 @@ fn test_auto_dispatch_filters_idle_engineers_only() {
     let tmp = tempfile::tempdir().unwrap();
     let roles = vec![
         RoleDef {
-            name: "architect".to_string(),
-            role_type: RoleType::Architect,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("architect", RoleType::Architect)
         },
         RoleDef {
-            name: "manager".to_string(),
-            role_type: RoleType::Manager,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("manager", RoleType::Manager)
         },
         RoleDef {
-            name: "eng-1".to_string(),
-            role_type: RoleType::Engineer,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("eng-1", RoleType::Engineer)
         },
         RoleDef {
-            name: "eng-2".to_string(),
-            role_type: RoleType::Engineer,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("eng-2", RoleType::Engineer)
         },
     ];
     let members = vec![
@@ -1134,9 +1045,9 @@ fn zero_diff_completion_recovery_escalates_after_threshold() {
 }
 
 #[test]
-#[serial]
 #[cfg_attr(not(feature = "integration"), ignore)]
 fn daemon_lifecycle_happy_path_exercises_decomposed_modules() {
+    let _env_lock = env_lock();
     let session = format!("batty-test-daemon-lifecycle-{}", std::process::id());
     let _ = crate::tmux::kill_session(&session);
 
@@ -1279,7 +1190,7 @@ fn daemon_lifecycle_happy_path_exercises_decomposed_modules() {
 
 #[test]
 fn preserve_worktree_before_restart_uses_shared_preservation_filters() {
-    let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _path_lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let repo = init_git_repo(&tmp, "batty-daemon-preserve");
     let team_config_dir = repo.join(".batty").join("team_config");
@@ -1325,7 +1236,7 @@ fn preserve_worktree_before_restart_uses_shared_preservation_filters() {
 
 #[test]
 fn preserve_worktree_before_restart_skips_support_files_without_user_changes() {
-    let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _path_lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let repo = init_git_repo(&tmp, "batty-daemon-preserve-support");
     let team_config_dir = repo.join(".batty").join("team_config");
@@ -1363,7 +1274,7 @@ fn preserve_worktree_before_restart_skips_support_files_without_user_changes() {
 
 #[test]
 fn preserve_worktree_before_restart_reports_block_when_preserve_fails() {
-    let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _path_lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let repo = init_git_repo(&tmp, "batty-daemon-preserve-blocked");
     let team_config_dir = repo.join(".batty").join("team_config");
@@ -1431,7 +1342,7 @@ fn report_preserve_failure_deduplicates_identical_alerts() {
     // every cycle. Engineers acked without action, manager re-fired, and
     // nothing made forward progress. This test locks in that repeated
     // identical calls within the dedup window produce exactly one message.
-    let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _path_lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let repo = init_git_repo(&tmp, "batty-daemon-preserve-dedup");
     let team_config_dir = repo.join(".batty").join("team_config");
@@ -1480,7 +1391,7 @@ fn report_preserve_failure_deduplicates_identical_alerts() {
 
 #[test]
 fn report_preserve_failure_deduplicates_identical_lane_level_alerts() {
-    let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _path_lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let repo = init_git_repo(&tmp, "batty-daemon-preserve-dedup-lane");
     let team_config_dir = repo.join(".batty").join("team_config");
@@ -1523,9 +1434,9 @@ fn report_preserve_failure_deduplicates_identical_lane_level_alerts() {
 }
 
 #[test]
-#[serial]
 #[cfg_attr(not(feature = "integration"), ignore)]
 fn maybe_fire_nudges_marks_member_working_after_live_delivery() {
+    let _env_lock = env_lock();
     let session = "batty-test-nudge-live-delivery";
     let mut delivered_live = false;
 
@@ -1589,9 +1500,9 @@ fn maybe_fire_nudges_marks_member_working_after_live_delivery() {
 }
 
 #[test]
-#[serial]
 #[cfg_attr(not(feature = "integration"), ignore)]
 fn maybe_intervene_triage_backlog_marks_member_working_after_live_delivery() {
+    let _env_lock = env_lock();
     let session = format!("batty-test-triage-live-delivery-{}", std::process::id());
     let _ = crate::tmux::kill_session(&session);
 
@@ -1815,7 +1726,7 @@ fn maybe_intervene_owned_tasks_engineer_message_captures_initial_state() {
 
 #[test]
 fn maybe_intervene_owned_tasks_engineer_message_includes_branch_recovery_blocker() {
-    let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _path_lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let repo = init_git_repo(&tmp, "owned-task-branch-blocker");
     let mut daemon = TestDaemonBuilder::new(repo.as_path())
@@ -3686,23 +3597,8 @@ fn resume_decision_logged_to_orchestrator() {
             event_log_max_bytes: crate::team::DEFAULT_EVENT_LOG_MAX_BYTES,
             retro_min_duration_secs: 60,
             roles: vec![RoleDef {
-                name: "architect".to_string(),
-                role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: Vec::new(),
-                instances: 1,
-                prompt: None,
-                talks_to: Vec::new(),
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("architect", RoleType::Architect)
             }],
         },
         session: "test".to_string(),
@@ -3964,61 +3860,16 @@ fn spawn_all_agents_resume_reports_missing_sessions_across_primary_roles() {
             retro_min_duration_secs: 60,
             roles: vec![
                 RoleDef {
-                    name: "architect".to_string(),
-                    role_type: RoleType::Architect,
                     agent: Some("claude".to_string()),
-                    auth_mode: None,
-                    auth_env: Vec::new(),
-                    instances: 1,
-                    prompt: None,
-                    talks_to: Vec::new(),
-                    channel: None,
-                    channel_config: None,
-                    nudge_interval_secs: None,
-                    receives_standup: None,
-                    standup_interval_secs: None,
-                    owns: Vec::new(),
-                    barrier_group: None,
-                    use_worktrees: false,
-                    ..Default::default()
+                    ..RoleDef::test("architect", RoleType::Architect)
                 },
                 RoleDef {
-                    name: "manager".to_string(),
-                    role_type: RoleType::Manager,
                     agent: Some("claude".to_string()),
-                    auth_mode: None,
-                    auth_env: Vec::new(),
-                    instances: 1,
-                    prompt: None,
-                    talks_to: Vec::new(),
-                    channel: None,
-                    channel_config: None,
-                    nudge_interval_secs: None,
-                    receives_standup: None,
-                    standup_interval_secs: None,
-                    owns: Vec::new(),
-                    barrier_group: None,
-                    use_worktrees: false,
-                    ..Default::default()
+                    ..RoleDef::test("manager", RoleType::Manager)
                 },
                 RoleDef {
-                    name: "eng".to_string(),
-                    role_type: RoleType::Engineer,
                     agent: Some("codex".to_string()),
-                    auth_mode: None,
-                    auth_env: Vec::new(),
-                    instances: 1,
-                    prompt: None,
-                    talks_to: Vec::new(),
-                    channel: None,
-                    channel_config: None,
-                    nudge_interval_secs: None,
-                    receives_standup: None,
-                    standup_interval_secs: None,
-                    owns: Vec::new(),
-                    barrier_group: None,
-                    use_worktrees: false,
-                    ..Default::default()
+                    ..RoleDef::test("eng", RoleType::Engineer)
                 },
             ],
         },
@@ -4121,23 +3972,8 @@ fn prepare_member_launch_injects_handoff_for_active_task() {
             event_log_max_bytes: crate::team::DEFAULT_EVENT_LOG_MAX_BYTES,
             retro_min_duration_secs: 60,
             roles: vec![RoleDef {
-                name: "engineer".to_string(),
-                role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("engineer", RoleType::Engineer)
             }],
         },
         session: "test".to_string(),
@@ -4413,80 +4249,30 @@ fn clean_room_test_daemon(project_root: &Path) -> TeamDaemon {
         retro_min_duration_secs: 60,
         roles: vec![
             RoleDef {
-                name: "decompiler".to_string(),
-                role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
                 talks_to: vec!["spec-writer".to_string()],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
                 barrier_group: Some("analysis".to_string()),
                 use_worktrees: true,
-                ..Default::default()
+                ..RoleDef::test("decompiler", RoleType::Architect)
             },
             RoleDef {
-                name: "spec-writer".to_string(),
-                role_type: RoleType::Manager,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
                 talks_to: vec!["decompiler".to_string(), "engineer".to_string()],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
                 barrier_group: Some("analysis".to_string()),
                 use_worktrees: true,
-                ..Default::default()
+                ..RoleDef::test("spec-writer", RoleType::Manager)
             },
             RoleDef {
-                name: "analyst".to_string(),
-                role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
                 barrier_group: Some("analysis".to_string()),
                 use_worktrees: true,
-                ..Default::default()
+                ..RoleDef::test("analyst", RoleType::Architect)
             },
             RoleDef {
-                name: "engineer".to_string(),
-                role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
                 barrier_group: Some("implementation".to_string()),
                 use_worktrees: true,
-                ..Default::default()
+                ..RoleDef::test("engineer", RoleType::Engineer)
             },
         ],
     };
@@ -4812,7 +4598,7 @@ fn clean_room_analysis_artifact_stays_readable_to_analysis_and_blocked_from_impl
 fn clean_room_skoolkit_disassembly_supports_z80_and_sna_snapshots() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _path_lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let mut daemon = clean_room_test_daemon(tmp.path());
     let bin_dir = tmp.path().join("bin");
@@ -4898,7 +4684,7 @@ fn clean_room_backend_detection_routes_supported_targets() {
 fn clean_room_ghidra_disassembly_supports_multiple_non_z80_targets() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _path_lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let mut daemon = clean_room_test_daemon(tmp.path());
     let bin_dir = tmp.path().join("bin");

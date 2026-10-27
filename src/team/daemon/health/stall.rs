@@ -919,7 +919,6 @@ mod tests {
         write_owned_task_file_with_context,
     };
     use chrono::Utc;
-    use serial_test::serial;
     use std::collections::HashMap;
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -1433,9 +1432,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn stall_restart_relaunches_stalled_agent_with_task_context() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-stall-restart-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -1602,9 +1601,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn stall_escalates_after_max_restarts() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-stall-escalate-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -1747,9 +1746,9 @@ mod tests {
     // which are tested via the context_exhaustion and stall flows.
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn stall_checkpoint_restart_resume_full_flow() {
+        let _env_lock = crate::team::test_support::env_lock();
         use crate::team::test_support::init_git_repo;
 
         let session = format!("batty-test-stall-cp-{}", std::process::id());
@@ -1919,9 +1918,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn stall_overwrites_existing_checkpoint() {
+        let _env_lock = crate::team::test_support::env_lock();
         use crate::team::test_support::init_git_repo;
 
         let session = format!("batty-test-stall-overwrite-cp-{}", std::process::id());
@@ -2056,9 +2055,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn stall_checkpoint_with_missing_worktree() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-stall-no-wt-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 

@@ -1039,7 +1039,7 @@ fn preview_text(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -1053,9 +1053,10 @@ mod tests {
     use crate::team::daemon::DaemonConfig;
     use crate::team::errors::DeliveryError;
     use crate::team::events::EventSink;
-    use crate::team::failure_patterns::FailureTracker;
+
     use crate::team::hierarchy::MemberInstance;
     use crate::team::test_helpers::daemon_config_with_roles;
+    use crate::team::test_support::git_ok;
 
     struct RecordingChannel {
         messages: Arc<Mutex<Vec<String>>>,
@@ -1091,21 +1092,6 @@ mod tests {
         std::fs::create_dir_all(&tasks_dir).unwrap();
         std::fs::write(tasks_dir.join(file_name), body).unwrap();
     }
-
-    fn git_ok(repo: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     #[test]
     fn process_telegram_queue_delivers_pending_user_messages() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1139,23 +1125,8 @@ mod tests {
                 event_log_max_bytes: crate::team::DEFAULT_EVENT_LOG_MAX_BYTES,
                 retro_min_duration_secs: 60,
                 roles: vec![RoleDef {
-                    name: "human".to_string(),
-                    role_type: RoleType::User,
-                    agent: None,
-                    auth_mode: None,
-                    auth_env: vec![],
-                    instances: 1,
-                    prompt: None,
                     talks_to: vec!["architect".to_string()],
-                    channel: None,
-                    channel_config: None,
-                    nudge_interval_secs: None,
-                    receives_standup: None,
-                    standup_interval_secs: None,
-                    owns: Vec::new(),
-                    barrier_group: None,
-                    use_worktrees: false,
-                    ..Default::default()
+                    ..RoleDef::test("human", RoleType::User)
                 }],
             },
             session: "test".to_string(),
@@ -1219,53 +1190,20 @@ mod tests {
         let mut shim_handles = HashMap::new();
         shim_handles.insert("scientist".to_string(), handle);
 
-        let mut daemon = TeamDaemon {
-            config: DaemonConfig {
-                project_root: tmp.path().to_path_buf(),
-                team_config: TeamConfig {
-                    name: "test".to_string(),
-                    trunk_branch: crate::team::config::default_trunk_branch(),
-                    agent: None,
-                    workflow_mode: WorkflowMode::Legacy,
-                    workflow_policy: WorkflowPolicy::default(),
-                    board: BoardConfig::default(),
-                    standup: StandupConfig::default(),
-                    automation: AutomationConfig::default(),
-                    automation_sender: None,
-                    external_senders: Vec::new(),
-                    orchestrator_pane: true,
-                    orchestrator_position: OrchestratorPosition::Bottom,
-                    layout: None,
-                    cost: Default::default(),
-                    grafana: Default::default(),
-                    use_shim: false,
-                    use_sdk_mode: false,
-                    auto_respawn_on_crash: false,
-                    shim_health_check_interval_secs: 60,
-                    shim_health_timeout_secs: 120,
-                    shim_shutdown_timeout_secs: 30,
-                    shim_working_state_timeout_secs: 1800,
-                    pending_queue_max_age_secs: 600,
-                    event_log_max_bytes: crate::team::DEFAULT_EVENT_LOG_MAX_BYTES,
-                    retro_min_duration_secs: 60,
-                    roles: Vec::new(),
-                },
-                session: "test".to_string(),
-                members: vec![member],
-                pane_map: HashMap::from([("scientist".to_string(), "%9999999".to_string())]),
-            },
-            watchers,
-            states: HashMap::from([("scientist".to_string(), MemberState::Idle)]),
-            idle_started_at: HashMap::new(),
-            active_tasks: HashMap::new(),
-            retry_counts: HashMap::new(),
-            dispatch_queue: Vec::new(),
-            triage_idle_epochs: HashMap::new(),
-            triage_interventions: HashMap::new(),
-            owned_task_interventions: HashMap::new(),
-            intervention_cooldowns: HashMap::new(),
-            channels: HashMap::new(),
-            nudges: HashMap::from([(
+        let mut daemon = crate::team::test_support::TestDaemonBuilder::new(tmp.path())
+            .workflow_policy(WorkflowPolicy::default())
+            .automation(AutomationConfig::default())
+            .roles(Vec::new())
+            .members(vec![member])
+            .pane_map(HashMap::from([(
+                "scientist".to_string(),
+                "%9999999".to_string(),
+            )]))
+            .states(HashMap::from([(
+                "scientist".to_string(),
+                MemberState::Idle,
+            )]))
+            .nudges(HashMap::from([(
                 "scientist".to_string(),
                 NudgeSchedule {
                     text: "Please make progress.".to_string(),
@@ -1274,67 +1212,11 @@ mod tests {
                     fired_this_idle: false,
                     paused: false,
                 },
-            )]),
-            discord_bot: None,
-            discord_event_cursor: 0,
-            telegram_bot: None,
-            failure_tracker: FailureTracker::new(20),
-            event_sink: EventSink::new(&tmp.path().join("events.jsonl")).unwrap(),
-            paused_standups: HashSet::new(),
-            last_standup: HashMap::new(),
-            last_board_rotation: Instant::now(),
-            last_auto_archive: Instant::now(),
-            last_auto_dispatch: Instant::now(),
-            last_main_smoke_check: Instant::now(),
-            pipeline_starvation_fired: false,
-            pipeline_starvation_last_fired: None,
-            retro_generated: false,
-            failed_deliveries: Vec::new(),
-            review_first_seen: HashMap::new(),
-            review_nudge_sent: HashSet::new(),
-            poll_cycle_count: 0,
-            current_tick_errors: Vec::new(),
-            poll_interval: Duration::from_secs(5),
-            is_git_repo: false,
-            is_multi_repo: false,
-            sub_repo_names: Vec::new(),
-            subsystem_error_counts: HashMap::new(),
-            auto_merge_overrides: HashMap::new(),
-            recent_dispatches: HashMap::new(),
-            recently_rescued_tasks: HashMap::new(),
-            recently_released_by: HashMap::new(),
-            recent_escalations: HashMap::new(),
-            main_smoke_state: None,
-            telemetry_db: None,
-            manual_assign_cooldowns: HashMap::new(),
-            backend_health: HashMap::new(),
-            backend_quota_retry_at: HashMap::new(),
-            narration_tracker: Default::default(),
-            context_pressure_tracker: Default::default(),
-            last_health_check: Some(Instant::now()),
-            last_uncommitted_warn: HashMap::new(),
-            last_shared_target_cleanup: Some(Instant::now()),
-            last_disk_hygiene_check: Some(Instant::now()),
-            pending_delivery_queue: HashMap::new(),
-            pending_shim_acks: HashMap::new(),
-            verification_states: HashMap::new(),
-            background_tests: Default::default(),
-            narration_rejection_counts: HashMap::new(),
-            zero_diff_completion_counts: HashMap::new(),
-            shim_handles,
-            working_since: HashMap::new(),
-            planning_cycle_last_fired: None,
-            planning_cycle_active: false,
-            planning_cycle_consecutive_empty: 0,
-            last_shim_health_check: Instant::now(),
-            merge_queue: crate::team::daemon::MergeQueue::default(),
-            last_binary_freshness_check: Some(Instant::now()),
-            last_tiered_inbox_sweep: Some(Instant::now()),
-            deferred: Default::default(),
-            telegram_health: Default::default(),
-            discord_health: Default::default(),
-            last_telemetry_retention: Instant::now(),
-        };
+            )]))
+            .watchers(watchers)
+            .build();
+        daemon.shim_handles = shim_handles;
+        daemon.event_sink = EventSink::new(&tmp.path().join("events.jsonl")).unwrap();
 
         backdate_idle_grace(&mut daemon, "scientist");
         daemon.maybe_fire_nudges().unwrap();
@@ -1357,8 +1239,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn maybe_intervene_triage_backlog_marks_member_working_after_live_delivery() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-triage-live-delivery-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -1391,113 +1274,17 @@ mod tests {
         let mut lead_watcher = SessionWatcher::new(&pane_id, "lead", 300, None);
         lead_watcher.confirm_ready();
         watchers.insert("lead".to_string(), lead_watcher);
-        let mut daemon = TeamDaemon {
-            config: DaemonConfig {
-                project_root: tmp.path().to_path_buf(),
-                team_config: TeamConfig {
-                    name: "test".to_string(),
-                    trunk_branch: crate::team::config::default_trunk_branch(),
-                    agent: None,
-                    workflow_mode: WorkflowMode::Legacy,
-                    workflow_policy: WorkflowPolicy::default(),
-                    board: BoardConfig::default(),
-                    standup: StandupConfig::default(),
-                    automation: AutomationConfig::default(),
-                    automation_sender: None,
-                    external_senders: Vec::new(),
-                    orchestrator_pane: true,
-                    orchestrator_position: OrchestratorPosition::Bottom,
-                    layout: None,
-                    cost: Default::default(),
-                    grafana: Default::default(),
-                    use_shim: false,
-                    use_sdk_mode: false,
-                    auto_respawn_on_crash: false,
-                    shim_health_check_interval_secs: 60,
-                    shim_health_timeout_secs: 120,
-                    shim_shutdown_timeout_secs: 30,
-                    shim_working_state_timeout_secs: 1800,
-                    pending_queue_max_age_secs: 600,
-                    event_log_max_bytes: crate::team::DEFAULT_EVENT_LOG_MAX_BYTES,
-                    retro_min_duration_secs: 60,
-                    roles: Vec::new(),
-                },
-                session: session.clone(),
-                members: vec![lead, engineer],
-                pane_map: HashMap::from([("lead".to_string(), pane_id.clone())]),
-            },
-            watchers,
-            states: HashMap::from([("lead".to_string(), MemberState::Idle)]),
-            idle_started_at: HashMap::new(),
-            active_tasks: HashMap::new(),
-            retry_counts: HashMap::new(),
-            dispatch_queue: Vec::new(),
-            triage_idle_epochs: HashMap::new(),
-            triage_interventions: HashMap::new(),
-            owned_task_interventions: HashMap::new(),
-            intervention_cooldowns: HashMap::new(),
-            channels: HashMap::new(),
-            nudges: HashMap::new(),
-            discord_bot: None,
-            discord_event_cursor: 0,
-            telegram_bot: None,
-            failure_tracker: FailureTracker::new(20),
-            event_sink: EventSink::new(&tmp.path().join("events.jsonl")).unwrap(),
-            paused_standups: HashSet::new(),
-            last_standup: HashMap::new(),
-            last_board_rotation: Instant::now(),
-            last_auto_archive: Instant::now(),
-            last_auto_dispatch: Instant::now(),
-            last_main_smoke_check: Instant::now(),
-            pipeline_starvation_fired: false,
-            pipeline_starvation_last_fired: None,
-            retro_generated: false,
-            failed_deliveries: Vec::new(),
-            review_first_seen: HashMap::new(),
-            review_nudge_sent: HashSet::new(),
-            poll_cycle_count: 0,
-            current_tick_errors: Vec::new(),
-            poll_interval: Duration::from_secs(5),
-            is_git_repo: false,
-            is_multi_repo: false,
-            sub_repo_names: Vec::new(),
-            subsystem_error_counts: HashMap::new(),
-            auto_merge_overrides: HashMap::new(),
-            recent_dispatches: HashMap::new(),
-            recently_rescued_tasks: HashMap::new(),
-            recently_released_by: HashMap::new(),
-            recent_escalations: HashMap::new(),
-            main_smoke_state: None,
-            telemetry_db: None,
-            manual_assign_cooldowns: HashMap::new(),
-            backend_health: HashMap::new(),
-            backend_quota_retry_at: HashMap::new(),
-            narration_tracker: Default::default(),
-            context_pressure_tracker: Default::default(),
-            last_health_check: Some(Instant::now()),
-            last_uncommitted_warn: HashMap::new(),
-            last_shared_target_cleanup: Some(Instant::now()),
-            last_disk_hygiene_check: Some(Instant::now()),
-            pending_delivery_queue: HashMap::new(),
-            pending_shim_acks: HashMap::new(),
-            verification_states: HashMap::new(),
-            background_tests: Default::default(),
-            narration_rejection_counts: HashMap::new(),
-            zero_diff_completion_counts: HashMap::new(),
-            shim_handles: HashMap::new(),
-            working_since: HashMap::new(),
-            planning_cycle_last_fired: None,
-            planning_cycle_active: false,
-            planning_cycle_consecutive_empty: 0,
-            last_shim_health_check: Instant::now(),
-            merge_queue: crate::team::daemon::MergeQueue::default(),
-            last_binary_freshness_check: Some(Instant::now()),
-            last_tiered_inbox_sweep: Some(Instant::now()),
-            deferred: Default::default(),
-            telegram_health: Default::default(),
-            discord_health: Default::default(),
-            last_telemetry_retention: Instant::now(),
-        };
+        let mut daemon = crate::team::test_support::TestDaemonBuilder::new(tmp.path())
+            .workflow_policy(WorkflowPolicy::default())
+            .automation(AutomationConfig::default())
+            .roles(Vec::new())
+            .session(session.clone())
+            .members(vec![lead, engineer])
+            .pane_map(HashMap::from([("lead".to_string(), pane_id.clone())]))
+            .states(HashMap::from([("lead".to_string(), MemberState::Idle)]))
+            .watchers(watchers)
+            .build();
+        daemon.event_sink = EventSink::new(&tmp.path().join("events.jsonl")).unwrap();
 
         let root = inbox::inboxes_root(tmp.path());
         inbox::init_inbox(&root, "lead").unwrap();
@@ -1542,144 +1329,45 @@ mod tests {
     #[test]
     fn automation_sender_prefers_direct_manager_and_config_fallback() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut daemon = TeamDaemon {
-            config: DaemonConfig {
-                project_root: tmp.path().to_path_buf(),
-                team_config: TeamConfig {
-                    name: "test".to_string(),
-                    trunk_branch: crate::team::config::default_trunk_branch(),
-                    agent: None,
-                    workflow_mode: WorkflowMode::Legacy,
-                    workflow_policy: WorkflowPolicy::default(),
-                    board: BoardConfig::default(),
-                    standup: StandupConfig::default(),
-                    automation: AutomationConfig::default(),
-                    automation_sender: Some("human".to_string()),
-                    external_senders: Vec::new(),
-                    orchestrator_pane: true,
-                    orchestrator_position: OrchestratorPosition::Bottom,
-                    layout: None,
-                    cost: Default::default(),
-                    grafana: Default::default(),
-                    use_shim: false,
-                    use_sdk_mode: false,
-                    auto_respawn_on_crash: false,
-                    shim_health_check_interval_secs: 60,
-                    shim_health_timeout_secs: 120,
-                    shim_shutdown_timeout_secs: 30,
-                    shim_working_state_timeout_secs: 1800,
-                    pending_queue_max_age_secs: 600,
-                    event_log_max_bytes: crate::team::DEFAULT_EVENT_LOG_MAX_BYTES,
-                    retro_min_duration_secs: 60,
-                    roles: Vec::new(),
+        let mut daemon = crate::team::test_support::TestDaemonBuilder::new(tmp.path())
+            .workflow_policy(WorkflowPolicy::default())
+            .automation(AutomationConfig::default())
+            .roles(Vec::new())
+            .members(vec![
+                MemberInstance {
+                    name: "architect".to_string(),
+                    role_name: "architect".to_string(),
+                    role_type: RoleType::Architect,
+                    agent: Some("claude".to_string()),
+                    prompt: None,
+                    reports_to: None,
+                    use_worktrees: false,
+                    ..Default::default()
                 },
-                session: "test".to_string(),
-                members: vec![
-                    MemberInstance {
-                        name: "architect".to_string(),
-                        role_name: "architect".to_string(),
-                        role_type: RoleType::Architect,
-                        agent: Some("claude".to_string()),
-                        prompt: None,
-                        reports_to: None,
-                        use_worktrees: false,
-                        ..Default::default()
-                    },
-                    MemberInstance {
-                        name: "lead".to_string(),
-                        role_name: "lead".to_string(),
-                        role_type: RoleType::Manager,
-                        agent: Some("claude".to_string()),
-                        prompt: None,
-                        reports_to: Some("architect".to_string()),
-                        use_worktrees: false,
-                        ..Default::default()
-                    },
-                    MemberInstance {
-                        name: "eng-1".to_string(),
-                        role_name: "eng".to_string(),
-                        role_type: RoleType::Engineer,
-                        agent: Some("codex".to_string()),
-                        prompt: None,
-                        reports_to: Some("lead".to_string()),
-                        use_worktrees: false,
-                        ..Default::default()
-                    },
-                ],
-                pane_map: HashMap::new(),
-            },
-            watchers: HashMap::new(),
-            states: HashMap::new(),
-            idle_started_at: HashMap::new(),
-            active_tasks: HashMap::new(),
-            retry_counts: HashMap::new(),
-            dispatch_queue: Vec::new(),
-            triage_idle_epochs: HashMap::new(),
-            triage_interventions: HashMap::new(),
-            owned_task_interventions: HashMap::new(),
-            intervention_cooldowns: HashMap::new(),
-            channels: HashMap::new(),
-            nudges: HashMap::new(),
-            discord_bot: None,
-            discord_event_cursor: 0,
-            telegram_bot: None,
-            failure_tracker: FailureTracker::new(20),
-            event_sink: EventSink::new(&tmp.path().join("events.jsonl")).unwrap(),
-            paused_standups: HashSet::new(),
-            last_standup: HashMap::new(),
-            last_board_rotation: Instant::now(),
-            last_auto_archive: Instant::now(),
-            last_auto_dispatch: Instant::now(),
-            last_main_smoke_check: Instant::now(),
-            pipeline_starvation_fired: false,
-            pipeline_starvation_last_fired: None,
-            retro_generated: false,
-            failed_deliveries: Vec::new(),
-            review_first_seen: HashMap::new(),
-            review_nudge_sent: HashSet::new(),
-            poll_cycle_count: 0,
-            current_tick_errors: Vec::new(),
-            poll_interval: Duration::from_secs(5),
-            is_git_repo: false,
-            is_multi_repo: false,
-            sub_repo_names: Vec::new(),
-            subsystem_error_counts: HashMap::new(),
-            auto_merge_overrides: HashMap::new(),
-            recent_dispatches: HashMap::new(),
-            recently_rescued_tasks: HashMap::new(),
-            recently_released_by: HashMap::new(),
-            recent_escalations: HashMap::new(),
-            main_smoke_state: None,
-            telemetry_db: None,
-            manual_assign_cooldowns: HashMap::new(),
-            backend_health: HashMap::new(),
-            backend_quota_retry_at: HashMap::new(),
-            narration_tracker: Default::default(),
-            context_pressure_tracker: Default::default(),
-            last_health_check: Some(Instant::now()),
-            last_uncommitted_warn: HashMap::new(),
-            last_shared_target_cleanup: Some(Instant::now()),
-            last_disk_hygiene_check: Some(Instant::now()),
-            pending_delivery_queue: HashMap::new(),
-            pending_shim_acks: HashMap::new(),
-            verification_states: HashMap::new(),
-            background_tests: Default::default(),
-            narration_rejection_counts: HashMap::new(),
-            zero_diff_completion_counts: HashMap::new(),
-            shim_handles: HashMap::new(),
-            working_since: HashMap::new(),
-            planning_cycle_last_fired: None,
-            planning_cycle_active: false,
-            planning_cycle_consecutive_empty: 0,
-            last_shim_health_check: Instant::now(),
-            merge_queue: crate::team::daemon::MergeQueue::default(),
-            last_binary_freshness_check: Some(Instant::now()),
-            last_tiered_inbox_sweep: Some(Instant::now()),
-            deferred: Default::default(),
-            telegram_health: Default::default(),
-            discord_health: Default::default(),
-            last_telemetry_retention: Instant::now(),
-        };
+                MemberInstance {
+                    name: "lead".to_string(),
+                    role_name: "lead".to_string(),
+                    role_type: RoleType::Manager,
+                    agent: Some("claude".to_string()),
+                    prompt: None,
+                    reports_to: Some("architect".to_string()),
+                    use_worktrees: false,
+                    ..Default::default()
+                },
+                MemberInstance {
+                    name: "eng-1".to_string(),
+                    role_name: "eng".to_string(),
+                    role_type: RoleType::Engineer,
+                    agent: Some("codex".to_string()),
+                    prompt: None,
+                    reports_to: Some("lead".to_string()),
+                    use_worktrees: false,
+                    ..Default::default()
+                },
+            ])
+            .build();
+        daemon.config.team_config.automation_sender = Some("human".to_string());
+        daemon.event_sink = EventSink::new(&tmp.path().join("events.jsonl")).unwrap();
 
         assert_eq!(daemon.automation_sender_for("eng-1"), "lead");
         assert_eq!(daemon.automation_sender_for("lead"), "architect");
@@ -1693,13 +1381,6 @@ mod tests {
     fn daemon_creates_telegram_bot_when_configured() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
-            name: "user".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
             channel: Some("telegram".to_string()),
             channel_config: Some(ChannelConfig {
@@ -1712,13 +1393,7 @@ mod tests {
                 commands_channel_id: None,
                 board_channel_id: None,
             }),
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("user", RoleType::User)
         }];
 
         let config = daemon_config_with_roles(tmp.path(), roles);
@@ -1730,23 +1405,8 @@ mod tests {
     fn daemon_no_telegram_bot_without_config() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
-            name: "user".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("user", RoleType::User)
         }];
 
         let config = daemon_config_with_roles(tmp.path(), roles);
@@ -1759,23 +1419,8 @@ mod tests {
     #[test]
     fn build_telegram_bot_returns_none_when_no_user_role() {
         let roles = vec![RoleDef {
-            name: "architect".to_string(),
-            role_type: RoleType::Architect,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: Vec::new(),
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("architect", RoleType::Architect)
         }];
         let tc = crate::team::test_helpers::team_config_with_roles(roles);
         assert!(build_telegram_bot(&tc).is_none());
@@ -1784,23 +1429,9 @@ mod tests {
     #[test]
     fn build_telegram_bot_returns_none_when_user_has_different_channel() {
         let roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
             channel: Some("slack".to_string()),
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         let tc = crate::team::test_helpers::team_config_with_roles(roles);
         assert!(build_telegram_bot(&tc).is_none());
@@ -1809,23 +1440,9 @@ mod tests {
     #[test]
     fn build_telegram_bot_returns_none_when_channel_config_missing() {
         let roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
             channel: Some("telegram".to_string()),
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         let tc = crate::team::test_helpers::team_config_with_roles(roles);
         assert!(build_telegram_bot(&tc).is_none());
@@ -1835,23 +1452,8 @@ mod tests {
     fn process_telegram_queue_no_pending_messages_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
@@ -1872,23 +1474,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
@@ -1925,23 +1512,8 @@ mod tests {
     fn deliver_user_inbox_no_channel_skips_delivery() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
@@ -1984,11 +1556,8 @@ mod tests {
     fn deliver_user_inbox_stops_after_first_channel_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
             talks_to: vec!["architect".to_string()],
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
@@ -2104,23 +1673,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
@@ -2150,23 +1704,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         let config = daemon_config_with_roles(tmp.path(), roles);
         let mut daemon = TeamDaemon::new(config).unwrap();
@@ -2199,42 +1738,12 @@ mod tests {
         let sent_bob = Arc::new(Mutex::new(Vec::new()));
         let roles = vec![
             RoleDef {
-                name: "alice".to_string(),
-                role_type: RoleType::User,
-                agent: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
                 talks_to: vec!["architect".to_string()],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("alice", RoleType::User)
             },
             RoleDef {
-                name: "bob".to_string(),
-                role_type: RoleType::User,
-                agent: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
                 talks_to: vec!["architect".to_string()],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("bob", RoleType::User)
             },
         ];
         let config = daemon_config_with_roles(tmp.path(), roles);
@@ -2415,56 +1924,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![
             RoleDef {
-                effort: None,
-                on_demand: false,
-                docs_only_evidence: false,
-                name: "human".to_string(),
-                role_type: RoleType::User,
-                agent: None,
-                model: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                posture: None,
-                model_class: None,
-                provider_overlay: None,
-                instance_overrides: HashMap::new(),
                 talks_to: vec!["eng".to_string()],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
+                ..RoleDef::test("human", RoleType::User)
             },
             RoleDef {
-                effort: None,
-                on_demand: false,
-                docs_only_evidence: false,
-                name: "eng".to_string(),
-                role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),
-                model: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                posture: None,
-                model_class: None,
-                provider_overlay: None,
-                instance_overrides: HashMap::new(),
-                talks_to: Vec::new(),
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
+                ..RoleDef::test("eng", RoleType::Engineer)
             },
         ];
         let mut config = daemon_config_with_roles(tmp.path(), roles);
@@ -2515,30 +1980,8 @@ mod tests {
     fn telegram_assign_command_rejects_busy_engineer() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
-            effort: None,
-            on_demand: false,
-            docs_only_evidence: false,
-            name: "eng".to_string(),
-            role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
-            model: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            posture: None,
-            model_class: None,
-            provider_overlay: None,
-            instance_overrides: HashMap::new(),
-            talks_to: Vec::new(),
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
+            ..RoleDef::test("eng", RoleType::Engineer)
         }];
         let mut config = daemon_config_with_roles(tmp.path(), roles);
         config.members = vec![MemberInstance {
@@ -2573,30 +2016,8 @@ mod tests {
     fn telegram_assign_command_rejects_blocked_task() {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![RoleDef {
-            effort: None,
-            on_demand: false,
-            docs_only_evidence: false,
-            name: "eng".to_string(),
-            role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
-            model: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            posture: None,
-            model_class: None,
-            provider_overlay: None,
-            instance_overrides: HashMap::new(),
-            talks_to: Vec::new(),
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
+            ..RoleDef::test("eng", RoleType::Engineer)
         }];
         let mut config = daemon_config_with_roles(tmp.path(), roles);
         config.members = vec![MemberInstance {
@@ -2635,56 +2056,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![
             RoleDef {
-                effort: None,
-                on_demand: false,
-                docs_only_evidence: false,
-                name: "human".to_string(),
-                role_type: RoleType::User,
-                agent: None,
-                model: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                posture: None,
-                model_class: None,
-                provider_overlay: None,
-                instance_overrides: HashMap::new(),
                 talks_to: vec!["architect".to_string()],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
+                ..RoleDef::test("human", RoleType::User)
             },
             RoleDef {
-                effort: None,
-                on_demand: false,
-                docs_only_evidence: false,
-                name: "architect".to_string(),
-                role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
-                model: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                posture: None,
-                model_class: None,
-                provider_overlay: None,
-                instance_overrides: HashMap::new(),
-                talks_to: Vec::new(),
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
+                ..RoleDef::test("architect", RoleType::Architect)
             },
         ];
         let mut config = daemon_config_with_roles(tmp.path(), roles);
@@ -2871,30 +2248,9 @@ mod tests {
         std::fs::write(worktree_dir.join("README.md"), "dirty\n").unwrap();
 
         let roles = vec![RoleDef {
-            effort: None,
-            on_demand: false,
-            docs_only_evidence: false,
-            name: "eng".to_string(),
-            role_type: RoleType::Engineer,
             agent: Some("codex".to_string()),
-            model: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            posture: None,
-            model_class: None,
-            provider_overlay: None,
-            instance_overrides: HashMap::new(),
-            talks_to: Vec::new(),
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
             use_worktrees: true,
+            ..RoleDef::test("eng", RoleType::Engineer)
         }];
         let mut config = daemon_config_with_roles(tmp.path(), roles);
         config.members = vec![MemberInstance {
@@ -2956,82 +2312,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![
             RoleDef {
-                effort: None,
-                on_demand: false,
-                docs_only_evidence: false,
-                name: "human".to_string(),
-                role_type: RoleType::User,
-                agent: None,
-                model: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                posture: None,
-                model_class: None,
-                provider_overlay: None,
-                instance_overrides: HashMap::new(),
                 talks_to: vec!["architect".to_string(), "eng".to_string()],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
+                ..RoleDef::test("human", RoleType::User)
             },
             RoleDef {
-                effort: None,
-                on_demand: false,
-                docs_only_evidence: false,
-                name: "architect".to_string(),
-                role_type: RoleType::Architect,
                 agent: Some("claude".to_string()),
-                model: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                posture: None,
-                model_class: None,
-                provider_overlay: None,
-                instance_overrides: HashMap::new(),
-                talks_to: Vec::new(),
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
+                ..RoleDef::test("architect", RoleType::Architect)
             },
             RoleDef {
-                effort: None,
-                on_demand: false,
-                docs_only_evidence: false,
-                name: "eng".to_string(),
-                role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),
-                model: None,
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                posture: None,
-                model_class: None,
-                provider_overlay: None,
-                instance_overrides: HashMap::new(),
-                talks_to: Vec::new(),
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
+                ..RoleDef::test("eng", RoleType::Engineer)
             },
         ];
         let mut config = daemon_config_with_roles(tmp.path(), roles);

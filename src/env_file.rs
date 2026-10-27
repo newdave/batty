@@ -114,50 +114,7 @@ fn render_env_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn unset(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: tests mutate process env in a bounded scope and restore it on drop.
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, original }
-        }
-
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: tests mutate process env in a bounded scope and restore it on drop.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => {
-                    // SAFETY: tests restore the original value before exiting.
-                    unsafe {
-                        std::env::set_var(self.key, value);
-                    }
-                }
-                None => {
-                    // SAFETY: tests restore the original absence before exiting.
-                    unsafe {
-                        std::env::remove_var(self.key);
-                    }
-                }
-            }
-        }
-    }
+    use crate::team::test_support::EnvVarGuard;
 
     #[test]
     fn load_env_file_sets_missing_vars() {

@@ -407,6 +407,7 @@ fn commits_touching_src_since(repo_root: &Path, since_ts: i64) -> Result<(u32, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::git_ok as run_git;
     use std::fs;
     use std::process::Command;
 
@@ -414,15 +415,6 @@ mod tests {
         run_git(dir, &["init", "-q", "-b", "main"]);
         run_git(dir, &["config", "user.email", "test@example.com"]);
         run_git(dir, &["config", "user.name", "Test"]);
-    }
-
-    fn run_git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("git binary");
-        assert!(status.success(), "git {args:?} failed in {dir:?}");
     }
 
     fn commit_file_with_time(dir: &Path, rel: &str, content: &str, unix_ts: i64) {

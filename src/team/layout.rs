@@ -551,7 +551,6 @@ mod tests {
     use super::super::config::TeamConfig;
     use super::super::hierarchy;
     use super::*;
-    use serial_test::serial;
     use std::process::Command;
 
     fn make_members(yaml: &str) -> Vec<MemberInstance> {
@@ -650,9 +649,9 @@ roles:
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn build_layout_supports_architect_two_managers_and_six_engineers() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-test-team-layout-nine";
         let _ = crate::tmux::kill_session(session);
 
@@ -969,9 +968,9 @@ roles:
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn build_layout_adds_orchestrator_pane_when_enabled() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-test-team-layout-orchestrator";
         let _ = crate::tmux::kill_session(session);
         let tmp = tempfile::tempdir().unwrap();
@@ -1025,9 +1024,9 @@ roles:
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn build_layout_skips_orchestrator_pane_when_disabled() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-test-team-layout-no-orchestrator";
         let _ = crate::tmux::kill_session(session);
         let tmp = tempfile::tempdir().unwrap();
@@ -1092,9 +1091,9 @@ roles:
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn build_layout_honors_horizontal_split_for_architect_zone() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-test-team-layout-architect-pair";
         let _ = crate::tmux::kill_session(session);
 

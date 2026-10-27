@@ -1261,23 +1261,21 @@ pub fn tmux_set(session: &str, option: &str, value: &str) -> Result<()> {
 /// - **Unit tests** — pure logic (parsing, string manipulation). Run with `cargo test`.
 /// - **Integration tests** — require a running tmux server. Gated behind the `integration`
 ///   Cargo feature: `cargo test --features integration`. These tests are marked with
-///   `#[cfg_attr(not(feature = "integration"), ignore)]` and `#[serial]`.
+///   `#[cfg_attr(not(feature = "integration"), ignore)]`.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::team::test_support::{EnvVarGuard, PATH_LOCK};
-    use serial_test::serial;
+    use crate::team::test_support::{EnvLock, EnvVarGuard, env_lock};
     use std::cell::RefCell;
 
     thread_local! {
-        static TMUX_TEST_PATH_GUARD: RefCell<Option<std::sync::MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+        static TMUX_TEST_PATH_GUARD: RefCell<Option<EnvLock>> = const { RefCell::new(None) };
     }
 
     fn require_tmux_integration() -> bool {
         TMUX_TEST_PATH_GUARD.with(|slot| {
             if slot.borrow().is_none() {
-                *slot.borrow_mut() =
-                    Some(PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner()));
+                *slot.borrow_mut() = Some(env_lock());
             }
         });
         if tmux_available() {
@@ -1296,9 +1294,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn check_tmux_finds_binary() {
+        let _env_lock = env_lock();
         let version = check_tmux().unwrap();
         assert!(
             version.starts_with("tmux"),
@@ -1380,7 +1378,7 @@ mod tests {
 
     #[test]
     fn pane_id_is_bounded_by_tmux_command_timeout() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let fake_tmux = tmp.path().join("tmux");
         std::fs::write(&fake_tmux, "#!/bin/sh\nsleep 30\n").unwrap();
@@ -1445,9 +1443,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn capability_probe_reports_pipe_pane() {
+        let _env_lock = env_lock();
         let caps = probe_capabilities().unwrap();
         assert!(
             caps.pipe_pane,
@@ -1456,15 +1454,16 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn nonexistent_session_does_not_exist() {
+        let _env_lock = env_lock();
         assert!(!session_exists("batty-test-nonexistent-12345"));
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn create_and_kill_session() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -1482,9 +1481,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn session_path_returns_working_directory() {
+        let _env_lock = env_lock();
         let session = "batty-test-session-path";
         let _ = kill_session(session);
 
@@ -1496,9 +1495,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn pane_current_path_returns_working_directory() {
+        let _env_lock = env_lock();
         let session = "batty-test-pane-current-path";
         let _ = kill_session(session);
 
@@ -1514,9 +1513,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn duplicate_session_is_error() {
+        let _env_lock = env_lock();
         let session = "batty-test-dup";
         let _ = kill_session(session);
 
@@ -1530,9 +1529,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn create_window_adds_named_window_to_existing_session() {
+        let _env_lock = env_lock();
         let session = "batty-test-window-create";
         let _ = kill_session(session);
 
@@ -1549,9 +1548,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn create_window_unsets_claudecode_from_session_environment() {
+        let _env_lock = env_lock();
         let session = "batty-test-window-unset-claudecode";
         let _ = kill_session(session);
 
@@ -1591,9 +1590,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn create_session_enables_mouse_mode() {
+        let _env_lock = env_lock();
         let session = "batty-test-mouse";
         let _ = kill_session(session);
 
@@ -1611,9 +1610,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn send_keys_to_session() {
+        let _env_lock = env_lock();
         let session = "batty-test-sendkeys";
         let _ = kill_session(session);
 
@@ -1631,9 +1630,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn send_keys_with_enter_submits_line() {
+        let _env_lock = env_lock();
         let session = "batty-test-sendkeys-enter";
         let _ = kill_session(session);
 
@@ -1661,9 +1660,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn send_keys_enter_only_submits_prompt() {
+        let _env_lock = env_lock();
         let session = "batty-test-sendkeys-enter-only";
         let _ = kill_session(session);
 
@@ -1688,9 +1687,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn pipe_pane_captures_output() {
+        let _env_lock = env_lock();
         let session = "batty-test-pipe";
         let _ = kill_session(session);
 
@@ -1728,9 +1727,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn capture_pane_returns_content() {
+        let _env_lock = env_lock();
         let session = "batty-test-capture";
         let _ = kill_session(session);
 
@@ -1754,9 +1753,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn capture_pane_recent_returns_content() {
+        let _env_lock = env_lock();
         let session = "batty-test-capture-recent";
         let _ = kill_session(session);
 
@@ -1779,9 +1778,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn list_panes_returns_at_least_one() {
+        let _env_lock = env_lock();
         let session = "batty-test-panes";
         let _ = kill_session(session);
 
@@ -1794,9 +1793,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn list_pane_details_includes_active_flag() {
+        let _env_lock = env_lock();
         let session = "batty-test-pane-details";
         let _ = kill_session(session);
 
@@ -1816,9 +1815,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn configure_supervisor_hotkeys_initializes_control_option() {
+        let _env_lock = env_lock();
         let session = "batty-test-supervisor-hotkeys";
         let _ = kill_session(session);
 
@@ -1842,9 +1841,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn take_supervisor_hotkey_action_reads_and_clears() {
+        let _env_lock = env_lock();
         let session = "batty-test-supervisor-action";
         let _ = kill_session(session);
 
@@ -1862,17 +1861,17 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn kill_nonexistent_session_is_ok() {
+        let _env_lock = env_lock();
         // Should not error — idempotent
         kill_session("batty-test-nonexistent-kill-99999").unwrap();
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn session_with_short_lived_process() {
+        let _env_lock = env_lock();
         let session = "batty-test-shortlived";
         let _ = kill_session(session);
 
@@ -1888,9 +1887,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn test_session_guard_cleanup_on_drop() {
+        let _env_lock = env_lock();
         let name = "batty-test-guard-drop";
         let _ = kill_session(name);
 
@@ -1905,9 +1904,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn test_session_guard_cleanup_on_panic() {
+        let _env_lock = env_lock();
         let name = "batty-test-guard-panic";
         let _ = kill_session(name);
 
@@ -2127,8 +2126,9 @@ mod tests {
     // --- Integration tests requiring tmux ---
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn pane_exists_for_valid_pane() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2141,8 +2141,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn session_exists_returns_false_after_kill() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2159,8 +2160,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn pane_dead_for_running_process() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2174,8 +2176,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn list_sessions_with_prefix_finds_matching() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2200,8 +2203,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn list_sessions_with_prefix_excludes_non_matching() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2210,8 +2214,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn split_window_horizontal_creates_new_pane() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2232,8 +2237,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn split_window_vertical_creates_new_pane() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2254,8 +2260,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn load_buffer_and_paste_buffer_injects_text() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2278,8 +2285,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn kill_pane_removes_pane() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2299,8 +2307,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn kill_pane_nonexistent_returns_error() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2313,8 +2322,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn set_mouse_disable_and_enable() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2348,8 +2358,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn tmux_set_custom_option() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2368,8 +2379,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn create_window_fails_for_missing_session() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2388,8 +2400,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn setup_pipe_pane_if_missing_works() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2415,8 +2428,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn select_layout_even_after_splits() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2432,8 +2446,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn rename_window_changes_name() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2450,8 +2465,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn select_window_switches_active() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2465,8 +2481,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn capture_pane_recent_zero_lines_returns_full() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2493,8 +2510,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn list_pane_details_shows_command_info() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2513,8 +2531,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn pane_id_returns_percent_prefixed() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }
@@ -2530,8 +2549,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn respawn_pane_restarts_running_pane() {
+        let _env_lock = env_lock();
         if !require_tmux_integration() {
             return;
         }

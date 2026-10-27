@@ -500,7 +500,6 @@ pub(super) fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
     fn simple_hash_differs_for_different_input() {
@@ -538,9 +537,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn idle_poll_consumes_non_empty_capture() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-test-watcher-idle-poll";
         let _ = crate::tmux::kill_session(session);
 
@@ -566,9 +565,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn active_poll_updates_state_when_capture_changes() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-test-watcher-active-change";
         let _ = crate::tmux::kill_session(session);
 
@@ -596,9 +595,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn idle_poll_detects_context_exhaustion() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-watcher-context-exhaust-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -617,9 +616,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn active_poll_keeps_previous_state_when_capture_is_unchanged() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-test-watcher-unchanged";
         let _ = crate::tmux::kill_session(session);
 
@@ -654,9 +653,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn pane_dead_poll_reports_pane_dead() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-watcher-pane-dead-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 

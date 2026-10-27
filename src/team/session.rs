@@ -773,7 +773,6 @@ mod tests {
     use crate::team::status;
     use crate::team::team_config_dir;
     use crate::team::team_config_path;
-    use serial_test::serial;
 
     #[test]
     fn nudge_disable_creates_marker_and_enable_removes_it() {
@@ -1421,9 +1420,9 @@ roles:
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn list_runtime_member_statuses_reads_tmux_role_and_status_options() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-test-team-status-runtime";
         let _ = crate::tmux::kill_session(session);
 

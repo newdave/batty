@@ -116,23 +116,14 @@ fn inspection_json_omits_telegram_bot_token() {
 }
 
 fn git(repo: &std::path::Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .args([
-            "-c",
-            "user.name=Batty Test",
-            "-c",
-            "user.email=batty@example.com",
-        ])
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut full = vec![
+        "-c",
+        "user.name=Batty Test",
+        "-c",
+        "user.email=batty@example.com",
+    ];
+    full.extend_from_slice(args);
+    crate::team::test_support::git_ok(repo, &full);
 }
 
 #[test]

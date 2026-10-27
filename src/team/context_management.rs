@@ -282,27 +282,13 @@ fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::git_ok;
 
     fn init_git_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
-        let status = Command::new("git")
-            .args(["init"])
-            .current_dir(path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = Command::new("git")
-            .args(["config", "user.name", "Batty Test"])
-            .current_dir(path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = Command::new("git")
-            .args(["config", "user.email", "batty@example.com"])
-            .current_dir(path)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        git_ok(path, &["init"]);
+        git_ok(path, &["config", "user.name", "Batty Test"]);
+        git_ok(path, &["config", "user.email", "batty@example.com"]);
     }
 
     fn commit_file(repo: &Path, rel_path: &str, content: &str, message: &str) {

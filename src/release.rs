@@ -1654,6 +1654,7 @@ fn trimmed_output(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::{git_ok as git, git_stdout as git_output};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1668,28 +1669,6 @@ mod tests {
             Ok(self.result.clone())
         }
     }
-
-    fn git(repo: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {:?} failed", args);
-    }
-
-    fn git_output(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git {:?} failed", args);
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
     fn init_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(

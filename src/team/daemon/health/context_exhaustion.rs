@@ -326,16 +326,15 @@ mod tests {
         TestDaemonBuilder, engineer_member, manager_member, setup_fake_claude,
         write_owned_task_file,
     };
-    use serial_test::serial;
     use std::collections::HashMap;
     use std::path::Path;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn agent_restart_relaunches_context_exhausted_member_with_task_context() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-agent-restart-context-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -437,9 +436,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn context_exhaustion_relaunch_corrects_mismatched_cwd() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-ctx-cwd-correct-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -512,9 +511,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn agent_restart_second_exhaustion_escalates_instead_of_restarting() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-agent-restart-escalate-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -606,9 +605,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn agent_restart_respects_cooldown_before_first_restart() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-agent-cooldown-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 

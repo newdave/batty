@@ -262,10 +262,10 @@ pub(super) fn render_cleanup_summary(summary: &CleanupSummary) -> String {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     use super::super::util::launch_state_path;
     use super::*;
+    use crate::team::test_support::git_ok;
 
     fn write_named_team_config(root: &Path, name: &str) {
         let team_dir = root.join(".batty").join("team_config");
@@ -327,22 +327,6 @@ roles:
         git_ok(root, &["add", "README.md"]);
         git_ok(root, &["commit", "-m", "initial"]);
     }
-
-    fn git_ok(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap_or_else(|error| panic!("git {:?} failed to run: {error}", args));
-        assert!(
-            output.status.success(),
-            "git {:?} failed: stdout={} stderr={}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     fn write_claimed_task(root: &Path, id: u32, status: &str, claimed_by: &str) {
         let tasks_dir = root
             .join(".batty")

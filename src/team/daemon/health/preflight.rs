@@ -155,7 +155,7 @@ mod tests {
         board_dir, ensure_agent_binaries_available, ensure_board_initialized, ensure_git_ready,
         ensure_kanban_available, ensure_telemetry_writable, ensure_worktree_operations,
     };
-    use super::super::test_helpers::{EnvVarGuard, PATH_LOCK, setup_fake_kanban, test_team_config};
+    use super::super::test_helpers::{EnvVarGuard, env_lock, setup_fake_kanban, test_team_config};
     use crate::team::config::{
         AutomationConfig, BoardConfig, OrchestratorPosition, RoleType, StandupConfig, TeamConfig,
         WorkflowMode, WorkflowPolicy,
@@ -166,7 +166,6 @@ mod tests {
         setup_fake_backend, setup_fake_claude,
     };
     use crate::team::watcher::SessionWatcher;
-    use serial_test::serial;
     use std::collections::HashMap;
     use std::path::Path;
     use std::process::Command;
@@ -212,14 +211,14 @@ mod tests {
 
     #[test]
     fn startup_preflight_initializes_missing_board_directory() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "startup_board_init");
         let fake_bin = setup_fake_kanban(&tmp, "startup-board-init");
         let original_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvVarGuard::set(
             "PATH",
-            &format!("{}:{original_path}", fake_bin.to_string_lossy()),
+            format!("{}:{original_path}", fake_bin.to_string_lossy()),
         );
 
         let board_path = board_dir(&repo);
@@ -287,7 +286,7 @@ mod tests {
 
     #[test]
     fn startup_preflight_reports_missing_git_identity() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "startup_git_identity");
         Command::new("git")
@@ -356,7 +355,7 @@ mod tests {
 
     #[test]
     fn startup_preflight_accepts_available_agent_binaries() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_claude_bin, _fake_claude_log) = setup_fake_claude(&tmp, "eng-1");
         let (fake_codex_bin, _fake_codex_log) =
@@ -364,7 +363,7 @@ mod tests {
         let original_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvVarGuard::set(
             "PATH",
-            &format!(
+            format!(
                 "{}:{}:{original_path}",
                 fake_claude_bin.to_string_lossy(),
                 fake_codex_bin.to_string_lossy()
@@ -379,10 +378,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn startup_preflight_respawns_dead_pane_and_bootstraps_board() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_guard = env_lock();
         let session = format!("batty-test-startup-preflight-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -392,7 +390,7 @@ mod tests {
         let original_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvVarGuard::set(
             "PATH",
-            &format!("{}:{original_path}", fake_bin.to_string_lossy()),
+            format!("{}:{original_path}", fake_bin.to_string_lossy()),
         );
 
         crate::tmux::create_session(&session, "bash", &[], repo.to_string_lossy().as_ref())
@@ -461,10 +459,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn startup_preflight_missing_sessions_recover_failed_member_without_respawning_healthy_panes() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_guard = env_lock();
         let session = format!("batty-test-startup-missing-session-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -477,7 +474,7 @@ mod tests {
         let original_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvVarGuard::set(
             "PATH",
-            &format!(
+            format!(
                 "{}:{}:{}:{original_path}",
                 fake_kanban.to_string_lossy(),
                 fake_claude_bin.to_string_lossy(),
@@ -645,9 +642,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn startup_cwd_validation_corrects_all_agent_panes() {
+        let _env_lock = env_lock();
         let session = format!("batty-test-startup-cwd-val-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -737,9 +734,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn pre_assignment_health_check_corrects_mismatched_cwd() {
+        let _env_lock = env_lock();
         use crate::team::config::{
             AutomationConfig, BoardConfig, OrchestratorPosition, StandupConfig, TeamConfig,
             WorkflowMode, WorkflowPolicy,
@@ -838,9 +835,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn pre_assignment_health_check_cwd_matching_path_passes_silently() {
+        let _env_lock = env_lock();
         use crate::team::config::{
             AutomationConfig, BoardConfig, OrchestratorPosition, StandupConfig, TeamConfig,
             WorkflowMode, WorkflowPolicy,

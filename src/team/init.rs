@@ -913,39 +913,11 @@ fn count_files_in_dir(path: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
-    use std::ffi::OsString;
+    use crate::team::test_support::{EnvVarGuard, env_lock};
 
     use crate::team::{
         daemon_log_path, orchestrator_log_path, team_config_dir, team_config_path, team_events_path,
     };
-
-    struct HomeGuard {
-        original_home: Option<OsString>,
-    }
-
-    impl HomeGuard {
-        fn set(path: &Path) -> Self {
-            let original_home = std::env::var_os("HOME");
-            unsafe {
-                std::env::set_var("HOME", path);
-            }
-            Self { original_home }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match &self.original_home {
-                Some(home) => unsafe {
-                    std::env::set_var("HOME", home);
-                },
-                None => unsafe {
-                    std::env::remove_var("HOME");
-                },
-            }
-        }
-    }
 
     #[test]
     fn init_team_creates_scaffolding() {
@@ -1015,11 +987,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn init_from_template_copies_files() {
+        let _env_lock = env_lock();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let _home_guard = HomeGuard::set(home.path());
+        let _home_guard = EnvVarGuard::set("HOME", home.path());
 
         let template_dir = home.path().join(".batty").join("templates").join("custom");
         std::fs::create_dir_all(template_dir.join("board")).unwrap();
@@ -1048,11 +1020,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn init_from_template_restores_project_root_assets() {
+        let _env_lock = env_lock();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let _home_guard = HomeGuard::set(home.path());
+        let _home_guard = EnvVarGuard::set("HOME", home.path());
 
         let template_dir = home
             .path()
@@ -1103,11 +1075,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn init_from_template_missing_template_errors_with_available_list() {
+        let _env_lock = env_lock();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let _home_guard = HomeGuard::set(home.path());
+        let _home_guard = EnvVarGuard::set("HOME", home.path());
 
         let templates_root = home.path().join(".batty").join("templates");
         std::fs::create_dir_all(templates_root.join("alpha")).unwrap();
@@ -1121,11 +1093,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn init_from_template_errors_when_templates_dir_is_missing() {
+        let _env_lock = env_lock();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let _home_guard = HomeGuard::set(home.path());
+        let _home_guard = EnvVarGuard::set("HOME", home.path());
 
         let error = init_from_template(project.path(), "missing").unwrap_err();
         assert!(error.to_string().contains("no templates directory found"));
@@ -1342,10 +1314,10 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn export_template_creates_directory_and_copies_files() {
+        let _env_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _home = EnvVarGuard::set("HOME", tmp.path());
         let project_root = tmp.path().join("project");
         let config_dir = team_config_dir(&project_root);
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -1367,10 +1339,10 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn export_template_overwrites_existing() {
+        let _env_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _home = EnvVarGuard::set("HOME", tmp.path());
         let project_root = tmp.path().join("project");
         let config_dir = team_config_dir(&project_root);
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -1397,10 +1369,10 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn export_template_missing_team_yaml_errors() {
+        let _env_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _home = EnvVarGuard::set("HOME", tmp.path());
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(team_config_dir(&project_root)).unwrap();
 
@@ -1410,10 +1382,10 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn export_template_includes_cleanroom_project_assets() {
+        let _env_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _home = EnvVarGuard::set("HOME", tmp.path());
         let project_root = tmp.path().join("project");
         let config_dir = team_config_dir(&project_root);
         std::fs::create_dir_all(&config_dir).unwrap();

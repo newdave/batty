@@ -2178,23 +2178,9 @@ mod tests {
 
         let mut daemon = empty_legacy_daemon(&tmp);
         daemon.config.team_config.roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
             channel: Some("telegram".to_string()),
             channel_config: Some(test_channel_config("123", "fake")),
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         daemon.config.members = vec![engineer_member("eng-1", None, false)];
         daemon.channels = HashMap::from([(
@@ -2237,11 +2223,9 @@ mod tests {
 
         let mut daemon = empty_legacy_daemon(&tmp);
         daemon.config.team_config.roles = vec![RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
             channel: Some("telegram".to_string()),
             channel_config: Some(test_channel_config("123", "fake")),
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         }];
         daemon.channels = HashMap::new();
 
@@ -2256,42 +2240,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let roles = vec![
             RoleDef {
-                name: "manager".to_string(),
-                role_type: RoleType::Manager,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("manager", RoleType::Manager)
             },
             RoleDef {
-                name: "eng-1".to_string(),
-                role_type: RoleType::Engineer,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("eng-1", RoleType::Engineer)
             },
         ];
         let members = vec![
@@ -2411,23 +2365,8 @@ mod tests {
 
         daemon.config.team_config.external_senders = vec!["email-router".to_string()];
         daemon.config.team_config.roles = vec![RoleDef {
-            name: "manager".to_string(),
-            role_type: RoleType::Manager,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
-            receives_standup: None,
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("manager", RoleType::Manager)
         }];
         daemon.config.members = vec![MemberInstance {
             name: "manager".to_string(),
@@ -2471,42 +2410,12 @@ mod tests {
         .unwrap();
         let roles = vec![
             RoleDef {
-                name: "manager".to_string(),
-                role_type: RoleType::Manager,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("manager", RoleType::Manager)
             },
             RoleDef {
-                name: "eng".to_string(),
-                role_type: RoleType::Engineer,
                 agent: Some("codex".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("eng", RoleType::Engineer)
             },
         ];
         let members = vec![
@@ -4118,42 +4027,12 @@ mod tests {
         daemon.config.team_config.workflow_mode = WorkflowMode::Hybrid;
         daemon.config.team_config.roles = vec![
             RoleDef {
-                name: "manager".to_string(),
-                role_type: RoleType::Manager,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("manager", RoleType::Manager)
             },
             RoleDef {
-                name: "engineer".to_string(),
-                role_type: RoleType::Engineer,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("engineer", RoleType::Engineer)
             },
         ];
         daemon.config.members = vec![MemberInstance {
@@ -4215,42 +4094,12 @@ mod tests {
         daemon.config.team_config.workflow_mode = WorkflowMode::Hybrid;
         daemon.config.team_config.roles = vec![
             RoleDef {
-                name: "manager".to_string(),
-                role_type: RoleType::Manager,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("manager", RoleType::Manager)
             },
             RoleDef {
-                name: "engineer".to_string(),
-                role_type: RoleType::Engineer,
                 agent: Some("claude".to_string()),
-                auth_mode: None,
-                auth_env: vec![],
-                instances: 1,
-                prompt: None,
-                talks_to: vec![],
-                channel: None,
-                channel_config: None,
-                nudge_interval_secs: None,
-                receives_standup: None,
-                standup_interval_secs: None,
-                owns: Vec::new(),
-                barrier_group: None,
-                use_worktrees: false,
-                ..Default::default()
+                ..RoleDef::test("engineer", RoleType::Engineer)
             },
         ];
         daemon.config.members = vec![MemberInstance {

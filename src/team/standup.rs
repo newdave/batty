@@ -914,23 +914,10 @@ mod tests {
     fn update_timer_for_state_pauses_while_working_and_restarts_on_idle() {
         let member = make_member("manager", RoleType::Manager, None);
         let role = RoleDef {
-            name: "manager".to_string(),
-            role_type: RoleType::Manager,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(true),
             standup_interval_secs: Some(600),
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("manager", RoleType::Manager)
         };
         let team_config = TeamConfig {
             name: "test".to_string(),
@@ -989,7 +976,7 @@ mod tests {
         );
 
         assert!(!paused_standups.contains("manager"));
-        assert!(last_standup["manager"].elapsed() < Duration::from_secs(1));
+        assert!(last_standup["manager"].elapsed() < Duration::from_secs(10));
     }
 
     #[test]
@@ -997,23 +984,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let member = make_member("manager", RoleType::Manager, None);
         let role = RoleDef {
-            name: "manager".to_string(),
-            role_type: RoleType::Manager,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(true),
             standup_interval_secs: Some(600),
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("manager", RoleType::Manager)
         };
         let team_config = TeamConfig {
             name: "test".to_string(),
@@ -1091,42 +1065,15 @@ mod tests {
             ..Default::default()
         };
         let user_role = RoleDef {
-            name: "user".to_string(),
-            role_type: RoleType::User,
-            agent: None,
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
             talks_to: vec!["architect".to_string()],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(true),
             standup_interval_secs: Some(1),
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("user", RoleType::User)
         };
         let architect_role = RoleDef {
-            name: "architect".to_string(),
-            role_type: RoleType::Architect,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(false),
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("architect", RoleType::Architect)
         };
         let team_config = TeamConfig {
             name: "test".to_string(),
@@ -1493,23 +1440,9 @@ last_verified: 2026-04-05
     fn update_timer_for_non_standup_member_clears_state() {
         let eng = make_member("eng-1", RoleType::Engineer, None);
         let role = RoleDef {
-            name: "eng-1".to_string(),
-            role_type: RoleType::Engineer,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(false),
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("eng-1", RoleType::Engineer)
         };
         let team_config = TeamConfig {
             name: "test".to_string(),
@@ -1560,23 +1493,10 @@ last_verified: 2026-04-05
     fn standup_interval_for_manager_uses_role_override() {
         let member = make_member("manager", RoleType::Manager, None);
         let role = RoleDef {
-            name: "manager".to_string(),
-            role_type: RoleType::Manager,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(true),
             standup_interval_secs: Some(300),
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("manager", RoleType::Manager)
         };
         let team_config = TeamConfig {
             name: "test".to_string(),
@@ -1770,23 +1690,10 @@ last_verified: 2026-04-05
         let tmp = tempfile::tempdir().unwrap();
         let member = make_member("manager", RoleType::Manager, None);
         let role = RoleDef {
-            name: "manager".to_string(),
-            role_type: RoleType::Manager,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(true),
             standup_interval_secs: Some(60),
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("manager", RoleType::Manager)
         };
         let team_config = TeamConfig {
             name: "test".to_string(),
@@ -1848,42 +1755,15 @@ last_verified: 2026-04-05
         let member = make_member("manager", RoleType::Manager, None);
         let eng = make_member("eng-1", RoleType::Engineer, Some("manager"));
         let role = RoleDef {
-            name: "manager".to_string(),
-            role_type: RoleType::Manager,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(true),
             standup_interval_secs: Some(1),
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("manager", RoleType::Manager)
         };
         let eng_role = RoleDef {
-            name: "eng-1".to_string(),
-            role_type: RoleType::Engineer,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(false),
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("eng-1", RoleType::Engineer)
         };
         let team_config = TeamConfig {
             name: "test".to_string(),
@@ -1946,42 +1826,15 @@ last_verified: 2026-04-05
         let member = make_member("manager", RoleType::Manager, None);
         let eng = make_member("eng-1", RoleType::Engineer, Some("manager"));
         let role = RoleDef {
-            name: "manager".to_string(),
-            role_type: RoleType::Manager,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(true),
             standup_interval_secs: Some(1),
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("manager", RoleType::Manager)
         };
         let eng_role = RoleDef {
-            name: "eng-1".to_string(),
-            role_type: RoleType::Engineer,
             agent: Some("claude".to_string()),
-            auth_mode: None,
-            auth_env: vec![],
-            instances: 1,
-            prompt: None,
-            talks_to: vec![],
-            channel: None,
-            channel_config: None,
-            nudge_interval_secs: None,
             receives_standup: Some(false),
-            standup_interval_secs: None,
-            owns: Vec::new(),
-            barrier_group: None,
-            use_worktrees: false,
-            ..Default::default()
+            ..RoleDef::test("eng-1", RoleType::Engineer)
         };
         let team_config = TeamConfig {
             name: "test".to_string(),

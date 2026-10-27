@@ -610,16 +610,7 @@ fn keep_policy_name(policy: &KeepPolicy) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {:?} failed", args);
-    }
-
+    use crate::team::test_support::git_ok as git;
     fn repo_with_file() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         git(tmp.path(), &["init"]);

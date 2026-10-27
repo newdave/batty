@@ -999,42 +999,8 @@ fn normalize_optional(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::{EnvVarGuard, env_lock};
     use serde_json::Value as JsonValue;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        old: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn unset(key: &'static str) -> Self {
-            let old = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, old }
-        }
-
-        fn set(key: &'static str, value: &str) -> Self {
-            let old = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(value) = &self.old {
-                    std::env::set_var(self.key, value);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
 
     fn write_task_file(dir: &Path, id: u32, status: &str) -> PathBuf {
         let tasks_dir = dir.join("tasks");
@@ -1071,8 +1037,8 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn transition_activity_records_user_cli_attribution() {
+        let _env_lock = env_lock();
         let _member = EnvVarGuard::unset("BATTY_MEMBER");
         let _tmux = EnvVarGuard::unset("TMUX_PANE");
         let tmp = tempfile::tempdir().unwrap();
@@ -1092,8 +1058,8 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn transition_activity_records_agent_cli_attribution() {
+        let _env_lock = env_lock();
         let _member = EnvVarGuard::set("BATTY_MEMBER", "eng-1-2");
         let _tmux = EnvVarGuard::unset("TMUX_PANE");
         let tmp = tempfile::tempdir().unwrap();

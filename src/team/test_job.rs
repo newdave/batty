@@ -167,19 +167,22 @@ mod tests {
                 Some(pgid),
             )
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while job.child_pgid.load(Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < deadline, "command never started");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            crate::team::test_support::wait_until(Duration::from_secs(60), || {
+                job.child_pgid.load(Ordering::SeqCst) != 0
+            }),
+            "command never started"
+        );
         let started = Instant::now();
         job.kill();
+        // The command sleeps 30s; finishing well inside that proves the kill
+        // took effect, while the wide margin tolerates a loaded machine.
         let run = job
-            .wait(Duration::from_secs(10))
+            .wait(Duration::from_secs(60))
             .expect("killed job should finish")
             .unwrap();
         assert!(!run.passed);
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(25));
     }
 
     #[cfg(unix)]

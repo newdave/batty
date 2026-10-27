@@ -2168,8 +2168,7 @@ pub(crate) fn recycle_cron_tasks_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::team::test_support::{PATH_LOCK, git, git_ok, git_stdout};
-    use std::sync::MutexGuard;
+    use crate::team::test_support::{EnvLock, env_lock, git, git_ok, git_stdout};
 
     fn git_binary_path() -> Option<&'static str> {
         ["git", "/usr/bin/git", "/opt/homebrew/bin/git"]
@@ -2181,8 +2180,8 @@ mod tests {
         git_binary_path().is_some()
     }
 
-    fn git_test_guard() -> Option<MutexGuard<'static, ()>> {
-        let guard = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    fn git_test_guard() -> Option<EnvLock> {
+        let guard = env_lock();
         if git_binary_available() {
             Some(guard)
         } else {

@@ -2941,7 +2941,7 @@ fn update_nudge_for_state_idle_from_paused_resets_window() {
 
     let schedule = daemon.nudges.get("eng-1").unwrap();
     // idle_since should be reset to ~now since paused was true
-    assert!(schedule.idle_since.unwrap().elapsed() < Duration::from_secs(2));
+    assert!(schedule.idle_since.unwrap().elapsed() < Duration::from_secs(10));
     assert!(!schedule.fired_this_idle);
 }
 

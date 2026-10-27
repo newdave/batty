@@ -1403,13 +1403,13 @@ mod tests {
             DAEMON_SHUTDOWN_GRACE_PERIOD
         );
     }
-    use serial_test::serial;
+    use crate::team::test_support::git_ok as run_git;
     use std::process::Command;
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn sleep_unless_shutdown_wakes_early_when_shutdown_requested() {
+        let _env_lock = crate::team::test_support::env_lock();
         WATCHDOG_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
         let start = std::time::Instant::now();
         sleep_unless_shutdown(Duration::from_secs(30));
@@ -1418,8 +1418,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn sleep_unless_shutdown_sleeps_full_duration_otherwise() {
+        let _env_lock = crate::team::test_support::env_lock();
         WATCHDOG_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
         let start = std::time::Instant::now();
         sleep_unless_shutdown(Duration::from_millis(50));
@@ -1430,15 +1430,6 @@ mod tests {
         run_git(dir, &["init", "-q", "-b", "main"]);
         run_git(dir, &["config", "user.email", "test@example.com"]);
         run_git(dir, &["config", "user.name", "Test"]);
-    }
-
-    fn run_git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("git binary");
-        assert!(status.success(), "git {args:?} failed in {dir:?}");
     }
 
     fn commit_file_with_time(dir: &Path, rel: &str, content: &str, unix_ts: i64) {
@@ -1627,8 +1618,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn graceful_daemon_shutdown_waits_for_clean_snapshot() {
+        let _env_lock = crate::team::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let state_path = daemon_state_path(tmp.path());
         let state_dir = state_path.parent().unwrap();
@@ -1660,8 +1651,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn graceful_daemon_shutdown_times_out_before_force_kill_fallback() {
+        let _env_lock = crate::team::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let script_path = tmp.path().join("stubborn-daemon.sh");
         let ready_path = tmp.path().join("trap-installed");

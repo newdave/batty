@@ -3417,7 +3417,7 @@ mod tests {
     };
     use crate::team::test_helpers::{make_test_daemon, write_event_log};
     use crate::team::test_support::{
-        EnvVarGuard, PATH_LOCK, TestDaemonBuilder, architect_member, engineer_member, git_ok,
+        EnvVarGuard, TestDaemonBuilder, architect_member, engineer_member, env_lock, git_ok,
         git_stdout, init_git_repo, manager_member, write_board_task_file, write_open_task_file,
         write_owned_task_file, write_owned_task_file_with_context,
     };
@@ -3927,7 +3927,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn planning_cycle_round_trip_creates_board_tasks_and_resets_active_flag() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _log_path) = setup_fake_kanban_for_planning(&tmp);
         let path = format!(
@@ -3982,7 +3982,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn planning_round_trip_with_malformed_blocks_keeps_good_tasks() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _log_path) = setup_fake_kanban_for_planning(&tmp);
         let path = format!(
@@ -4002,7 +4002,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn planning_round_trip_rejects_raw_log_generated_tasks() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _log_path) = setup_fake_kanban_for_planning(&tmp);
         let path = format!(
@@ -4078,7 +4078,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn planning_response_missing_board_dir_returns_graceful_error_and_resets_cycle() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _log_path) = setup_fake_kanban_for_planning(&tmp);
         let path = format!(
@@ -4127,7 +4127,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn planning_response_double_apply_is_graceful() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let (fake_bin, _log_path) = setup_fake_kanban_for_planning(&tmp);
         let path = format!(
@@ -4201,10 +4201,9 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
     }
 
     #[test]
-    #[serial_test::serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn planning_cycle_end_to_end_includes_context_and_dispatches_created_work() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         write_planning_docs(&tmp);
         let (fake_bin, _log_path) = setup_fake_kanban_for_planning(&tmp);
@@ -4678,9 +4677,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
     }
 
     #[test]
-    #[serial_test::serial]
     fn reconcile_active_tasks_preserves_dirty_archived_lane_before_clear() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "reconcile-archived-dirty-lane");
         let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
@@ -5085,7 +5083,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn reconcile_active_tasks_removes_transient_executor_worktree_after_reassignment() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "executor-reassignment-cleanup");
         let manager = manager_member("manager", None);
@@ -5454,7 +5452,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn claimed_task_branch_mismatch_reports_detached_head_claimed_task() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "claimed-branch-detached-head");
         let engineer = engineer_member("eng-1", Some("manager"), true);
@@ -5513,7 +5511,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn claimed_task_branch_mismatch_expects_own_branch_after_reassignment() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "claimed-branch-reassigned");
         let daemon = TestDaemonBuilder::new(repo.as_path())
@@ -5549,7 +5547,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn claimed_task_branch_mismatch_ignores_matching_claimed_branch() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "claimed-branch-match");
         let engineer = engineer_member("eng-1", Some("manager"), true);
@@ -5586,7 +5584,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn claimed_task_branch_mismatch_ignores_detached_head_without_claim() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "claimed-branch-no-claim");
         let engineer = engineer_member("eng-1", Some("manager"), true);
@@ -5613,7 +5611,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn reconcile_active_tasks_repairs_clean_branch_mismatch_to_expected_branch() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "reconcile-clean-branch-repair");
         let manager = MemberInstance {
@@ -5686,7 +5684,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         // the current (stale) branch first, then switch to the expected
         // branch. Dirty work is preserved in git history and the engineer
         // lands on the correct lane.
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "reconcile-stale-branch");
         let manager = MemberInstance {
@@ -5789,7 +5787,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
         // re-emitting "branch recovery blocked" every monitor tick with no
         // healing action. The fix: self-heal runs for Working members too,
         // auto-saving dirty work on the stale branch before switching.
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "reconcile-stale-branch-working");
         let manager = MemberInstance {
@@ -5854,7 +5852,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn reconcile_active_tasks_ignores_gitignored_runtime_noise() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "reconcile-runtime-noise");
         std::fs::write(repo.join(".gitignore"), ".batty-target/\n").unwrap();
@@ -5928,7 +5926,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn reconcile_active_tasks_requeues_orphaned_branch_mismatch_after_retry_limit() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "reconcile-orphan-branch-mismatch");
         let manager = MemberInstance {
@@ -5981,17 +5979,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
             ".batty/worktrees/eng-1",
         );
 
-        let old = std::env::var("BATTY_ORPHAN_BRANCH_MISMATCH_MAX_ATTEMPTS").ok();
-        unsafe {
-            std::env::set_var("BATTY_ORPHAN_BRANCH_MISMATCH_MAX_ATTEMPTS", "1");
-        }
+        let _max_attempts = EnvVarGuard::set("BATTY_ORPHAN_BRANCH_MISMATCH_MAX_ATTEMPTS", "1");
         daemon.reconcile_active_tasks().unwrap();
-        match old {
-            Some(value) => unsafe {
-                std::env::set_var("BATTY_ORPHAN_BRANCH_MISMATCH_MAX_ATTEMPTS", value)
-            },
-            None => unsafe { std::env::remove_var("BATTY_ORPHAN_BRANCH_MISMATCH_MAX_ATTEMPTS") },
-        }
 
         let task = crate::task::load_task_by_id(
             &repo
@@ -6016,7 +6005,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn reconcile_active_tasks_blocks_detached_head_branch_mismatch() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "reconcile-detached-branch");
         let manager = manager_member("manager", None);
@@ -6059,7 +6048,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn deliver_automation_nudge_suppresses_engineer_nudge_when_branch_mismatch_exists() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "nudge-branch-mismatch");
         let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
@@ -8068,9 +8057,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
     }
 
     #[test]
-    #[serial_test::serial]
     fn reconcile_stale_worktrees_rebases_clean_base_worktree_after_main_advances() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "worktree-auto-rebase");
         let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
@@ -8113,7 +8101,7 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
 
     #[test]
     fn reconcile_stale_worktrees_skips_base_worktree_when_engineer_has_active_task() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "worktree-auto-rebase-active");
         let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
@@ -8145,9 +8133,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
     }
 
     #[test]
-    #[serial_test::serial]
     fn reconcile_stale_worktrees_resets_idle_branch_when_board_no_longer_authorizes_it() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "worktree-reset-unauthorized-branch");
         let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
@@ -8187,9 +8174,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
     }
 
     #[test]
-    #[serial_test::serial]
     fn reconcile_stale_worktrees_preserves_staged_done_lane_before_safe_branch_reset() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "worktree-reset-done-staged");
         let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
@@ -8271,9 +8257,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
     }
 
     #[test]
-    #[serial_test::serial]
     fn reconcile_stale_worktrees_preserves_unstaged_done_lane_before_safe_branch_reset() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "worktree-reset-done-unstaged");
         let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
@@ -8348,9 +8333,8 @@ thread 'tmux::tests::split_window_horizontal_creates_new_pane' panicked at src/t
     }
 
     #[test]
-    #[serial_test::serial]
     fn reconcile_stale_worktrees_snapshots_dirty_done_lane_when_commit_preserve_fails() {
-        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _path_lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "worktree-reset-done-preserve-failure");
         let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");

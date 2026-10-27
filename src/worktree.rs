@@ -1726,6 +1726,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::git_ok as git;
     use std::fs;
 
     fn git_available() -> bool {
@@ -1735,21 +1736,6 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
-
-    fn git(repo: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(repo)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     fn init_repo() -> Option<tempfile::TempDir> {
         if !git_available() {
             return None;

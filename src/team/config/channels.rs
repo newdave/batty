@@ -227,11 +227,9 @@ mod tests {
     fn team(channel: Option<&str>, cc: Option<ChannelConfig>) -> TeamConfig {
         let mut config: TeamConfig = serde_yaml::from_str("name: t\nroles: []\n").unwrap();
         config.roles.push(RoleDef {
-            name: "human".to_string(),
-            role_type: RoleType::User,
             channel: channel.map(str::to_string),
             channel_config: cc,
-            ..Default::default()
+            ..RoleDef::test("human", RoleType::User)
         });
         config
     }

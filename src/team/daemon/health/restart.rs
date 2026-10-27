@@ -288,16 +288,15 @@ mod tests {
     use crate::team::hierarchy::MemberInstance;
     use crate::team::standup::MemberState;
     use crate::team::test_support::setup_fake_claude;
-    use serial_test::serial;
     use std::collections::HashMap;
     use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn poll_watchers_respawns_pane_dead_member_and_records_events() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-restart-dead-member-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -457,9 +456,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn spawn_all_agents_corrects_mismatched_cwd_before_launch() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-spawn-cwd-correct-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 
@@ -585,9 +584,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn restart_member_corrects_mismatched_cwd_after_respawn() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session = format!("batty-test-restart-cwd-correct-{}", std::process::id());
         let _ = crate::tmux::kill_session(&session);
 

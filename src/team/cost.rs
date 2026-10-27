@@ -1848,6 +1848,7 @@ mod tests {
 
     #[test]
     fn session_roots_default_uses_home() {
+        let _env_lock = crate::team::test_support::env_lock();
         let roots = SessionRoots::default();
         let home = std::env::var("HOME").unwrap_or_default();
         assert!(roots.codex_sessions_root.starts_with(&home));

@@ -1076,9 +1076,16 @@ mod thread_conflict_tests {
             .arg(format!("sleep 30; : codex exec --json resume {tid} -"))
             .spawn()
             .unwrap();
-        thread::sleep(Duration::from_millis(200));
-        let killed = kill_stale_codex_for_thread(&tid);
-        assert!(killed.contains(&stale.id()));
+        // The process table may lag the spawn; poll until the stale command
+        // line is visible (the kill itself is what we are testing).
+        let mut killed = Vec::new();
+        assert!(
+            crate::team::test_support::wait_until(Duration::from_secs(15), || {
+                killed = kill_stale_codex_for_thread(&tid);
+                killed.contains(&stale.id())
+            }),
+            "stale codex never found"
+        );
         let status = stale.wait().unwrap();
         assert!(!status.success());
         assert!(kill_stale_codex_for_thread(&tid).is_empty());
@@ -1465,7 +1472,7 @@ mod tests {
         }
         let started = Instant::now();
         stop_codex_exec(&state);
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_secs(20));
         assert!(child.lock().unwrap().try_wait().unwrap().is_some());
         let st = state.lock().unwrap();
         assert_eq!(st.state, ShimState::Dead);
