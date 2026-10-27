@@ -432,12 +432,21 @@ mod tests {
         let mut frame = (json.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(&json);
 
+        // The writer waits for the receiver to observe a read timeout after
+        // each piece instead of sleeping, so a loaded host cannot deliver
+        // the pieces back to back.
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_observed = observed.clone();
         let writer = std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
             let mut a = a;
             // Split inside the length prefix, then inside the body.
             for piece in [&frame[..2], &frame[2..10], &frame[10..]] {
                 a.write_all(piece).unwrap();
-                std::thread::sleep(Duration::from_millis(60));
+                let seen = writer_observed.load(Ordering::SeqCst);
+                crate::team::test_support::wait_until(Duration::from_secs(5), || {
+                    writer_observed.load(Ordering::SeqCst) > seen
+                });
             }
             a
         });
@@ -454,6 +463,7 @@ mod tests {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ));
                     timeouts += 1;
+                    observed.store(timeouts, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         };
@@ -468,7 +478,15 @@ mod tests {
             _ => panic!("wrong variant"),
         }
         drop(writer.join().unwrap());
-        assert!(receiver.recv::<Command>().unwrap().is_none());
+        // EOF may take a moment to propagate; tolerate read timeouts until it does.
+        let eof = crate::team::test_support::wait_until(Duration::from_secs(5), || match receiver
+            .recv::<Command>(
+        ) {
+            Ok(None) => true,
+            Ok(Some(_)) => panic!("unexpected extra frame"),
+            Err(_) => false,
+        });
+        assert!(eof, "receiver never saw EOF");
     }
 
     #[test]

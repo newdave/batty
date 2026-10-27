@@ -179,6 +179,42 @@ jobs:
           PROPTEST_CASES: '2048'
           PROPTEST_MAX_SHRINK_ITERS: '8192'
 
+  flake-check:
+    name: Lib Tests Under Load (flake check)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.non_docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Configure git identity and default branch
+        run: |
+          git config --global user.email "ci@batty.test"
+          git config --global user.name "Batty CI"
+          git config --global init.defaultBranch main
+        shell: bash
+
+      # Oversubscribe the CPUs (2x threads) twice so wall-clock assumptions in
+      # tests surface as failures here instead of as flakes on main.
+      - name: Lib tests at 2x CPU threads (two passes)
+        shell: bash
+        run: |
+          threads=$(( $(nproc) * 2 ))
+          for pass in 1 2; do
+            echo "::group::pass $pass (--test-threads=$threads)"
+            cargo test --lib -- --test-threads="$threads"
+            echo "::endgroup::"
+          done
+
   coverage:
     name: Code Coverage
     needs: changes

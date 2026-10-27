@@ -382,10 +382,19 @@ pub(crate) fn setup_fake_backend(
     if let Some(parent) = fake_log.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
+    // A fake `batty` may be launched as a shim with the daemon's socket on
+    // fd 3. If it exits at once the peer is already closed when the daemon
+    // configures the socket, and macOS rejects that with EINVAL (a load-only
+    // flake). Hold fd 3 open until the daemon drops its end (EOF).
+    let hold_peer = if program == "batty" {
+        "{ read -r -t 30 <&3; } 2>/dev/null\n"
+    } else {
+        ""
+    };
     std::fs::write(
         &fake_program,
         format!(
-            "#!/bin/bash\nmkdir -p '{}'\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            "#!/bin/bash\nmkdir -p '{}'\nprintf '%s\\n' \"$*\" >> '{}'\n{hold_peer}exit 0\n",
             fake_log.parent().unwrap().display(),
             fake_log.display(),
         ),

@@ -243,19 +243,27 @@ mod tests {
     fn kill_terminates_tracked_command_process_group() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
-        let job = TestJob::spawn("kill", move |pgid| {
+        let pidfile = tmp.path().join("sleep.pid");
+        let job = TestJob::spawn_with_timeout("kill", None, move |pgid| {
+            // Fork the long-lived child and publish its pid before the kill,
+            // so the kill never races the shell's fork of `sleep`.
             crate::team::task_loop::run_tests_in_worktree_tracked(
                 &dir,
-                Some("sleep 30; exit 0"),
+                Some("sleep 30 & echo $! > sleep.pid.tmp; mv sleep.pid.tmp sleep.pid; wait"),
                 Some(pgid),
             )
         });
         assert!(
             crate::team::test_support::wait_until(Duration::from_secs(60), || {
-                job.child_pgid.load(Ordering::SeqCst) != 0
+                job.child_pgid.load(Ordering::SeqCst) != 0 && pidfile.exists()
             }),
             "command never started"
         );
+        let sleep_pid: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let started = Instant::now();
         job.kill();
         // The command sleeps 30s; finishing well inside that proves the kill
@@ -266,6 +274,14 @@ mod tests {
             .unwrap();
         assert!(!run.passed);
         assert!(started.elapsed() < Duration::from_secs(25));
+        // The whole group went down, not just the shell.
+        assert!(
+            crate::team::test_support::wait_until(Duration::from_secs(10), || {
+                // SAFETY: signal 0 only probes for existence.
+                unsafe { libc::kill(sleep_pid, 0) != 0 }
+            }),
+            "background sleep survived the group kill"
+        );
     }
 
     #[cfg(unix)]

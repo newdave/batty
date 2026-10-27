@@ -1040,9 +1040,18 @@ mod tests {
     fn terminate_child_escalates_to_sigkill_after_the_grace_period() {
         use std::os::unix::process::ExitStatusExt;
         // Ignores SIGTERM (the ignore is inherited by `sleep`).
-        let mut child = spawn_grouped("trap '' TERM; while :; do sleep 1; done");
+        let marker = tempfile::tempdir().unwrap();
+        let ready = marker.path().join("ready");
+        let mut child = spawn_grouped(&format!(
+            "trap '' TERM; : > '{}'; while :; do sleep 1; done",
+            ready.display()
+        ));
         let pid = child.id();
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait until the trap is installed, or SIGTERM would just kill the shell.
+        assert!(crate::team::test_support::wait_until(
+            Duration::from_secs(30),
+            || ready.exists()
+        ));
         let grace = Duration::from_millis(600);
         let started = Instant::now();
         terminate_child(&mut child, true, grace);
@@ -1051,7 +1060,10 @@ mod tests {
             "SIGKILL must wait out the grace period"
         );
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
-        assert!(!group_alive(pid), "whole group must be gone");
+        assert!(
+            crate::team::test_support::wait_until(Duration::from_secs(10), || !group_alive(pid)),
+            "whole group must be gone"
+        );
     }
 
     #[cfg(unix)]
