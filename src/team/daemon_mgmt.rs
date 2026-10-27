@@ -1262,10 +1262,13 @@ pub fn run_watchdog(project_root: &Path, resume: bool) -> Result<()> {
 }
 
 /// Find the tmux pane ID tagged with `@batty_role=<member_name>` in a session.
-fn find_pane_for_member(session: &str, member_name: &str) -> Option<String> {
+pub(crate) fn find_pane_for_member(session: &str, member_name: &str) -> Option<String> {
     let output = crate::tmux::run_tmux_with_timeout(
         [
             "list-panes",
+            // -s: every window in the session (windows/focus layouts put
+            // members in separate windows), not just the current one.
+            "-s",
             "-t",
             session,
             "-F",

@@ -2022,6 +2022,52 @@ roles:
 
     #[test]
     #[cfg_attr(not(feature = "integration"), ignore)]
+    fn windows_mode_member_panes_are_found_across_windows() {
+        // The daemon rebuilds its pane map and `batty status` reads runtime
+        // state by listing panes; both must see members in every window,
+        // not only the current (dashboard) one.
+        let _env_lock = crate::team::test_support::env_lock();
+        let session = "batty-uxtest-windows-lookup";
+        let _ = crate::tmux::kill_session(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let members = make_members(THREE_MEMBERS);
+        let pane_map = build_layout(
+            session,
+            &members,
+            &layout_with_mode(super::super::config::LayoutMode::Windows),
+            tmp.path(),
+            WorkflowMode::Legacy,
+            false,
+            OrchestratorPosition::Bottom,
+        )
+        .unwrap();
+        let found: HashMap<String, Option<String>> = pane_map
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    crate::team::daemon_mgmt::find_pane_for_member(session, name),
+                )
+            })
+            .collect();
+        let runtime = crate::team::status::list_runtime_member_statuses(session);
+        let _ = crate::tmux::kill_session(session);
+
+        for (name, pane) in &pane_map {
+            assert_eq!(
+                found.get(name).cloned().flatten().as_deref(),
+                Some(pane.as_str()),
+                "daemon pane lookup missed {name}"
+            );
+        }
+        let runtime = runtime.unwrap();
+        for name in pane_map.keys() {
+            assert!(runtime.contains_key(name), "runtime status missed {name}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
     fn focus_mode_keeps_all_members_in_one_window() {
         let _env_lock = crate::team::test_support::env_lock();
         let session = "batty-uxtest-focus";

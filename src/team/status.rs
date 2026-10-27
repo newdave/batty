@@ -336,6 +336,9 @@ pub(crate) fn list_runtime_member_statuses(
     let output = crate::tmux::run_tmux_with_timeout(
         [
             "list-panes",
+            // -s: every window in the session (windows/focus layouts put
+            // members in separate windows), not just the current one.
+            "-s",
             "-t",
             session,
             "-F",
