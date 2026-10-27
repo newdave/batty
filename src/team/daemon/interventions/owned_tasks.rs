@@ -228,7 +228,9 @@ impl TeamDaemon {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let first_task = owned_tasks[0];
+        let Some(first_task) = owned_tasks.first().copied() else {
+            return String::new();
+        };
 
         let mut message = format!(
             "Owned active task backlog detected: you are idle but still own active board task(s): {task_summary}.\n\
@@ -315,7 +317,9 @@ impl TeamDaemon {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let first_task = owned_tasks[0];
+        let Some(first_task) = owned_tasks.first().copied() else {
+            return String::new();
+        };
         let redirect_command = if member.role_type == RoleType::Engineer {
             format!(
                 "`batty assign {member_name} \"Task #{task_id}: <next concrete step or unblock plan>\"`",

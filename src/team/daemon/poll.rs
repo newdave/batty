@@ -266,6 +266,12 @@ impl TeamDaemon {
 
         // -- Recoverable subsystems: log-and-skip with consecutive-failure tracking --
         self.run_recoverable_step("poll_shim_handles", |daemon| daemon.poll_shim_handles());
+        self.run_recoverable_step("process_stalled_mid_turn_retries", |daemon| {
+            daemon.process_stalled_mid_turn_retries()
+        });
+        self.run_recoverable_step("process_pending_removals", |daemon| {
+            daemon.process_pending_removals()
+        });
         self.run_recoverable_step("shim_health_check", |daemon| daemon.shim_health_check());
         self.run_recoverable_step("check_working_state_timeouts", |daemon| {
             daemon.check_working_state_timeouts()
@@ -430,7 +436,7 @@ impl TeamDaemon {
         self.run_recoverable_step("run_auto_doctor", |daemon| {
             daemon.run_auto_doctor().map(|_| ())
         });
-        self.run_recoverable_step_with_catch_unwind("maybe_generate_retrospective", |daemon| {
+        self.run_recoverable_step("maybe_generate_retrospective", |daemon| {
             daemon.maybe_generate_retrospective()
         });
         self.run_recoverable_step("maybe_notify_failure_patterns", |daemon| {
@@ -514,7 +520,7 @@ impl TeamDaemon {
         while !pids.is_empty() && Instant::now() < deadline {
             pids.retain(|(name, pid)| {
                 // Check if process still alive via kill(0)
-                let alive = unsafe { libc::kill(*pid as i32, 0) } == 0;
+                let alive = super::helpers::pid_alive(*pid);
                 if !alive {
                     debug!(member = name.as_str(), pid, "shim process exited cleanly");
                 }
@@ -535,9 +541,7 @@ impl TeamDaemon {
                 let _ = handle.send_kill();
             }
             // Also send SIGKILL directly
-            unsafe {
-                libc::kill(*pid as i32, libc::SIGKILL);
-            }
+            super::helpers::kill_pid(*pid, libc::SIGKILL);
         }
     }
 

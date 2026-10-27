@@ -232,7 +232,9 @@ impl TeamDaemon {
                 ReviewQueueState::Stale(stale) => Some((*task, stale)),
             })
             .collect::<Vec<_>>();
-        let first_task = review_tasks[0];
+        let Some(first_task) = review_tasks.first().copied() else {
+            return String::new();
+        };
         let first_report = first_task.claimed_by.as_deref().unwrap_or("engineer");
         let first_report_is_engineer = self
             .config

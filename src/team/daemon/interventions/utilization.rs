@@ -295,8 +295,9 @@ impl TeamDaemon {
             4. `kanban-md list --dir {board_dir_str} --status backlog`"
         );
 
-        if let Some((engineer, task_ids)) = idle_active_engineers.first() {
-            let task_id = task_ids[0];
+        if let Some((engineer, task_ids)) = idle_active_engineers.first()
+            && let Some(&task_id) = task_ids.first()
+        {
             if let Some(lead) = self.manager_for_member_name(engineer) {
                 message.push_str(&format!(
                     "\n5. For an idle active lane, force lead action now with `batty send {lead} \"Engineer {engineer} is idle on Task #{task_id}. Normalize the board state or unblock/reassign this lane now.\"`."

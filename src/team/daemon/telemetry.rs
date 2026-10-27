@@ -95,7 +95,10 @@ impl TeamDaemon {
     /// Check whether the running binary is stale relative to the git HEAD
     /// of the batty source tree (#675). Gated to run at most once per hour.
     pub(super) fn maybe_check_binary_freshness(&mut self) {
-        if self.last_binary_freshness_check.elapsed() < BINARY_FRESHNESS_INTERVAL {
+        if self
+            .last_binary_freshness_check
+            .is_some_and(|t| t.elapsed() < BINARY_FRESHNESS_INTERVAL)
+        {
             return;
         }
         self.check_binary_freshness(BinaryFreshnessTrigger::Periodic);
@@ -108,7 +111,7 @@ impl TeamDaemon {
     fn check_binary_freshness(&mut self, trigger: BinaryFreshnessTrigger) {
         use std::time::Instant;
 
-        self.last_binary_freshness_check = Instant::now();
+        self.last_binary_freshness_check = Some(Instant::now());
 
         let binary_path = match std::env::current_exe() {
             Ok(path) => path,
@@ -224,10 +227,13 @@ impl TeamDaemon {
             return;
         }
         const TIERED_INBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-        if self.last_tiered_inbox_sweep.elapsed() < TIERED_INBOX_SWEEP_INTERVAL {
+        if self
+            .last_tiered_inbox_sweep
+            .is_some_and(|t| t.elapsed() < TIERED_INBOX_SWEEP_INTERVAL)
+        {
             return;
         }
-        self.last_tiered_inbox_sweep = Instant::now();
+        self.last_tiered_inbox_sweep = Some(Instant::now());
 
         let inboxes_root = crate::team::inbox::inboxes_root(&self.config.project_root);
         let ttls = crate::team::inbox_tiered::TieredTtlConfig::default();
@@ -313,8 +319,17 @@ impl TeamDaemon {
     }
 
     pub(super) fn record_loop_step_error(&mut self, step: &str, error: &str) {
-        warn!(step, error = %error, "daemon loop step failed; continuing");
-        self.emit_event(TeamEvent::loop_step_error(step, error));
+        // Persistent failures would otherwise log and emit an event every
+        // cycle. Report the first failure, changed errors, then back off.
+        // Optional-subsystem steps always emit the event: their error budget
+        // is computed from recent `loop_step_error` events.
+        let report = self.deferred.step_failures.should_report(step, error);
+        if report {
+            tracing::error!(step, error = %error, "daemon loop step failed; continuing");
+        }
+        if report || optional_subsystem_for_step(step).is_some() {
+            self.emit_event(TeamEvent::loop_step_error(step, error));
+        }
         // Capture into the per-tick error buffer so `tick()` can return
         // structured diagnostics in TickReport. Cleared at the start of
         // each tick. Cheap when no errors occur.
@@ -1418,10 +1433,10 @@ mod tests {
             backend_quota_retry_at: HashMap::new(),
             narration_tracker: Default::default(),
             context_pressure_tracker: Default::default(),
-            last_health_check: Instant::now(),
+            last_health_check: Some(Instant::now()),
             last_uncommitted_warn: HashMap::new(),
-            last_shared_target_cleanup: Instant::now(),
-            last_disk_hygiene_check: Instant::now(),
+            last_shared_target_cleanup: Some(Instant::now()),
+            last_disk_hygiene_check: Some(Instant::now()),
             pending_delivery_queue: HashMap::new(),
             pending_shim_acks: HashMap::new(),
             verification_states: HashMap::new(),
@@ -1435,11 +1450,12 @@ mod tests {
             planning_cycle_consecutive_empty: 0,
             last_shim_health_check: Instant::now(),
             merge_queue: crate::team::daemon::MergeQueue::default(),
-            last_binary_freshness_check: Instant::now(),
+            last_binary_freshness_check: Some(Instant::now()),
+            last_tiered_inbox_sweep: Some(Instant::now()),
+            deferred: Default::default(),
             telegram_health: Default::default(),
             discord_health: Default::default(),
             last_telemetry_retention: Instant::now(),
-            last_tiered_inbox_sweep: Instant::now(),
         };
 
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -1905,10 +1921,10 @@ mod tests {
             backend_quota_retry_at: HashMap::new(),
             narration_tracker: Default::default(),
             context_pressure_tracker: Default::default(),
-            last_health_check: Instant::now(),
+            last_health_check: Some(Instant::now()),
             last_uncommitted_warn: HashMap::new(),
-            last_shared_target_cleanup: Instant::now(),
-            last_disk_hygiene_check: Instant::now(),
+            last_shared_target_cleanup: Some(Instant::now()),
+            last_disk_hygiene_check: Some(Instant::now()),
             pending_delivery_queue: HashMap::new(),
             pending_shim_acks: HashMap::new(),
             verification_states: HashMap::new(),
@@ -1922,11 +1938,12 @@ mod tests {
             planning_cycle_consecutive_empty: 0,
             last_shim_health_check: Instant::now(),
             merge_queue: crate::team::daemon::MergeQueue::default(),
-            last_binary_freshness_check: Instant::now(),
+            last_binary_freshness_check: Some(Instant::now()),
+            last_tiered_inbox_sweep: Some(Instant::now()),
+            deferred: Default::default(),
             telegram_health: Default::default(),
             discord_health: Default::default(),
             last_telemetry_retention: Instant::now(),
-            last_tiered_inbox_sweep: Instant::now(),
         };
 
         daemon.poll_watchers().unwrap();

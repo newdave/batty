@@ -204,7 +204,9 @@ impl TeamDaemon {
                             .stall_reason()
                     )
                 } else {
-                    let (reason_suffix, _) = dispatch_gap_stall_reason.unwrap();
+                    let Some((reason_suffix, _)) = dispatch_gap_stall_reason else {
+                        continue;
+                    };
                     format!("manager_supervisory_{reason_suffix}")
                 };
                 let fallback_count = self.fallback_direct_dispatch(
@@ -517,8 +519,9 @@ impl TeamDaemon {
             4. `kanban-md list --dir {board_dir_str} --status backlog`"
         );
 
-        if let Some(first_active) = idle_active_reports.first() {
-            let first_task_id = first_active.active_task_ids[0];
+        if let Some(first_active) = idle_active_reports.first()
+            && let Some(&first_task_id) = first_active.active_task_ids.first()
+        {
             message.push_str(&format!(
                 "\n5. For an idle active lane, intervene directly with `batty send {report} \"Task #{task_id} is idle under your ownership. Either move it forward now, report the exact blocker, or request board normalization.\"`.",
                 report = first_active.name,

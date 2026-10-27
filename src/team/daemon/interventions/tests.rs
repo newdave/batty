@@ -3960,3 +3960,32 @@ fn all_engineers_active_ignores_non_in_progress_tasks() {
     // eng-2's task is in "review", not "in-progress" — should return false
     assert!(!super::all_engineers_have_active_tasks(&names, &tasks));
 }
+
+#[test]
+fn intervention_message_builders_do_not_panic_on_empty_task_slices() {
+    let harness = triage_harness();
+    let daemon = harness.build_daemon().unwrap();
+    let member = daemon
+        .config
+        .members
+        .iter()
+        .find(|member| member.name == "lead")
+        .unwrap()
+        .clone();
+
+    assert!(
+        daemon
+            .build_owned_task_intervention_message(&member, &[], &[])
+            .is_empty()
+    );
+    assert!(
+        daemon
+            .build_stuck_task_escalation_message(&member, &[], 60)
+            .is_empty()
+    );
+    assert!(
+        daemon
+            .build_review_intervention_message(&member, &[], &[])
+            .is_empty()
+    );
+}

@@ -174,11 +174,7 @@ impl<'a> ScenarioHooks<'a> {
     /// Backdate the daemon's `last_disk_hygiene_check` timestamp. Forces
     /// the next tick to run disk hygiene.
     pub fn backdate_last_disk_hygiene(&mut self, by: Duration) {
-        self.daemon.last_disk_hygiene_check = self
-            .daemon
-            .last_disk_hygiene_check
-            .checked_sub(by)
-            .unwrap_or_else(|| Instant::now().checked_sub(by).unwrap_or(Instant::now()));
+        self.daemon.last_disk_hygiene_check = Instant::now().checked_sub(by);
     }
 
     /// Force a stall-state timeout for `member` by backdating its

@@ -1423,11 +1423,10 @@ impl TeamDaemon {
             self.active_task_id(engineer)
                 .filter(|task_id| claimed.iter().any(|task| task.id == *task_id))
                 .or_else(|| select_authoritative_multi_claim_task(&claimed).map(|task| task.id))
-                .expect("claimed tasks is not empty")
         } else if let [task_id] = branch_matches.as_slice() {
-            *task_id
+            Some(*task_id)
         } else if let [task_id] = worktree_matches.as_slice() {
-            *task_id
+            Some(*task_id)
         } else {
             select_authoritative_owned_task(
                 self.active_task_id(engineer),
@@ -1435,7 +1434,9 @@ impl TeamDaemon {
                 &claimed,
             )
             .map(|task| task.id)
-            .expect("claimed tasks is not empty")
+        };
+        let Some(authoritative_id) = authoritative_id else {
+            return Ok(false);
         };
 
         if self.active_task_id(engineer) != Some(authoritative_id) {
@@ -2123,8 +2124,9 @@ impl TeamDaemon {
                 continue;
             }
 
-            let current_task = current_review_task(&tasks_by_id, task.task_id)
-                .expect("filtered stale review task should still be in review");
+            let Some(current_task) = current_review_task(&tasks_by_id, task.task_id) else {
+                continue;
+            };
             let review_owner = Some(current_task)
                 .and_then(|task| task.review_owner.as_deref())
                 .map(str::to_string)

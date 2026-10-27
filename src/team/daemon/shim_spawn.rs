@@ -40,16 +40,12 @@ pub(in crate::team) fn kill_orphan_shims(member_name: &str) {
                 member = member_name,
                 pid, "killing orphan shim process from previous session"
             );
-            unsafe {
-                // Kill the process group to also terminate the child agent
-                libc::kill(-(pid as i32), libc::SIGTERM);
-            }
+            // Kill the process group to also terminate the child agent
+            super::helpers::kill_process_group(pid, libc::SIGTERM);
             // Give it a moment, then force kill
             std::thread::sleep(std::time::Duration::from_millis(500));
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
+            super::helpers::kill_process_group(pid, libc::SIGKILL);
+            super::helpers::kill_pid(pid, libc::SIGKILL);
         }
     }
 }

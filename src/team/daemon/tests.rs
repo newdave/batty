@@ -6138,3 +6138,16 @@ fn slow_main_smoke_runs_in_background() {
     let state = daemon.main_smoke_state.as_ref().expect("main smoke state");
     assert!(!state.broken);
 }
+
+#[test]
+fn new_daemon_periodic_checks_are_due_without_backdating_instants() {
+    // `Instant::now() - Duration` panics when uptime is shorter than the
+    // duration; "never ran" is represented as None and is always due.
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = crate::team::test_helpers::make_test_daemon(tmp.path(), Vec::new());
+    assert!(daemon.last_health_check.is_none());
+    assert!(daemon.last_shared_target_cleanup.is_none());
+    assert!(daemon.last_disk_hygiene_check.is_none());
+    assert!(daemon.last_binary_freshness_check.is_none());
+    assert!(daemon.last_tiered_inbox_sweep.is_none());
+}

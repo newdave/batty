@@ -298,3 +298,104 @@ pub(super) fn ensure_agent_binaries_available(members: &[MemberInstance]) -> Res
 
     Ok(())
 }
+
+/// Convert a recorded child pid to a `pid_t` that is safe to signal.
+///
+/// `kill(0, ..)` signals the caller's process group and `kill(-1, ..)` every
+/// process the caller may signal, so zero and values that wrap negative are
+/// rejected.
+pub(super) fn signalable_pid(pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+/// Whether `pid` names a live process. Zombies still count as alive; use
+/// [`reap_if_exited`] for children of this process.
+pub(super) fn pid_alive(pid: u32) -> bool {
+    let Some(pid) = signalable_pid(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only performs an existence/permission check.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Send `signal` to `pid`, ignoring invalid pids. Returns true if delivered.
+pub(super) fn kill_pid(pid: u32, signal: libc::c_int) -> bool {
+    let Some(pid) = signalable_pid(pid) else {
+        return false;
+    };
+    // SAFETY: pid is validated positive.
+    unsafe { libc::kill(pid, signal) == 0 }
+}
+
+/// Send `signal` to the process group led by `pid`, ignoring invalid pids.
+pub(super) fn kill_process_group(pid: u32, signal: libc::c_int) -> bool {
+    let Some(pid) = signalable_pid(pid) else {
+        return false;
+    };
+    // SAFETY: pid is validated positive, so `-pid` is a specific group.
+    unsafe { libc::kill(-pid, signal) == 0 }
+}
+
+/// Non-blocking exit check for a child of this process. Reaps the child when
+/// it has exited (so it does not linger as a zombie). For pids that are not
+/// our children, falls back to an existence check.
+pub(super) fn reap_if_exited(pid: u32) -> bool {
+    let Some(raw) = signalable_pid(pid) else {
+        return true;
+    };
+    let mut status = 0;
+    // SAFETY: raw is validated positive and status is a valid out pointer.
+    let rc = unsafe { libc::waitpid(raw, &mut status, libc::WNOHANG) };
+    match rc {
+        0 => false,
+        r if r == raw => true,
+        _ => !pid_alive(pid),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn signalable_pid_rejects_zero_and_wrapping_values() {
+        assert_eq!(signalable_pid(0), None);
+        assert_eq!(signalable_pid(u32::MAX), None);
+        assert_eq!(signalable_pid(i32::MAX as u32 + 1), None);
+        assert_eq!(signalable_pid(42), Some(42));
+    }
+
+    #[test]
+    fn invalid_pids_are_never_signalled() {
+        assert!(!pid_alive(0));
+        assert!(!kill_pid(0, libc::SIGKILL));
+        assert!(!kill_process_group(0, libc::SIGKILL));
+        assert!(reap_if_exited(0));
+    }
+
+    #[test]
+    fn reap_if_exited_reaps_zombie_children() {
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !reap_if_exited(pid) {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The zombie was reaped (std sees ECHILD), so the pid no longer exists.
+        let _ = child.try_wait();
+        assert!(!pid_alive(pid));
+    }
+
+    #[test]
+    fn reap_if_exited_is_false_for_running_child() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        assert!(pid_alive(pid));
+        assert!(!reap_if_exited(pid));
+        assert!(kill_pid(pid, libc::SIGKILL));
+        child.wait().unwrap();
+    }
+}

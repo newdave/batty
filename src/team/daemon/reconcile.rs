@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use super::TeamDaemon;
+use super::deferred::PendingRemoval;
+use super::helpers::{kill_pid, reap_if_exited, signalable_pid};
 use crate::shim::protocol::ShimState;
 use crate::task::load_tasks_from_dir;
 use crate::team::config::{RoleType, TeamConfig};
@@ -205,33 +207,70 @@ impl TeamDaemon {
             }
         }
 
-        // Phase 2: Wait for shim to exit (with timeout)
-        if let Some(handle) = self.shim_handles.get(name) {
-            if !handle.is_terminal() {
-                let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
-                let pid = handle.child_pid;
-                while Instant::now() < deadline {
-                    let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-                    if !alive {
-                        debug!(member = name, pid, "shim process exited cleanly");
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                // Force kill if still alive
-                let still_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-                if still_alive {
-                    warn!(
-                        member = name,
-                        pid, "shim did not exit in time — sending SIGKILL"
-                    );
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                }
-            }
+        // Phase 2: Do not wait for the shim inside the tick. Record the
+        // pending removal; `process_pending_removals` reaps the process on
+        // later ticks (SIGKILL after the shutdown timeout) and then finishes.
+        let live_pid = self
+            .shim_handles
+            .get(name)
+            .filter(|handle| !handle.is_terminal())
+            .map(|handle| handle.child_pid)
+            .filter(|pid| signalable_pid(*pid).is_some());
+        if let Some(pid) = live_pid {
+            self.deferred.pending_removals.insert(
+                name.to_string(),
+                PendingRemoval {
+                    pid,
+                    deadline: Instant::now() + Duration::from_secs(timeout_secs as u64),
+                    was_working: is_working,
+                    killed: false,
+                },
+            );
+            return Ok(());
         }
 
+        self.finish_member_removal(name, is_working)
+    }
+
+    /// Advance removals started by `remove_member`: finish once the shim has
+    /// exited, or force-kill it when the shutdown timeout elapses.
+    pub(super) fn process_pending_removals(&mut self) -> Result<()> {
+        let names: Vec<String> = self.deferred.pending_removals.keys().cloned().collect();
+        for name in names {
+            let Some(pending) = self.deferred.pending_removals.get(&name).cloned() else {
+                continue;
+            };
+            // `reap_if_exited` waits on zombies, which `kill(pid, 0)` would
+            // report as alive for the full timeout.
+            if reap_if_exited(pending.pid) {
+                debug!(
+                    member = name.as_str(),
+                    pid = pending.pid,
+                    "shim process exited"
+                );
+            } else if !pending.killed && Instant::now() >= pending.deadline {
+                warn!(
+                    member = name.as_str(),
+                    pid = pending.pid,
+                    "shim did not exit in time — sending SIGKILL"
+                );
+                kill_pid(pending.pid, libc::SIGKILL);
+                if let Some(entry) = self.deferred.pending_removals.get_mut(&name) {
+                    entry.killed = true;
+                }
+                continue;
+            } else {
+                continue;
+            }
+            self.deferred.pending_removals.remove(&name);
+            if let Err(error) = self.finish_member_removal(&name, pending.was_working) {
+                warn!(member = name.as_str(), error = %error, "failed to finish member removal");
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_member_removal(&mut self, name: &str, is_working: bool) -> Result<()> {
         // Phase 3: Remove shim handle
         self.shim_handles.remove(name);
 
@@ -799,6 +838,73 @@ mod tests {
             }
         }
         assert_eq!(target, Some("%0".to_string()));
+    }
+
+    #[test]
+    fn remove_member_defers_wait_and_reaps_on_later_ticks() {
+        use crate::shim::protocol::{Channel, socketpair};
+        use crate::team::daemon::agent_handle::AgentHandle;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = make_test_daemon(tmp.path(), Vec::new());
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (parent_sock, _child_sock) = socketpair().unwrap();
+        let handle = AgentHandle::new(
+            "eng-9".into(),
+            Channel::new(parent_sock),
+            child.id(),
+            "claude".into(),
+            "claude".into(),
+            tmp.path().to_path_buf(),
+        );
+        daemon.shim_handles.insert("eng-9".into(), handle);
+
+        // Returns immediately even though the shim ignores the shutdown.
+        let started = Instant::now();
+        daemon.remove_member("eng-9").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(daemon.shim_handles.contains_key("eng-9"));
+        assert!(daemon.deferred.pending_removals.contains_key("eng-9"));
+
+        // Before the deadline nothing happens.
+        daemon.process_pending_removals().unwrap();
+        assert!(daemon.shim_handles.contains_key("eng-9"));
+        assert!(!daemon.deferred.pending_removals["eng-9"].killed);
+
+        // After the deadline the shim is killed, then reaped and removed.
+        daemon
+            .deferred
+            .pending_removals
+            .get_mut("eng-9")
+            .unwrap()
+            .deadline = Instant::now();
+        daemon.process_pending_removals().unwrap();
+        assert!(daemon.deferred.pending_removals["eng-9"].killed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon.deferred.pending_removals.contains_key("eng-9") {
+            assert!(Instant::now() < deadline, "shim never reaped");
+            std::thread::sleep(Duration::from_millis(20));
+            daemon.process_pending_removals().unwrap();
+        }
+        assert!(!daemon.shim_handles.contains_key("eng-9"));
+        // Already reaped by the daemon.
+        let _ = child.try_wait();
+    }
+
+    #[test]
+    fn remove_member_without_live_shim_finishes_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = make_test_daemon(tmp.path(), Vec::new());
+        daemon
+            .states
+            .insert("eng-9".into(), crate::team::standup::MemberState::Idle);
+        daemon.remove_member("eng-9").unwrap();
+        assert!(daemon.deferred.pending_removals.is_empty());
+        assert!(!daemon.states.contains_key("eng-9"));
     }
 
     #[test]

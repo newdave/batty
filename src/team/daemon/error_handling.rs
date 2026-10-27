@@ -1,14 +1,13 @@
 //! Error handling infrastructure for daemon subsystem steps.
 //!
-//! Provides `run_loop_step`, `run_recoverable_step`, and
-//! `run_recoverable_step_with_catch_unwind` — the wrappers the daemon poll
+//! Provides `run_loop_step` and `run_recoverable_step` — the wrappers the daemon poll
 //! loop uses to execute each subsystem while keeping the daemon alive when
 //! individual subsystems fail.
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::*;
 
@@ -19,59 +18,48 @@ const OPTIONAL_SUBSYSTEM_BACKOFF_KEY_PREFIX: &str = "__optional_subsystem_backof
 const OPTIONAL_SUBSYSTEM_DISABLE_KEY_PREFIX: &str = "__optional_subsystem_disabled:";
 
 impl TeamDaemon {
-    /// Run a critical subsystem step. Errors and panics are logged but no
-    /// consecutive-failure tracking is applied.
+    /// Run a critical subsystem step. Errors and panics are reported (see
+    /// `record_loop_step_error`) but no consecutive-failure tracking is applied.
     pub(super) fn run_loop_step<F>(&mut self, step: &str, action: F)
     where
         F: FnOnce(&mut Self) -> Result<()>,
     {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self))) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                error!(subsystem = step, error = %error, "daemon subsystem failed");
-                self.record_loop_step_error(step, &error.to_string());
-            }
-            Err(panic_payload) => {
-                let msg = panic_payload_to_string(&panic_payload);
-                error!(subsystem = step, panic = %msg, "daemon subsystem panicked");
-                self.record_loop_step_error(step, &format!("panic: {msg}"));
-            }
-        }
+        self.run_step(step, false, action);
     }
 
-    /// Run a recoverable subsystem step. Errors and panics are logged, and
-    /// consecutive failures are tracked. After 3+ consecutive failures an
-    /// escalation WARN is emitted each cycle.
+    /// Run a recoverable subsystem step. Errors and panics are reported, and
+    /// consecutive failures are tracked; repeated failures escalate with
+    /// exponential backoff rather than every cycle.
     pub(super) fn run_recoverable_step<F>(&mut self, step: &str, action: F)
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        self.run_step(step, true, action);
+    }
+
+    fn run_step<F>(&mut self, step: &str, track_consecutive: bool, action: F)
     where
         F: FnOnce(&mut Self) -> Result<()>,
     {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self))) {
             Ok(Ok(())) => {
                 self.subsystem_error_counts.remove(step);
+                self.deferred.step_failures.clear(step);
             }
             Ok(Err(error)) => {
-                error!(subsystem = step, error = %error, "daemon subsystem failed");
                 self.record_loop_step_error(step, &error.to_string());
-                self.increment_subsystem_error(step);
+                if track_consecutive {
+                    self.increment_subsystem_error(step);
+                }
             }
             Err(panic_payload) => {
                 let msg = panic_payload_to_string(&panic_payload);
-                error!(subsystem = step, panic = %msg, "daemon subsystem panicked");
                 self.record_loop_step_error(step, &format!("panic: {msg}"));
-                self.increment_subsystem_error(step);
+                if track_consecutive {
+                    self.increment_subsystem_error(step);
+                }
             }
         }
-    }
-
-    /// Run a recoverable subsystem step with panic protection via
-    /// `catch_unwind`. Used for subsystems (standup, retro, telegram) where a
-    /// panic must not crash the daemon.
-    pub(super) fn run_recoverable_step_with_catch_unwind<F>(&mut self, step: &str, action: F)
-    where
-        F: FnOnce(&mut Self) -> Result<()>,
-    {
-        self.run_recoverable_step(step, action);
     }
 
     pub(super) fn run_optional_subsystem_step<F>(&mut self, step: &str, subsystem: &str, action: F)
@@ -85,17 +73,16 @@ impl TeamDaemon {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self))) {
             Ok(Ok(())) => {
                 self.subsystem_error_counts.remove(step);
+                self.deferred.step_failures.clear(step);
                 self.record_optional_subsystem_success(subsystem);
             }
             Ok(Err(error)) => {
-                error!(subsystem = step, error = %error, "daemon subsystem failed");
                 self.record_loop_step_error(step, &error.to_string());
                 self.increment_subsystem_error(step);
                 self.record_optional_subsystem_failure(subsystem, &error.to_string());
             }
             Err(panic_payload) => {
                 let msg = panic_payload_to_string(&panic_payload);
-                error!(subsystem = step, panic = %msg, "daemon subsystem panicked");
                 self.record_loop_step_error(step, &format!("panic: {msg}"));
                 self.increment_subsystem_error(step);
                 self.record_optional_subsystem_failure(subsystem, &format!("panic: {msg}"));
@@ -109,7 +96,8 @@ impl TeamDaemon {
             .entry(step.to_string())
             .or_insert(0);
         *count += 1;
-        if *count >= 3 {
+        // Escalate at 3 failures, then only at powers of two to avoid log spam.
+        if *count == 3 || (*count > 3 && count.is_power_of_two()) {
             warn!(
                 subsystem = step,
                 consecutive_failures = *count,
@@ -379,13 +367,51 @@ mod tests {
     }
 
     #[test]
+    fn persistent_failure_events_are_throttled_but_counters_keep_counting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = daemon_config_with_roles(tmp.path(), Vec::new());
+        let mut daemon = TeamDaemon::new(config).unwrap();
+
+        for _ in 0..8 {
+            daemon.run_recoverable_step("check_backend_health", |_daemon| {
+                anyhow::bail!("same failure")
+            });
+        }
+        assert_eq!(
+            daemon.subsystem_error_counts.get("check_backend_health"),
+            Some(&8)
+        );
+        // Cycles 1, 2, 4, 8 are reported.
+        let events_path = tmp
+            .path()
+            .join(".batty")
+            .join("team_config")
+            .join("events.jsonl");
+        let count = |daemon: &TeamDaemon| {
+            let _ = daemon;
+            read_events(&events_path)
+                .unwrap()
+                .iter()
+                .filter(|e| e.event == "loop_step_error")
+                .count()
+        };
+        assert_eq!(count(&daemon), 4);
+
+        // A changed error text is reported immediately.
+        daemon.run_recoverable_step("check_backend_health", |_daemon| {
+            anyhow::bail!("different failure")
+        });
+        assert_eq!(count(&daemon), 5);
+    }
+
+    #[test]
     fn catch_unwind_recovers_from_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let config = daemon_config_with_roles(tmp.path(), Vec::new());
         let mut daemon = TeamDaemon::new(config).unwrap();
 
         // A panic inside a catch_unwind-wrapped step should not crash
-        daemon.run_recoverable_step_with_catch_unwind("process_telegram_queue", |_daemon| {
+        daemon.run_recoverable_step("process_telegram_queue", |_daemon| {
             panic!("telegram thread panicked")
         });
 
@@ -633,9 +659,7 @@ mod tests {
         );
 
         // Recoverable with catch_unwind: panic IS tracked same as error.
-        daemon.run_recoverable_step_with_catch_unwind("process_telegram_queue", |_d| {
-            panic!("unexpected panic")
-        });
+        daemon.run_recoverable_step("process_telegram_queue", |_d| panic!("unexpected panic"));
         assert_eq!(
             daemon.subsystem_error_counts.get("process_telegram_queue"),
             Some(&1),

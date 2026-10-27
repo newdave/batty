@@ -24,6 +24,21 @@ pub(super) struct BinaryFingerprint {
 }
 
 impl BinaryFingerprint {
+    /// Stable identity of this exact binary build, for warning dedupe.
+    pub fn dedupe_key(&self) -> String {
+        #[cfg(unix)]
+        let inode = self.inode;
+        #[cfg(not(unix))]
+        let inode = 0;
+        format!(
+            "{}:{:?}:{}:{}",
+            self.path.display(),
+            self.modified,
+            self.len,
+            inode
+        )
+    }
+
     pub fn capture(path: &Path) -> Result<Self> {
         let metadata =
             fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
@@ -96,6 +111,15 @@ impl HotReloadMonitor {
 }
 
 impl TeamDaemon {
+    /// True the first time a warning of `kind` is raised for this binary
+    /// fingerprint, so a binary that stays unreloadable does not warn on
+    /// every check.
+    fn warn_hot_reload_once(&mut self, kind: &str, binary: &BinaryFingerprint) -> bool {
+        self.deferred
+            .hot_reload_warned
+            .insert(format!("{kind}:{}", binary.dedupe_key()))
+    }
+
     pub(super) fn maybe_hot_reload_binary(
         &mut self,
         monitor: Option<&mut HotReloadMonitor>,
@@ -112,25 +136,29 @@ impl TeamDaemon {
         };
 
         if !monitor.can_attempt_reload() {
-            warn!(
-                path = %updated_binary.path.display(),
-                "binary changed again but reload attempt is rate-limited"
-            );
+            if self.warn_hot_reload_once("rate-limited", &updated_binary) {
+                warn!(
+                    path = %updated_binary.path.display(),
+                    "binary changed again but reload attempt is rate-limited"
+                );
+            }
             return Ok(());
         }
 
         if !binary_is_reloadable(&updated_binary.path) {
-            warn!(
-                path = %updated_binary.path.display(),
-                "binary changed but is not safe to hot-reload yet"
-            );
+            if self.warn_hot_reload_once("not-reloadable", &updated_binary) {
+                warn!(
+                    path = %updated_binary.path.display(),
+                    "binary changed but is not safe to hot-reload yet"
+                );
+            }
             return Ok(());
         }
 
         monitor.mark_reload_attempt();
-        // exec would orphan running test commands; kill them and persist the
-        // interrupted verifications so the new binary re-runs them.
-        self.stop_background_tests();
+        // Persist state and the reload marker before touching anything
+        // irreversible: if either fails the reload aborts with running tests
+        // intact.
         self.persist_runtime_state(false)?;
         self.record_daemon_reloading();
         self.record_orchestrator_action(format!(
@@ -138,6 +166,16 @@ impl TeamDaemon {
             updated_binary.path.display()
         ));
         write_hot_reload_marker(&self.config.project_root)?;
+
+        // exec would orphan running test commands; kill them and persist the
+        // interrupted verifications so the new binary re-runs them.
+        self.stop_background_tests();
+        if let Err(error) = self.persist_runtime_state(false) {
+            warn!(
+                error = %error,
+                "failed to persist interrupted verifications before hot reload"
+            );
+        }
 
         if let Err(error) = exec_reloaded_daemon(&updated_binary.path, &self.config.project_root) {
             let _ = clear_hot_reload_marker(&self.config.project_root);
@@ -263,4 +301,51 @@ pub(super) fn exec_reloaded_daemon(executable: &Path, project_root: &Path) -> Re
 #[cfg(not(unix))]
 pub(super) fn exec_reloaded_daemon(_executable: &Path, _project_root: &Path) -> Result<()> {
     bail!("daemon hot reload via exec is only supported on unix")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::team::test_support::TestDaemonBuilder;
+
+    #[test]
+    fn warn_hot_reload_once_dedupes_per_kind_and_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("batty");
+        fs::write(&binary, "build-a").unwrap();
+        let fingerprint = BinaryFingerprint::capture(&binary).unwrap();
+        let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
+
+        assert!(daemon.warn_hot_reload_once("rate-limited", &fingerprint));
+        assert!(!daemon.warn_hot_reload_once("rate-limited", &fingerprint));
+        assert!(daemon.warn_hot_reload_once("not-reloadable", &fingerprint));
+
+        fs::write(&binary, "build-b-longer").unwrap();
+        let rebuilt = BinaryFingerprint::capture(&binary).unwrap();
+        assert!(daemon.warn_hot_reload_once("rate-limited", &rebuilt));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreloadable_binary_warns_once_across_checks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("batty");
+        fs::write(&binary, "old").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut monitor = HotReloadMonitor::new(BinaryFingerprint::capture(&binary).unwrap());
+        // Replace the binary (new inode/length) without exec permission.
+        fs::remove_file(&binary).unwrap();
+        fs::write(&binary, "new-and-longer").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
+        for _ in 0..3 {
+            monitor.last_checked = Instant::now() - HOT_RELOAD_CHECK_INTERVAL;
+            daemon.maybe_hot_reload_binary(Some(&mut monitor)).unwrap();
+        }
+        assert_eq!(daemon.deferred.hot_reload_warned.len(), 1);
+        assert!(!hot_reload_marker_path(tmp.path()).exists());
+    }
 }

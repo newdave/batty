@@ -15,6 +15,7 @@ use crate::team::workspace::workspace_repo_targets;
 
 const SHARED_TARGET_DISK_THRESHOLD_PCT: u8 = 80;
 const SHARED_TARGET_CLEANUP_INTERVAL: Duration = Duration::from_secs(900);
+const UNCOMMITTED_INSPECTION_INTERVAL: Duration = Duration::from_secs(30);
 
 fn conflict_paths(repo_dir: &Path) -> Vec<String> {
     let output = match std::process::Command::new("git")
@@ -285,10 +286,13 @@ impl TeamDaemon {
     }
 
     pub(in super::super) fn maybe_cleanup_shared_cargo_target(&mut self) -> Result<()> {
-        if self.last_shared_target_cleanup.elapsed() < SHARED_TARGET_CLEANUP_INTERVAL {
+        if self
+            .last_shared_target_cleanup
+            .is_some_and(|t| t.elapsed() < SHARED_TARGET_CLEANUP_INTERVAL)
+        {
             return Ok(());
         }
-        self.last_shared_target_cleanup = Instant::now();
+        self.last_shared_target_cleanup = Some(Instant::now());
 
         let shared_target =
             crate::team::task_loop::shared_cargo_target_dir(&self.config.project_root);
@@ -318,7 +322,6 @@ impl TeamDaemon {
     /// been cherry-picked onto main, and auto-reset them to the base branch.
     /// Also detects and auto-recovers worktrees stuck in merge conflict state.
     pub(in super::super) fn check_worktree_staleness(&mut self) -> Result<()> {
-        self.reconcile_active_tasks()?;
         let project_root = self.project_root().to_path_buf();
         if git_has_unresolved_conflicts(&project_root).unwrap_or(false) {
             let conflict_files = conflict_paths(&project_root);
@@ -371,13 +374,19 @@ impl TeamDaemon {
             }
         }
 
-        if let Ok(root_dirty) = crate::team::merge::inspect_root_dirty_state(&project_root)
-            && !root_dirty.source_paths.is_empty()
-        {
-            warn!(
-                paths = %root_dirty.source_paths.join(", "),
-                "project root has dirty source changes that will block review auto-merges"
-            );
+        match crate::team::merge::inspect_root_dirty_state(&project_root) {
+            Ok(root_dirty) if !root_dirty.source_paths.is_empty() => {
+                let paths = root_dirty.source_paths.join(", ");
+                // Log once per change in the dirty set, not every tick.
+                if self.deferred.warn_changed("root_dirty_source", &paths) {
+                    warn!(
+                        paths = %paths,
+                        "project root has dirty source changes that will block review auto-merges"
+                    );
+                }
+            }
+            Ok(_) => self.deferred.clear_warning("root_dirty_source"),
+            Err(_) => {}
         }
 
         let members: Vec<_> = self
@@ -657,10 +666,13 @@ impl TeamDaemon {
                 .workflow_policy
                 .health_check_interval_secs,
         );
-        if self.last_health_check.elapsed() < interval {
+        if self
+            .last_health_check
+            .is_some_and(|t| t.elapsed() < interval)
+        {
             return Ok(());
         }
-        self.last_health_check = Instant::now();
+        self.last_health_check = Some(Instant::now());
 
         // Collect (member_name, agent_name) pairs to avoid borrowing self.config during mutation.
         let checks: Vec<(String, String)> = self
@@ -789,6 +801,20 @@ impl TeamDaemon {
                 continue;
             }
 
+            // Gate the diff inspection itself so it does not run per engineer
+            // on every poll.
+            if self
+                .deferred
+                .last_uncommitted_inspection
+                .get(name)
+                .is_some_and(|last| last.elapsed() < UNCOMMITTED_INSPECTION_INTERVAL)
+            {
+                continue;
+            }
+            self.deferred
+                .last_uncommitted_inspection
+                .insert(name.clone(), Instant::now());
+
             let live_work_dir = self
                 .shim_handles
                 .get(name)
@@ -805,15 +831,22 @@ impl TeamDaemon {
                 live_work_dir.as_deref(),
                 self.is_multi_repo,
             );
+            let missing_key = format!("uncommitted_path_missing:{name}");
             if !inspection_path.exists() {
-                warn!(
-                    engineer = %name,
-                    worktree = %inspection_path.display(),
-                    configured_worktree = %worktree_path.display(),
-                    "skipping uncommitted work warning because the inspected worktree path is missing"
-                );
+                if self
+                    .deferred
+                    .warn_changed(&missing_key, &inspection_path.display().to_string())
+                {
+                    warn!(
+                        engineer = %name,
+                        worktree = %inspection_path.display(),
+                        configured_worktree = %worktree_path.display(),
+                        "skipping uncommitted work warning because the inspected worktree path is missing"
+                    );
+                }
                 continue;
             }
+            self.deferred.clear_warning(&missing_key);
 
             let lines = match workspace_uncommitted_diff_lines(
                 &inspection_path,
@@ -822,10 +855,17 @@ impl TeamDaemon {
             ) {
                 Ok(n) => n,
                 Err(error) => {
-                    warn!(engineer = %name, error = %error, "failed to check uncommitted diff");
+                    if self.deferred.warn_changed(
+                        &format!("uncommitted_diff_failed:{name}"),
+                        &error.to_string(),
+                    ) {
+                        warn!(engineer = %name, error = %error, "failed to check uncommitted diff");
+                    }
                     continue;
                 }
             };
+            self.deferred
+                .clear_warning(&format!("uncommitted_diff_failed:{name}"));
 
             if lines < threshold {
                 let had_warning_state = self.last_uncommitted_warn.remove(name).is_some();
@@ -1021,7 +1061,7 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
-        daemon.last_health_check = Instant::now();
+        daemon.last_health_check = Some(Instant::now());
         daemon.check_backend_health().unwrap();
         assert!(daemon.backend_health.is_empty());
     }
@@ -1042,7 +1082,7 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
-        daemon.last_health_check = Instant::now() - Duration::from_secs(3600);
+        daemon.last_health_check = None;
         daemon.check_backend_health().unwrap();
         assert!(daemon.backend_health.contains_key("eng-health-run"));
     }
@@ -1063,7 +1103,7 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![user]);
-        daemon.last_health_check = Instant::now() - Duration::from_secs(3600);
+        daemon.last_health_check = None;
         daemon.check_backend_health().unwrap();
         assert!(daemon.backend_health.is_empty());
     }
@@ -1094,7 +1134,7 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
-        daemon.last_health_check = Instant::now() - Duration::from_secs(3600);
+        daemon.last_health_check = None;
 
         // First check: no prior state → sets initial value.
         daemon.check_backend_health().unwrap();
@@ -1133,7 +1173,7 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
-        daemon.last_health_check = Instant::now() - Duration::from_secs(3600);
+        daemon.last_health_check = None;
         daemon
             .backend_health
             .insert("eng-stable".to_string(), BackendHealth::Healthy);
@@ -1168,7 +1208,7 @@ mod tests {
                 engineer_member("eng-1", Some("architect"), false),
             ])
             .build();
-        daemon.last_health_check = Instant::now() - Duration::from_secs(3600);
+        daemon.last_health_check = None;
 
         daemon.check_backend_health().unwrap();
 
@@ -1189,7 +1229,7 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path())
             .members(vec![engineer_member("eng-parked", None, false)])
             .build();
-        daemon.last_health_check = Instant::now() - Duration::from_secs(3600);
+        daemon.last_health_check = None;
         daemon
             .backend_health
             .insert("eng-parked".to_string(), BackendHealth::QuotaExhausted);
@@ -1240,7 +1280,7 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path())
             .members(vec![engineer_member("eng-recovered", None, false)])
             .build();
-        daemon.last_health_check = Instant::now() - Duration::from_secs(3600);
+        daemon.last_health_check = None;
         daemon
             .backend_health
             .insert("eng-recovered".to_string(), BackendHealth::QuotaExhausted);
@@ -1320,7 +1360,7 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path())
             .members(vec![member])
             .build();
-        daemon.last_health_check = Instant::now() - Duration::from_secs(3600);
+        daemon.last_health_check = None;
 
         daemon.check_backend_health().unwrap();
         assert!(daemon.backend_health.contains_key("architect"));
@@ -2073,6 +2113,37 @@ mod tests {
         let msgs = inbox::pending_messages(&inbox_root, "eng-1").unwrap();
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].body.contains("COMMIT REMINDER"));
+    }
+
+    #[test]
+    fn maybe_warn_uncommitted_work_skips_inspection_within_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = make_uncommitted_warn_daemon(&tmp, 10);
+        let inbox_root = inbox::inboxes_root(tmp.path());
+        inbox::init_inbox(&inbox_root, "eng-1").unwrap();
+
+        // A fresh inspection stamp means the diff is not even measured.
+        daemon
+            .deferred
+            .last_uncommitted_inspection
+            .insert("eng-1".to_string(), Instant::now());
+        daemon.maybe_warn_uncommitted_work().unwrap();
+        assert!(
+            inbox::pending_messages(&inbox_root, "eng-1")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Once the interval has elapsed, the inspection runs and warns.
+        daemon.deferred.last_uncommitted_inspection.insert(
+            "eng-1".to_string(),
+            Instant::now() - super::UNCOMMITTED_INSPECTION_INTERVAL - Duration::from_secs(1),
+        );
+        daemon.maybe_warn_uncommitted_work().unwrap();
+        assert_eq!(
+            inbox::pending_messages(&inbox_root, "eng-1").unwrap().len(),
+            1
+        );
     }
 
     #[test]

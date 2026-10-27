@@ -68,7 +68,7 @@ fn wait_for_expected_disconnect_handoff(
     std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let alive = unsafe { libc::kill(handle.child_pid as i32, 0) } == 0;
+            let alive = crate::team::daemon::helpers::pid_alive(handle.child_pid);
             if !alive {
                 debug!(
                     member = member_name.as_str(),
@@ -84,9 +84,7 @@ fn wait_for_expected_disconnect_handoff(
                     "retired shim exceeded disconnect handoff timeout; forcing kill"
                 );
                 let _ = handle.send_kill();
-                unsafe {
-                    libc::kill(handle.child_pid as i32, libc::SIGKILL);
-                }
+                crate::team::daemon::helpers::kill_pid(handle.child_pid, libc::SIGKILL);
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -187,6 +185,10 @@ impl TeamDaemon {
         let member_names: Vec<String> = self.shim_handles.keys().cloned().collect();
 
         for name in &member_names {
+            // Members being removed are only waiting to be reaped.
+            if self.deferred.pending_removals.contains_key(name) {
+                continue;
+            }
             if let Some(handle) = self.shim_handles.get_mut(name) {
                 handle.flush_pending_output();
             }

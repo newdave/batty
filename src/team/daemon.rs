@@ -79,6 +79,8 @@ pub(crate) mod board_snapshot;
 mod board_snapshot_tests;
 #[path = "daemon/config_reload.rs"]
 mod config_reload;
+#[path = "daemon/deferred.rs"]
+mod deferred;
 #[path = "discord_bridge.rs"]
 mod discord_bridge;
 #[path = "dispatch/mod.rs"]
@@ -395,13 +397,13 @@ pub struct TeamDaemon {
     /// Per-session output tracking used for proactive context-pressure handling.
     pub(super) context_pressure_tracker: health::context::ContextPressureTracker,
     /// When the last periodic health check was run.
-    pub(super) last_health_check: Instant,
+    pub(super) last_health_check: Option<Instant>,
     /// Rate-limiting: last time each engineer received an uncommitted-work warning.
     pub(super) last_uncommitted_warn: HashMap<String, Instant>,
     /// Last time the daemon checked for stale per-worktree cargo targets to prune.
-    pub(super) last_shared_target_cleanup: Instant,
+    pub(super) last_shared_target_cleanup: Option<Instant>,
     /// Last time the daemon ran a full disk hygiene pass.
-    pub(super) last_disk_hygiene_check: Instant,
+    pub(super) last_disk_hygiene_check: Option<Instant>,
     /// Per-engineer completion verification loop state.
     pub(super) verification_states: HashMap<String, VerificationState>,
     /// Test commands running off the poll loop (verification, main smoke,
@@ -433,14 +435,16 @@ pub struct TeamDaemon {
     /// Serial daemon-owned merge queue for auto-merge execution.
     pub(super) merge_queue: MergeQueue,
     /// When the last binary freshness check ran (#675). Gated to at most once per hour.
-    pub(super) last_binary_freshness_check: Instant,
+    pub(super) last_binary_freshness_check: Option<Instant>,
     /// Consecutive-failure tracking for the Telegram / Discord pollers.
     pub(super) telegram_health: crate::team::integration_health::PollHealth,
     pub(super) discord_health: crate::team::integration_health::PollHealth,
     /// Last daily telemetry retention pass.
     pub(super) last_telemetry_retention: Instant,
     /// When the last tiered inbox expiry sweep ran (#658). Gated to at most once per minute.
-    pub(super) last_tiered_inbox_sweep: Instant,
+    pub(super) last_tiered_inbox_sweep: Option<Instant>,
+    /// Work deferred off the poll tick (scheduled retries, pending removals, log throttles).
+    pub(super) deferred: deferred::DeferredState,
 }
 
 #[cfg(any(test, feature = "scenario-test"))]
@@ -781,10 +785,10 @@ impl TeamDaemon {
                 context_pressure_threshold_bytes,
             ),
             // Start far enough in the past to trigger an immediate check.
-            last_health_check: Instant::now() - Duration::from_secs(3600),
+            last_health_check: None,
             last_uncommitted_warn: HashMap::new(),
-            last_shared_target_cleanup: Instant::now() - Duration::from_secs(3600),
-            last_disk_hygiene_check: Instant::now() - Duration::from_secs(3600),
+            last_shared_target_cleanup: None,
+            last_disk_hygiene_check: None,
             verification_states: HashMap::new(),
             background_tests: Default::default(),
             narration_rejection_counts: HashMap::new(),
@@ -796,7 +800,7 @@ impl TeamDaemon {
             last_shim_health_check: Instant::now(),
             merge_queue: MergeQueue::default(),
             // Start far enough in the past to trigger an immediate check at startup.
-            last_binary_freshness_check: Instant::now() - Duration::from_secs(7200),
+            last_binary_freshness_check: None,
             telegram_health: Default::default(),
             discord_health: Default::default(),
             // Run one retention pass shortly after startup.
@@ -804,7 +808,8 @@ impl TeamDaemon {
                 .checked_sub(Duration::from_secs(24 * 3600))
                 .unwrap_or_else(Instant::now),
             // First sweep runs on the first tick after startup.
-            last_tiered_inbox_sweep: Instant::now() - Duration::from_secs(120),
+            last_tiered_inbox_sweep: None,
+            deferred: Default::default(),
         })
     }
 
@@ -1777,13 +1782,16 @@ impl TeamDaemon {
             self.record_orchestrator_action(format!(
                 "stall: shim reported stalled mid-turn for {member_name}; retry {attempt} after {backoff_secs}s"
             ));
-            sleep_stalled_mid_turn_backoff(Duration::from_secs(backoff_secs));
-
-            let retry_notice = format!(
-                "Claude SDK stalled mid-turn and Batty released the stuck turn. Waited {backoff_secs}s before retrying.\n{response}\n\nContinue from the current worktree state. Do not restart or discard prior work unless the task requires it."
+            // Never sleep inside the poll tick: schedule the retry and let
+            // `process_stalled_mid_turn_retries` deliver it once due.
+            self.deferred.stall_retries.insert(
+                member_name.to_string(),
+                deferred::ScheduledStallRetry {
+                    retry_at: Instant::now() + Duration::from_secs(backoff_secs),
+                    backoff_secs,
+                    response: response.to_string(),
+                },
             );
-            self.queue_message("daemon", member_name, &retry_notice)?;
-            self.mark_member_working(member_name);
             return Ok(true);
         }
 
@@ -1806,7 +1814,32 @@ impl TeamDaemon {
         Ok(true)
     }
 
+    /// Deliver stalled-mid-turn retry notices whose backoff has elapsed.
+    pub(super) fn process_stalled_mid_turn_retries(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .deferred
+            .stall_retries
+            .iter()
+            .filter(|(_, retry)| retry.retry_at <= now)
+            .map(|(member, _)| member.clone())
+            .collect();
+        for member_name in due {
+            let Some(retry) = self.deferred.stall_retries.remove(&member_name) else {
+                continue;
+            };
+            let retry_notice = format!(
+                "Claude SDK stalled mid-turn and Batty released the stuck turn. Waited {}s before retrying.\n{}\n\nContinue from the current worktree state. Do not restart or discard prior work unless the task requires it.",
+                retry.backoff_secs, retry.response
+            );
+            self.queue_message("daemon", &member_name, &retry_notice)?;
+            self.mark_member_working(&member_name);
+        }
+        Ok(())
+    }
+
     pub(super) fn clear_active_task(&mut self, engineer: &str) {
+        self.deferred.stall_retries.remove(engineer);
         if let Some(task_id) = self.active_tasks.remove(engineer) {
             self.narration_rejection_counts.remove(&task_id);
             self.zero_diff_completion_counts.remove(&task_id);
@@ -1901,14 +1934,6 @@ fn stalled_mid_turn_backoff_secs(attempt: u32) -> Option<u64> {
         .copied()
 }
 
-#[cfg(not(test))]
-fn sleep_stalled_mid_turn_backoff(duration: Duration) {
-    std::thread::sleep(duration);
-}
-
-#[cfg(test)]
-fn sleep_stalled_mid_turn_backoff(_duration: Duration) {}
-
 #[cfg(test)]
 #[path = "daemon/tests.rs"]
 mod tests;
@@ -1960,6 +1985,33 @@ mod stalled_mid_turn_tests {
 
         assert!(handled);
         assert_eq!(daemon.retry_count_for_test(member_name), Some(1));
+        // Returns immediately: nothing delivered yet, retry only scheduled.
+        assert!(
+            inbox::pending_messages(&inbox_root, member_name)
+                .unwrap()
+                .is_empty()
+        );
+        let retry_at = daemon.deferred.stall_retries[member_name].retry_at;
+        assert!(retry_at > Instant::now() + Duration::from_secs(20));
+
+        // Before the deadline, processing is a no-op.
+        daemon.process_stalled_mid_turn_retries().unwrap();
+        assert!(
+            inbox::pending_messages(&inbox_root, member_name)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(daemon.deferred.stall_retries.contains_key(member_name));
+
+        // After the deadline the retry notice is queued and the member is Working.
+        daemon
+            .deferred
+            .stall_retries
+            .get_mut(member_name)
+            .unwrap()
+            .retry_at = Instant::now();
+        daemon.process_stalled_mid_turn_retries().unwrap();
+        assert!(daemon.deferred.stall_retries.is_empty());
         assert_eq!(
             daemon.member_state_for_test(member_name),
             Some(MemberState::Working)

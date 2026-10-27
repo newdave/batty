@@ -290,10 +290,10 @@ mod tests {
             backend_quota_retry_at: HashMap::new(),
             narration_tracker: Default::default(),
             context_pressure_tracker: Default::default(),
-            last_health_check: Instant::now(),
+            last_health_check: Some(Instant::now()),
             last_uncommitted_warn: HashMap::new(),
-            last_shared_target_cleanup: Instant::now(),
-            last_disk_hygiene_check: Instant::now(),
+            last_shared_target_cleanup: Some(Instant::now()),
+            last_disk_hygiene_check: Some(Instant::now()),
             pending_delivery_queue: HashMap::new(),
             pending_shim_acks: HashMap::new(),
             verification_states: HashMap::new(),
@@ -307,11 +307,12 @@ mod tests {
             planning_cycle_consecutive_empty: 0,
             last_shim_health_check: Instant::now(),
             merge_queue: crate::team::daemon::MergeQueue::default(),
-            last_binary_freshness_check: Instant::now(),
+            last_binary_freshness_check: Some(Instant::now()),
+            last_tiered_inbox_sweep: Some(Instant::now()),
+            deferred: Default::default(),
             telegram_health: Default::default(),
             discord_health: Default::default(),
             last_telemetry_retention: Instant::now(),
-            last_tiered_inbox_sweep: Instant::now(),
         }
     }
 
