@@ -140,7 +140,7 @@ Batty exposes its state through several layers:
 | `src/cli.rs` | Command surface and flags |
 | `src/team/config/` | `team.yaml` parsing and defaults |
 | `src/team/daemon/` | Poll loop, health checks, interventions, merge queue |
-| `src/team/dispatch/` | Readiness checks, queueing, WIP and stabilization |
+| `src/team/daemon/dispatch/` | Readiness checks, queueing, WIP and stabilization |
 | `src/team/merge/` | Merge operations and locking |
 | `src/team/verification.rs` | Completion verification policy |
 | `src/team/telemetry_db.rs` | SQLite telemetry persistence |

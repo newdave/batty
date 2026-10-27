@@ -25,7 +25,7 @@ The extracted modules below keep that loop readable without changing the daemon'
 
 ## Module Responsibilities
 
-### `src/team/dispatch.rs`
+### `src/team/daemon/dispatch/`
 
 - Responsibility: assignment launch flow and pane working-directory correction.
 - Key entrypoints: `TeamDaemon::launch_task_assignment`, `TeamDaemon::ensure_member_pane_cwd`, `engineer_task_branch_name`, `summarize_assignment`.
@@ -53,7 +53,7 @@ The extracted modules below keep that loop readable without changing the daemon'
 - Replaced in monolithic daemon: scattered event-sink and orchestrator-log append code.
 - Called from daemon flow: every lifecycle, intervention, delivery, and retrospective path that records audit data.
 
-### `src/team/launcher.rs`
+### `src/team/daemon/launcher.rs`
 
 - Responsibility: agent launch-script generation, launch identity persistence, session-id handling, and Codex/Claude-specific prompt shaping.
 - Key entrypoints: `write_launch_script`, `strip_nudge_section`, `canonical_agent_name`, `new_member_session_id`, `load_launch_state`, `duplicate_claude_session_ids`, `member_session_tracker_config`.
@@ -119,7 +119,7 @@ The extracted modules below keep that loop readable without changing the daemon'
 - Responsibility: workflow-aware nudge target selection based on runnable work, review queues, and ownership.
 - Used by daemon: intervention and idle-automation decisions.
 
-### `src/team/delivery.rs`, `src/team/dispatch.rs`, `src/team/merge.rs`, `src/team/status.rs`, and `src/team/task_loop.rs`
+### `src/team/delivery.rs`, `src/team/daemon/dispatch/`, `src/team/merge.rs`, `src/team/status.rs`, and `src/team/task_loop.rs`
 
 - These are the primary extracted subsystems that replaced large inline sections of the original monolithic daemon and now define the daemon's boundary with delivery, assignment, merge, status, and worktree management.
 

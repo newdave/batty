@@ -26,7 +26,7 @@ Once the time passes, the task becomes `Runnable` and enters the normal dispatch
 The `Task::is_schedule_blocked()` method checks whether `scheduled_for` is in the future. Two places use this:
 
 1. **Resolver** (`src/team/resolver.rs`) — marks the task as `Blocked` with a scheduling reason.
-1. **Dispatch** (`src/team/dispatch.rs`) — filters out schedule-blocked tasks from the candidate list.
+1. **Dispatch** (`src/team/daemon/dispatch/`) — filters out schedule-blocked tasks from the candidate list.
 
 A task with no `scheduled_for` field is never schedule-blocked.
 

@@ -7,8 +7,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, Utc};
 use tracing::{info, warn};
 
-use super::telegram_bridge::TelegramCommand;
-use super::*;
+use super::super::*;
+use super::TelegramCommand;
 use crate::task::{Task, load_tasks_from_dir};
 use crate::team::config::{ChannelConfig, RoleType, TeamConfig};
 use crate::team::discord::{
@@ -32,7 +32,7 @@ pub(crate) struct DiscordShutdownSnapshot {
     pub(crate) last_test_health: String,
 }
 
-pub(super) fn build_discord_bot(team_config: &TeamConfig) -> Option<DiscordBot> {
+pub(in crate::team::daemon) fn build_discord_bot(team_config: &TeamConfig) -> Option<DiscordBot> {
     team_config
         .roles
         .iter()
@@ -42,7 +42,7 @@ pub(super) fn build_discord_bot(team_config: &TeamConfig) -> Option<DiscordBot> 
 }
 
 impl TeamDaemon {
-    pub(super) fn process_discord_queue(&mut self) -> Result<()> {
+    pub(in crate::team::daemon) fn process_discord_queue(&mut self) -> Result<()> {
         self.poll_discord()?;
         self.sync_discord_events()?;
         self.sync_discord_board();

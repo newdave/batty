@@ -34,7 +34,7 @@ Participants who designed agent systems and stepped back shipped more than those
 
 ### What exists
 - `src/team/discord.rs` (354 lines) — HTTP API client for Discord Bot API
-- `src/team/discord_bridge.rs` (425 lines) — event routing, command parser, embed builder
+- `src/team/daemon/chat/discord.rs` (425 lines) — event routing, command parser, embed builder
 - Three-channel routing: `#commands`, `#events`, `#agents`
 - Command parser: `$go`, `$stop`, `$status`, `$board`, `$assign`, `$merge`, `$help`, etc.
 - Rich embeds with role colors (architect=blue, engineer=green, reviewer=orange)

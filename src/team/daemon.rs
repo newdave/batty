@@ -67,70 +67,44 @@ const STALLED_MID_TURN_RETRY_BACKOFF_SECS: [u64; 2] = [30, 60];
 /// task #546 after 37 minutes of restart cycling.
 const STALLED_MID_TURN_MAX_ATTEMPTS: u32 = 5;
 
-#[path = "daemon/agent_handle.rs"]
 pub(super) mod agent_handle;
-#[path = "daemon/automation.rs"]
 mod automation;
-#[path = "daemon/background_tests.rs"]
 mod background_tests;
 pub(crate) mod board_snapshot;
 #[cfg(test)]
 mod board_snapshot_tests;
-#[path = "daemon/config_reload.rs"]
+mod chat;
 mod config_reload;
-#[path = "daemon/deferred.rs"]
 mod deferred;
 mod delivery_state;
-#[path = "discord_bridge.rs"]
-mod discord_bridge;
-#[path = "dispatch/mod.rs"]
 pub(crate) mod dispatch;
 mod dispatch_state;
-#[path = "daemon/error_handling.rs"]
 mod error_handling;
-#[path = "daemon/health/mod.rs"]
 pub(crate) mod health;
 mod health_state;
-#[path = "daemon/helpers.rs"]
 mod helpers;
-#[path = "daemon/hot_reload.rs"]
 mod hot_reload;
 mod integrations;
 mod intervention_state;
-#[path = "daemon/interventions/mod.rs"]
 mod interventions;
-#[path = "launcher.rs"]
 mod launcher;
-#[path = "daemon/merge_queue.rs"]
 mod merge_queue;
 mod merge_state;
-#[path = "daemon/poll.rs"]
 mod poll;
-#[path = "daemon/reconcile.rs"]
 mod reconcile;
 #[cfg(any(test, feature = "scenario-test"))]
-#[path = "daemon/scenario_api.rs"]
 pub mod scenario_api;
 mod scheduler;
-#[path = "daemon/shim_spawn.rs"]
 mod shim_spawn;
-#[path = "daemon/shim_state.rs"]
 mod shim_state;
-#[path = "daemon/spec_gen.rs"]
 mod spec_gen;
-#[path = "daemon/state.rs"]
 mod state;
-#[path = "telegram_bridge.rs"]
-mod telegram_bridge;
-#[path = "daemon/telemetry.rs"]
 pub(crate) mod telemetry;
-#[path = "daemon/tick_report.rs"]
 pub mod tick_report;
-#[path = "daemon/verification.rs"]
 pub(crate) mod verification;
 mod verification_tracking;
 
-pub(crate) use self::discord_bridge::{
+pub(crate) use self::chat::discord::{
     build_shutdown_snapshot, send_discord_shutdown_notice, send_discord_shutdown_summary,
 };
 #[cfg(test)]
@@ -572,9 +546,9 @@ impl TeamDaemon {
         }
 
         // Create Discord bot for inbound polling and event mirroring (if configured)
-        let discord_bot = discord_bridge::build_discord_bot(&config.team_config);
+        let discord_bot = chat::discord::build_discord_bot(&config.team_config);
         // Create Telegram bot for inbound polling (if configured)
-        let telegram_bot = telegram_bridge::build_telegram_bot(&config.team_config);
+        let telegram_bot = chat::telegram::build_telegram_bot(&config.team_config);
         let narration_detection_enabled = config
             .team_config
             .workflow_policy
@@ -1741,7 +1715,6 @@ fn stalled_mid_turn_backoff_secs(attempt: u32) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[path = "daemon/tests.rs"]
 mod tests;
 
 #[cfg(test)]

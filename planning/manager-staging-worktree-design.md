@@ -28,7 +28,7 @@ not require broad session/config refactors.
 ### 2. Where the manager shim obtains its working directory context
 
 - Manager/member launch planning goes through `TeamDaemon::member_work_dir(...)`
-  in `src/team/launcher.rs`.
+  in `src/team/daemon/launcher.rs`.
 - For roles with `use_worktrees = false`, `member_work_dir(...)` returns the
   project root, not a staging worktree.
 - Reconcile/spawn paths also use `member_work_dir(...)`, and Claude session
