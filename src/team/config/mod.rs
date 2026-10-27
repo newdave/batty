@@ -38,6 +38,65 @@ impl PlanningDirectiveFile {
     }
 }
 
+/// Config keys that still deserialize (so existing `team.yaml` files load) but
+/// have no runtime reader. `(parent path, key, note)`; a parent of `roles[]`
+/// applies to every entry of the top-level `roles` list.
+const UNUSED_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("", "auto_respawn_on_crash"),
+    ("automation", "commit_before_reset"),
+    ("automation", "replenishment_threshold"),
+    ("workflow_policy", "narration_threshold"),
+    ("workflow_policy", "narration_nudge_max"),
+    ("workflow_policy", "capability_overrides"),
+    ("roles[]", "owns"),
+];
+
+/// Warnings for unused/deprecated keys present in the raw `team.yaml` text.
+/// Invalid YAML yields no warnings (loading reports that error separately).
+pub fn unused_config_key_warnings(raw_yaml: &str) -> Vec<String> {
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(raw_yaml) else {
+        return Vec::new();
+    };
+    let has = |value: &serde_yaml::Value, key: &str| {
+        value
+            .as_mapping()
+            .is_some_and(|mapping| mapping.contains_key(key))
+    };
+    let mut warnings = Vec::new();
+    for (parent, key) in UNUSED_CONFIG_KEYS {
+        let note = |location: String| {
+            format!(
+                "`{location}` is unused and deprecated: it is accepted but has no effect; remove it from team.yaml"
+            )
+        };
+        match *parent {
+            "" => {
+                if has(&root, key) {
+                    warnings.push(note((*key).to_string()));
+                }
+            }
+            "roles[]" => {
+                let roles = root.get("roles").and_then(serde_yaml::Value::as_sequence);
+                for role in roles.into_iter().flatten() {
+                    if has(role, key) {
+                        let name = role
+                            .get("name")
+                            .and_then(serde_yaml::Value::as_str)
+                            .unwrap_or("?");
+                        warnings.push(note(format!("roles[{name}].{key}")));
+                    }
+                }
+            }
+            parent => {
+                if root.get(parent).is_some_and(|section| has(section, key)) {
+                    warnings.push(note(format!("{parent}.{key}")));
+                }
+            }
+        }
+    }
+    warnings
+}
+
 /// Resolve the configured trunk branch for a project. Falls back to the
 /// default (`main`) when `team.yaml` is missing or cannot be parsed.
 pub fn configured_trunk_branch(project_root: &Path) -> String {
@@ -146,6 +205,30 @@ impl TeamConfig {
     }
 
     /// Load team config from a YAML file.
+    /// Like [`TeamConfig::load`], but a missing file is an error that tells the
+    /// user how to create it (for commands that only inspect an existing config).
+    pub fn load_existing(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            bail!(
+                "No team config found at {}. Run `batty init` first.",
+                path.display()
+            );
+        }
+        Self::load(path)
+    }
+
+    /// Pretty JSON for `batty config --json`: the resolved config as
+    /// serialized by serde (so it cannot drift from the struct), plus the
+    /// config path and resolved member count. Secrets are skipped by serde.
+    pub fn to_inspection_json(&self, config_path: &Path, members: usize) -> Result<String> {
+        let output = serde_json::json!({
+            "config_path": config_path.display().to_string(),
+            "members": members,
+            "config": self,
+        });
+        Ok(serde_json::to_string_pretty(&output)?)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;

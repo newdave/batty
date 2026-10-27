@@ -75,7 +75,9 @@ impl ParityReport {
     }
 
     pub fn parse(input: &str) -> Result<Self> {
-        let (frontmatter, body) = split_frontmatter(input)?;
+        let (frontmatter, body) = crate::task::frontmatter::split(input)
+            .context("PARITY.md must start with YAML frontmatter and close it with ---")?;
+        let body = body.trim();
         let metadata: ParityMetadata =
             serde_yaml::from_str(frontmatter).context("failed to parse PARITY.md frontmatter")?;
         let rows = parse_table_rows(body)?;
@@ -324,30 +326,6 @@ fn truncate(input: &str, width: usize) -> String {
     let mut out: String = input.chars().take(width.saturating_sub(3)).collect();
     out.push_str("...");
     out
-}
-
-fn split_frontmatter(input: &str) -> Result<(&str, &str)> {
-    let mut lines = input.lines();
-    if lines.next() != Some("---") {
-        bail!("PARITY.md must start with YAML frontmatter");
-    }
-
-    let after_start = input
-        .find("\n")
-        .map(|idx| idx + 1)
-        .context("PARITY.md frontmatter is malformed")?;
-    let rest = &input[after_start..];
-    let end_offset = rest
-        .find("\n---")
-        .context("PARITY.md frontmatter is missing closing delimiter")?;
-    let frontmatter = &rest[..end_offset];
-    let body_start = after_start + end_offset + "\n---".len();
-    let body = input
-        .get(body_start..)
-        .unwrap_or("")
-        .trim_start_matches('\n')
-        .trim();
-    Ok((frontmatter, body))
 }
 
 fn parse_table_rows(body: &str) -> Result<Vec<ParityRow>> {

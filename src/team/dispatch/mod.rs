@@ -537,8 +537,20 @@ impl TeamDaemon {
     where
         I: IntoIterator<Item = &'a str>,
     {
+        let tasks_dir = self.board_dir().join("tasks");
+        if let Some(result) = validated_move(args) {
+            crate::team::daemon::board_snapshot::note_board_write(&tasks_dir);
+            return match result {
+                Ok(()) => true,
+                Err(error) => {
+                    let detail = format!("failed while trying to {action}: {error:#}");
+                    self.report_nonfatal_kanban_failure(action, &detail, recipients);
+                    false
+                }
+            };
+        }
         let kanban_result = std::process::Command::new("kanban-md").args(args).output();
-        crate::team::daemon::board_snapshot::note_board_write(&self.board_dir().join("tasks"));
+        crate::team::daemon::board_snapshot::note_board_write(&tasks_dir);
         match kanban_result {
             Ok(output) if output.status.success() => true,
             Ok(output) => {
@@ -768,6 +780,30 @@ impl TeamDaemon {
         self.last_auto_dispatch = Instant::now();
         Ok(())
     }
+}
+
+/// If `args` is a `kanban-md move <id> <status> [--claim <who>] [--dir <board>]`
+/// invocation, run it through the workflow state machine instead of shelling
+/// out blindly. Returns `None` for other commands.
+fn validated_move(args: &[&str]) -> Option<anyhow::Result<()>> {
+    if args.first() != Some(&"move") {
+        return None;
+    }
+    let value_of = |flag: &str| {
+        args.iter()
+            .position(|arg| *arg == flag)
+            .and_then(|index| args.get(index + 1))
+            .copied()
+    };
+    let task_id = args.get(1)?.parse::<u32>().ok()?;
+    let status = args.get(2).filter(|status| !status.starts_with("--"))?;
+    let board_dir = value_of("--dir")?;
+    Some(crate::team::task_cmd::move_task_validated(
+        std::path::Path::new(board_dir),
+        task_id,
+        status,
+        value_of("--claim"),
+    ))
 }
 
 fn is_verification_retry_assignment(task: &str) -> bool {

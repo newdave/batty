@@ -5,7 +5,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
 
     use crate::team::auto_merge::{
         AutoMergeDecision, DiffSummary, compute_merge_confidence, should_auto_merge,
@@ -18,100 +17,18 @@ mod tests {
         check_wip_limit, is_review_nudge_due, is_review_stale, should_escalate,
     };
     use crate::team::resolver::{ResolutionStatus, resolve_board, runnable_tasks};
-    use crate::team::review::{MergeDisposition, apply_review};
     use crate::team::standup::MemberState;
     use crate::team::task_loop::setup_engineer_worktree;
     use crate::team::test_helpers::make_test_daemon;
     use crate::team::test_support::{
         engineer_member, git_ok, init_git_repo, manager_member, write_board_task_file,
     };
-    use crate::team::workflow::{TaskState, WorkflowMeta, can_transition};
+    use crate::team::workflow::{TaskState, can_transition};
 
     // -----------------------------------------------------------------------
     // 1. Task lifecycle: todo → assigned → in-progress → completed → done
     //    with all events emitted correctly
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn full_task_lifecycle_transitions() {
-        let mut meta = WorkflowMeta {
-            state: TaskState::Backlog,
-            ..WorkflowMeta::default()
-        };
-
-        // Backlog → Todo (triage)
-        meta.transition(TaskState::Todo).unwrap();
-        assert_eq!(meta.state, TaskState::Todo);
-
-        // Todo → InProgress (engineer picks it up)
-        meta.transition(TaskState::InProgress).unwrap();
-        assert_eq!(meta.state, TaskState::InProgress);
-        meta.execution_owner = Some("eng-1".to_string());
-
-        // InProgress → Review (engineer submits)
-        meta.transition(TaskState::Review).unwrap();
-        assert_eq!(meta.state, TaskState::Review);
-        meta.review_owner = Some("manager-1".to_string());
-
-        // Review → Done (approved)
-        meta.transition(TaskState::Done).unwrap();
-        assert_eq!(meta.state, TaskState::Done);
-
-        // Done → Archived (cleanup)
-        meta.transition(TaskState::Archived).unwrap();
-        assert_eq!(meta.state, TaskState::Archived);
-    }
-
-    #[test]
-    fn task_lifecycle_review_rework_loop() {
-        let mut meta = WorkflowMeta {
-            state: TaskState::Todo,
-            ..WorkflowMeta::default()
-        };
-
-        meta.transition(TaskState::InProgress).unwrap();
-        meta.transition(TaskState::Review).unwrap();
-
-        // Review → InProgress (changes requested)
-        meta.transition(TaskState::InProgress).unwrap();
-        assert_eq!(meta.state, TaskState::InProgress);
-
-        // InProgress → Review (resubmit)
-        meta.transition(TaskState::Review).unwrap();
-
-        // Review → Done (approved on second pass)
-        meta.transition(TaskState::Done).unwrap();
-        assert_eq!(meta.state, TaskState::Done);
-    }
-
-    #[test]
-    fn task_lifecycle_blocked_then_unblocked() {
-        let mut meta = WorkflowMeta {
-            state: TaskState::Todo,
-            ..WorkflowMeta::default()
-        };
-
-        // Block from Todo
-        meta.transition(TaskState::Blocked).unwrap();
-        assert_eq!(meta.state, TaskState::Blocked);
-        meta.blocked_on = Some("waiting for API".to_string());
-
-        // Unblock → back to Todo
-        meta.transition(TaskState::Todo).unwrap();
-        meta.blocked_on = None;
-
-        // Progress, block from InProgress, unblock
-        meta.transition(TaskState::InProgress).unwrap();
-        meta.transition(TaskState::Blocked).unwrap();
-        meta.blocked_on = Some("infrastructure issue".to_string());
-        meta.transition(TaskState::InProgress).unwrap();
-        meta.blocked_on = None;
-
-        // Continue to completion
-        meta.transition(TaskState::Review).unwrap();
-        meta.transition(TaskState::Done).unwrap();
-        assert_eq!(meta.state, TaskState::Done);
-    }
 
     #[test]
     fn illegal_lifecycle_skips_are_rejected() {
@@ -121,44 +38,6 @@ mod tests {
         assert!(can_transition(TaskState::InProgress, TaskState::Done).is_err());
         assert!(can_transition(TaskState::Done, TaskState::InProgress).is_err());
         assert!(can_transition(TaskState::Archived, TaskState::Todo).is_err());
-    }
-
-    #[test]
-    fn review_apply_transitions_state_correctly() {
-        // MergeReady → Done
-        let mut meta = WorkflowMeta {
-            state: TaskState::Review,
-            execution_owner: Some("eng-1".to_string()),
-            review_owner: Some("mgr".to_string()),
-            ..WorkflowMeta::default()
-        };
-        apply_review(&mut meta, MergeDisposition::MergeReady, "mgr").unwrap();
-        assert_eq!(meta.state, TaskState::Done);
-
-        // ReworkRequired → InProgress
-        let mut meta2 = WorkflowMeta {
-            state: TaskState::Review,
-            execution_owner: Some("eng-1".to_string()),
-            ..WorkflowMeta::default()
-        };
-        apply_review(&mut meta2, MergeDisposition::ReworkRequired, "mgr").unwrap();
-        assert_eq!(meta2.state, TaskState::InProgress);
-
-        // Discarded → Archived
-        let mut meta3 = WorkflowMeta {
-            state: TaskState::Review,
-            ..WorkflowMeta::default()
-        };
-        apply_review(&mut meta3, MergeDisposition::Discarded, "mgr").unwrap();
-        assert_eq!(meta3.state, TaskState::Archived);
-
-        // Escalated → Blocked
-        let mut meta4 = WorkflowMeta {
-            state: TaskState::Review,
-            ..WorkflowMeta::default()
-        };
-        apply_review(&mut meta4, MergeDisposition::Escalated, "mgr").unwrap();
-        assert_eq!(meta4.state, TaskState::Blocked);
     }
 
     #[test]
@@ -204,44 +83,6 @@ mod tests {
         assert!(validation.missing_fields.contains(&"branch".to_string()));
         assert!(validation.missing_fields.contains(&"commit".to_string()));
         assert!(validation.missing_fields.contains(&"tests_run".to_string()));
-    }
-
-    #[test]
-    fn review_then_completion_then_done_flow() {
-        // Full flow: state machine transition + completion packet + review
-        let mut meta = WorkflowMeta {
-            state: TaskState::Todo,
-            depends_on: vec![],
-            ..WorkflowMeta::default()
-        };
-
-        // Engineer works on it
-        meta.transition(TaskState::InProgress).unwrap();
-        meta.execution_owner = Some("eng-1".to_string());
-
-        // Engineer produces a completion packet
-        let packet = CompletionPacket {
-            task_id: 42,
-            branch: Some("eng-1/42".to_string()),
-            worktree_path: Some("/tmp/eng-1".to_string()),
-            commit: Some("abc1234".to_string()),
-            changed_paths: vec!["src/foo.rs".to_string()],
-            tests_run: true,
-            tests_passed: true,
-            artifacts: vec![],
-            outcome: "ready_for_review".to_string(),
-        };
-        let validation = validate_completion(&packet);
-        assert!(validation.is_complete, "packet should be valid");
-
-        // Move to Review
-        meta.transition(TaskState::Review).unwrap();
-        meta.branch = packet.branch;
-        meta.commit = packet.commit;
-
-        // Reviewer approves
-        apply_review(&mut meta, MergeDisposition::MergeReady, "mgr").unwrap();
-        assert_eq!(meta.state, TaskState::Done);
     }
 
     #[test]
@@ -594,32 +435,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_meta_is_runnable_integrates_with_dep_set() {
-        let done_set = HashSet::from([1u32, 2]);
-
-        let runnable = WorkflowMeta {
-            state: TaskState::Todo,
-            depends_on: vec![1, 2],
-            ..WorkflowMeta::default()
-        };
-        assert!(runnable.is_runnable(&done_set));
-
-        let blocked = WorkflowMeta {
-            state: TaskState::Todo,
-            depends_on: vec![1, 3],
-            ..WorkflowMeta::default()
-        };
-        assert!(!blocked.is_runnable(&done_set));
-
-        let wrong_state = WorkflowMeta {
-            state: TaskState::InProgress,
-            depends_on: vec![1],
-            ..WorkflowMeta::default()
-        };
-        assert!(!wrong_state.is_runnable(&done_set));
-    }
-
-    #[test]
     fn blocked_on_field_blocks_resolution() {
         let tmp = tempfile::tempdir().unwrap();
 
@@ -696,33 +511,6 @@ mod tests {
 
         // User type has no WIP limit
         assert!(check_wip_limit(&policy, RoleType::User, 999));
-    }
-
-    #[test]
-    fn wip_and_dependency_interact_correctly() {
-        // When WIP is at capacity, even runnable tasks shouldn't be dispatched.
-        // When deps are unmet, even under WIP, tasks shouldn't be dispatched.
-        let policy = WorkflowPolicy {
-            wip_limit_per_engineer: Some(1),
-            ..WorkflowPolicy::default()
-        };
-
-        // Under WIP, deps met → runnable
-        let meta = WorkflowMeta {
-            state: TaskState::Todo,
-            depends_on: vec![1],
-            ..WorkflowMeta::default()
-        };
-        let done = HashSet::from([1u32]);
-        assert!(meta.is_runnable(&done));
-        assert!(check_wip_limit(&policy, RoleType::Engineer, 0));
-
-        // Under WIP, deps unmet → blocked (deps win)
-        let unmet_done = HashSet::new();
-        assert!(!meta.is_runnable(&unmet_done));
-
-        // Over WIP, deps met → WIP blocks dispatch
-        assert!(!check_wip_limit(&policy, RoleType::Engineer, 1));
     }
 
     // -----------------------------------------------------------------------

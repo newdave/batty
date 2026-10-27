@@ -1,6 +1,5 @@
 name: my-project
 use_shim: true
-auto_respawn_on_crash: true
 orchestrator_pane: true
 orchestrator_position: left
 
@@ -51,7 +50,6 @@ roles:
     prompt: architect.md
     talks_to: [human, manager]
     nudge_interval_secs: 1800
-    owns: ["planning/**", "docs/**"]
 
   - name: manager
     role_type: manager

@@ -62,7 +62,6 @@ name: my-project
 workflow_mode: hybrid
 use_shim: true
 use_sdk_mode: true
-auto_respawn_on_crash: true
 
 board:
   auto_dispatch: true
@@ -111,7 +110,6 @@ roles:
 Recommended defaults:
 
 - Keep `use_shim: true` and `use_sdk_mode: true`.
-- Leave `auto_respawn_on_crash: true` on for unattended teams.
 - Keep `board.auto_dispatch: true` so idle engineers do not sit waiting.
 - Keep `workflow_policy.auto_merge.enabled: true` so safe diffs merge on green.
 

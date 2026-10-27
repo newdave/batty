@@ -750,6 +750,12 @@ pub fn validate_team(project_root: &Path, verbose: bool) -> Result<()> {
         println!("[WARN] {warning}");
     }
 
+    if let Ok(raw) = std::fs::read_to_string(&config_path) {
+        for warning in config::unused_config_key_warnings(&raw) {
+            println!("[WARN] {warning}");
+        }
+    }
+
     for note in migration_validation_notes(&team_config, workflow_mode_is_explicit) {
         println!("{note}");
     }

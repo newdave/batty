@@ -325,7 +325,7 @@ pub fn collect_review_queue_snapshot_from_tasks(
 
 fn review_task_age_secs(task: &Task, now: DateTime<Utc>) -> Result<i64> {
     let content = std::fs::read_to_string(&task.source_path)?;
-    let (frontmatter, _) = split_task_frontmatter(&content)?;
+    let (frontmatter, _) = crate::task::frontmatter::split(&content)?;
     let parsed: ReviewTaskTimestampFrontmatter = serde_yaml::from_str(frontmatter)?;
     let timestamp = parsed.updated.or(parsed.started).or(parsed.created);
     Ok(timestamp
@@ -333,23 +333,6 @@ fn review_task_age_secs(task: &Task, now: DateTime<Utc>) -> Result<i64> {
         .and_then(parse_frontmatter_timestamp_compat)
         .map(|timestamp| now.signed_duration_since(timestamp).num_seconds().max(0))
         .unwrap_or(0))
-}
-
-fn split_task_frontmatter(content: &str) -> Result<(&str, &str)> {
-    let trimmed = content.trim_start();
-    anyhow::ensure!(
-        trimmed.starts_with("---"),
-        "task file missing YAML frontmatter"
-    );
-    let after_open = trimmed[3..].strip_prefix('\n').unwrap_or(&trimmed[3..]);
-    let close_pos = after_open
-        .find("\n---")
-        .ok_or_else(|| anyhow::anyhow!("task file missing closing frontmatter delimiter"))?;
-    let frontmatter = &after_open[..close_pos];
-    let body = after_open[close_pos + 4..]
-        .strip_prefix('\n')
-        .unwrap_or(&after_open[close_pos + 4..]);
-    Ok((frontmatter, body))
 }
 
 fn duration_minutes(

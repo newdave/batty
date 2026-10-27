@@ -23,17 +23,6 @@ fn reject_symlinks(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn frontmatter(content: &str) -> Result<Mapping> {
-    let rest = content
-        .trim_start()
-        .strip_prefix("---\n")
-        .context("board mutation requires YAML frontmatter")?;
-    let end = rest
-        .find("\n---")
-        .context("board mutation requires closing frontmatter delimiter")?;
-    Ok(serde_yaml::from_str(&rest[..end])?)
-}
-
 /// The lock inode must never be removed or replaced: Go processes may already
 /// hold descriptors to it. Closing this descriptor also releases flock on error.
 #[cfg(unix)]
@@ -156,8 +145,8 @@ fn write_locked_with(
     if actual != expected {
         bail!("task changed since mutation was prepared; retry with a fresh snapshot");
     }
-    let old = frontmatter(expected)?;
-    let new = frontmatter(contents)?;
+    let (old, _) = crate::task::frontmatter::parse(expected)?;
+    let (new, _) = crate::task::frontmatter::parse(contents)?;
     if old.get("id") != new.get("id") {
         bail!("board mutation cannot change task identity");
     }

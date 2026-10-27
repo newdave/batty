@@ -1,18 +1,15 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
 //! Review and merge transitions for Batty-managed workflow metadata.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::task::Task;
 
-use super::workflow::{ReviewDisposition, TaskState, WorkflowMeta, can_transition};
+use super::workflow::{TaskState, WorkflowMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,76 +94,6 @@ pub(crate) struct ReviewMergeRemediation {
     pub(crate) expected_branch: Option<String>,
     pub(crate) actual_branch: Option<String>,
     pub(crate) commits_ahead: Option<u32>,
-}
-
-pub fn apply_review(
-    meta: &mut WorkflowMeta,
-    disposition: MergeDisposition,
-    reviewer: &str,
-) -> Result<(), String> {
-    validate_review_readiness(meta)?;
-
-    let packet_ref = meta
-        .review
-        .as_ref()
-        .and_then(|review| review.packet_ref.clone());
-    let notes = meta.review.as_ref().and_then(|review| review.notes.clone());
-
-    let (next_state, review_disposition, blocked_on) = match disposition {
-        MergeDisposition::MergeReady => (TaskState::Done, Some(ReviewDisposition::Approved), None),
-        MergeDisposition::ReworkRequired => (
-            TaskState::InProgress,
-            Some(ReviewDisposition::ChangesRequested),
-            None,
-        ),
-        MergeDisposition::Discarded => {
-            (TaskState::Archived, Some(ReviewDisposition::Rejected), None)
-        }
-        MergeDisposition::Escalated => (
-            TaskState::Blocked,
-            None,
-            Some(format!("escalated by {reviewer}")),
-        ),
-    };
-
-    can_transition(meta.state, next_state)?;
-    meta.state = next_state;
-    meta.review_owner = Some(reviewer.to_string());
-    meta.review_disposition = review_disposition;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    meta.review = Some(ReviewState {
-        reviewer: reviewer.to_string(),
-        packet_ref,
-        disposition,
-        notes,
-        reviewed_at: Some(now),
-        nudge_sent: false,
-    });
-    meta.blocked_on = blocked_on;
-
-    Ok(())
-}
-
-pub fn validate_review_readiness(meta: &WorkflowMeta) -> Result<(), String> {
-    if meta.state == TaskState::Review {
-        Ok(())
-    } else {
-        Err(format!(
-            "task must be in Review state before applying review, found {:?}",
-            meta.state
-        ))
-    }
-}
-
-pub fn validate_review_candidate(
-    project_root: &Path,
-    meta: &WorkflowMeta,
-) -> anyhow::Result<ReviewEligibility> {
-    let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
-    validate_review_candidate_from_trunk(project_root, meta, &trunk_branch)
 }
 
 pub fn validate_review_candidate_from_trunk(
@@ -630,21 +557,6 @@ mod tests {
     use std::process::Command;
     use tempfile::tempdir;
 
-    fn review_meta() -> WorkflowMeta {
-        WorkflowMeta {
-            state: TaskState::Review,
-            review: Some(ReviewState {
-                reviewer: "manager-0".to_string(),
-                packet_ref: Some("review/packet-1.json".to_string()),
-                disposition: MergeDisposition::MergeReady,
-                notes: Some("initial packet".to_string()),
-                reviewed_at: None,
-                nudge_sent: false,
-            }),
-            ..WorkflowMeta::default()
-        }
-    }
-
     fn write_team_config(project_root: &Path, trunk_branch: &str) {
         let config_dir = crate::team::team_config_dir(project_root);
         fs::create_dir_all(&config_dir).unwrap();
@@ -670,97 +582,6 @@ roles:
     }
 
     #[test]
-    fn merge_ready_moves_review_to_done() {
-        let mut meta = review_meta();
-
-        apply_review(&mut meta, MergeDisposition::MergeReady, "manager-1").unwrap();
-
-        assert_eq!(meta.state, TaskState::Done);
-        assert_eq!(meta.review_owner.as_deref(), Some("manager-1"));
-        assert_eq!(meta.review_disposition, Some(ReviewDisposition::Approved));
-        assert_eq!(meta.blocked_on, None);
-        let review = meta.review.unwrap();
-        assert_eq!(review.disposition, MergeDisposition::MergeReady);
-        assert_eq!(review.packet_ref.as_deref(), Some("review/packet-1.json"));
-    }
-
-    #[test]
-    fn rework_required_moves_review_to_in_progress() {
-        let mut meta = review_meta();
-
-        apply_review(&mut meta, MergeDisposition::ReworkRequired, "manager-1").unwrap();
-
-        assert_eq!(meta.state, TaskState::InProgress);
-        assert_eq!(
-            meta.review_disposition,
-            Some(ReviewDisposition::ChangesRequested)
-        );
-        assert_eq!(meta.blocked_on, None);
-        assert_eq!(
-            meta.review.as_ref().map(|review| review.disposition),
-            Some(MergeDisposition::ReworkRequired)
-        );
-    }
-
-    #[test]
-    fn discarded_moves_review_to_archived() {
-        let mut meta = review_meta();
-
-        apply_review(&mut meta, MergeDisposition::Discarded, "manager-1").unwrap();
-
-        assert_eq!(meta.state, TaskState::Archived);
-        assert_eq!(meta.review_disposition, Some(ReviewDisposition::Rejected));
-        assert_eq!(meta.blocked_on, None);
-        assert_eq!(
-            meta.review.as_ref().map(|review| review.disposition),
-            Some(MergeDisposition::Discarded)
-        );
-    }
-
-    #[test]
-    fn escalated_moves_review_to_blocked() {
-        let mut meta = review_meta();
-
-        apply_review(&mut meta, MergeDisposition::Escalated, "manager-1").unwrap();
-
-        assert_eq!(meta.state, TaskState::Blocked);
-        assert_eq!(meta.review_disposition, None);
-        assert_eq!(meta.blocked_on.as_deref(), Some("escalated by manager-1"));
-        assert_eq!(
-            meta.review.as_ref().map(|review| review.disposition),
-            Some(MergeDisposition::Escalated)
-        );
-    }
-
-    #[test]
-    fn apply_review_rejects_non_review_tasks() {
-        let mut meta = WorkflowMeta {
-            state: TaskState::InProgress,
-            ..WorkflowMeta::default()
-        };
-
-        let err = apply_review(&mut meta, MergeDisposition::MergeReady, "manager-1")
-            .expect_err("non-review tasks should be rejected");
-
-        assert!(err.contains("Review state"));
-        assert_eq!(meta.state, TaskState::InProgress);
-        assert_eq!(meta.review_disposition, None);
-        assert_eq!(meta.blocked_on, None);
-        assert!(meta.review.is_none());
-    }
-
-    #[test]
-    fn validate_review_readiness_rejects_non_review_state() {
-        let meta = WorkflowMeta {
-            state: TaskState::Todo,
-            ..WorkflowMeta::default()
-        };
-
-        let err = validate_review_readiness(&meta).expect_err("todo should not be review-ready");
-        assert!(err.contains("Review state"));
-    }
-
-    #[test]
     fn validate_review_candidate_rejects_missing_metadata() {
         let tmp = tempdir().unwrap();
         let repo = init_git_repo(&tmp, "review_missing_meta");
@@ -769,7 +590,7 @@ roles:
             ..WorkflowMeta::default()
         };
 
-        let eligibility = validate_review_candidate(&repo, &meta).unwrap();
+        let eligibility = validate_review_candidate_from_trunk(&repo, &meta, "main").unwrap();
         assert_eq!(
             eligibility,
             ReviewEligibility::MissingMetadata {
@@ -824,7 +645,7 @@ roles:
             ..WorkflowMeta::default()
         };
 
-        let eligibility = validate_review_candidate(&repo, &meta).unwrap();
+        let eligibility = validate_review_candidate_from_trunk(&repo, &meta, "main").unwrap();
         assert_eq!(
             eligibility,
             ReviewEligibility::AlreadyMerged {
@@ -870,7 +691,8 @@ roles:
 
         write_team_config(&repo, "mainline");
 
-        let eligibility = validate_review_candidate(&repo, &meta).unwrap();
+        let trunk = crate::team::config::configured_trunk_branch(&repo);
+        let eligibility = validate_review_candidate_from_trunk(&repo, &meta, &trunk).unwrap();
         assert_eq!(
             eligibility,
             ReviewEligibility::AlreadyMerged {

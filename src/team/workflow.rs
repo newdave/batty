@@ -1,7 +1,4 @@
 //! Workflow state model for Batty-managed tasks.
-#![cfg_attr(not(test), allow(dead_code))]
-
-use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,19 +56,33 @@ pub struct WorkflowMeta {
     pub next_action: Option<String>,
 }
 
-impl WorkflowMeta {
-    pub fn is_runnable(&self, done_tasks: &HashSet<u32>) -> bool {
-        self.state == TaskState::Todo
-            && self
-                .depends_on
-                .iter()
-                .all(|dependency| done_tasks.contains(dependency))
+impl TaskState {
+    /// Parse a status as spelled on the board (`in-progress`) or in
+    /// serialized workflow metadata (`in_progress`).
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "backlog" => Ok(Self::Backlog),
+            "todo" => Ok(Self::Todo),
+            "in_progress" => Ok(Self::InProgress),
+            "review" => Ok(Self::Review),
+            "blocked" => Ok(Self::Blocked),
+            "done" => Ok(Self::Done),
+            "archived" => Ok(Self::Archived),
+            other => Err(format!("unknown task state `{other}`")),
+        }
     }
 
-    pub fn transition(&mut self, to: TaskState) -> Result<(), String> {
-        can_transition(self.state, to)?;
-        self.state = to;
-        Ok(())
+    /// Canonical spelling used in board task frontmatter and kanban-md.
+    pub fn board_name(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Todo => "todo",
+            Self::InProgress => "in-progress",
+            Self::Review => "review",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Archived => "archived",
+        }
     }
 }
 
@@ -121,24 +132,22 @@ mod tests {
     }
 
     #[test]
-    fn is_runnable_requires_todo_state_and_completed_dependencies() {
-        let mut done_tasks = HashSet::from([1, 2]);
-        let runnable = WorkflowMeta {
-            state: TaskState::Todo,
-            depends_on: vec![1, 2],
-            ..WorkflowMeta::default()
-        };
-        assert!(runnable.is_runnable(&done_tasks));
-
-        done_tasks.remove(&2);
-        assert!(!runnable.is_runnable(&done_tasks));
-
-        let wrong_state = WorkflowMeta {
-            state: TaskState::InProgress,
-            depends_on: vec![1],
-            ..WorkflowMeta::default()
-        };
-        assert!(!wrong_state.is_runnable(&HashSet::from([1])));
+    fn task_state_parse_accepts_both_spellings_and_round_trips() {
+        assert_eq!(TaskState::parse("in-progress"), Ok(TaskState::InProgress));
+        assert_eq!(TaskState::parse(" In_Progress "), Ok(TaskState::InProgress));
+        assert!(TaskState::parse("nope").is_err());
+        for state in [
+            TaskState::Backlog,
+            TaskState::Todo,
+            TaskState::InProgress,
+            TaskState::Review,
+            TaskState::Blocked,
+            TaskState::Done,
+            TaskState::Archived,
+        ] {
+            assert_eq!(TaskState::parse(state.board_name()), Ok(state));
+        }
+        assert_eq!(TaskState::InProgress.board_name(), "in-progress");
     }
 
     #[test]
@@ -176,19 +185,6 @@ mod tests {
         for (from, to) in illegal {
             assert!(can_transition(from, to).is_err());
         }
-    }
-
-    #[test]
-    fn transition_updates_state_after_validation() {
-        let mut meta = WorkflowMeta {
-            state: TaskState::Todo,
-            ..WorkflowMeta::default()
-        };
-
-        meta.transition(TaskState::InProgress).unwrap();
-        assert_eq!(meta.state, TaskState::InProgress);
-        assert!(meta.transition(TaskState::Archived).is_err());
-        assert_eq!(meta.state, TaskState::InProgress);
     }
 
     #[test]
@@ -265,67 +261,7 @@ mod tests {
 
     // --- is_runnable edge cases ---
 
-    #[test]
-    fn is_runnable_with_no_deps_at_todo() {
-        let meta = WorkflowMeta {
-            state: TaskState::Todo,
-            ..WorkflowMeta::default()
-        };
-        assert!(meta.is_runnable(&HashSet::new()));
-    }
-
-    #[test]
-    fn is_runnable_at_backlog_is_false() {
-        let meta = WorkflowMeta::default(); // Backlog
-        assert!(!meta.is_runnable(&HashSet::new()));
-    }
-
-    #[test]
-    fn is_runnable_at_done_is_false() {
-        let meta = WorkflowMeta {
-            state: TaskState::Done,
-            ..WorkflowMeta::default()
-        };
-        assert!(!meta.is_runnable(&HashSet::new()));
-    }
-
     // --- multi-step transitions ---
-
-    #[test]
-    fn full_lifecycle_transition_chain() {
-        let mut meta = WorkflowMeta::default(); // Backlog
-        meta.transition(TaskState::Todo).unwrap();
-        meta.transition(TaskState::InProgress).unwrap();
-        meta.transition(TaskState::Review).unwrap();
-        meta.transition(TaskState::Done).unwrap();
-        meta.transition(TaskState::Archived).unwrap();
-        assert_eq!(meta.state, TaskState::Archived);
-    }
-
-    #[test]
-    fn blocked_to_todo_to_in_progress_chain() {
-        let mut meta = WorkflowMeta {
-            state: TaskState::Todo,
-            ..WorkflowMeta::default()
-        };
-        meta.transition(TaskState::Blocked).unwrap();
-        meta.transition(TaskState::Todo).unwrap();
-        meta.transition(TaskState::InProgress).unwrap();
-        assert_eq!(meta.state, TaskState::InProgress);
-    }
-
-    #[test]
-    fn review_rework_cycle() {
-        let mut meta = WorkflowMeta {
-            state: TaskState::InProgress,
-            ..WorkflowMeta::default()
-        };
-        meta.transition(TaskState::Review).unwrap();
-        meta.transition(TaskState::InProgress).unwrap(); // rework
-        meta.transition(TaskState::Review).unwrap();
-        meta.transition(TaskState::Done).unwrap();
-        assert_eq!(meta.state, TaskState::Done);
-    }
 
     // --- TaskState serde ---
 

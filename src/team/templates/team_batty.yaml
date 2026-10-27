@@ -1,6 +1,5 @@
 name: batty-dev
 use_shim: true
-auto_respawn_on_crash: true
 orchestrator_pane: true
 orchestrator_position: left
 
@@ -51,7 +50,6 @@ roles:
     model_class: frontier
     talks_to: [human, manager]
     nudge_interval_secs: 1200
-    owns: ["planning/**", "docs/**", "CLAUDE.md"]
 
   - name: manager
     role_type: manager

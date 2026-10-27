@@ -14,10 +14,8 @@ mod tests {
     use super::super::nudge::compute_nudges;
     use super::super::policy::{check_wip_limit, is_review_stale, should_escalate};
     use super::super::resolver::{ResolutionStatus, resolve_board, runnable_tasks};
-    use super::super::review::{MergeDisposition, ReviewState, apply_review};
     use super::super::standup::MemberState;
     use super::super::team_config_dir;
-    use super::super::workflow::{TaskState, WorkflowMeta};
 
     #[derive(Debug)]
     struct TemplateExpectation {
@@ -623,50 +621,6 @@ roles:
                 );
             }
         }
-    }
-
-    #[test]
-    fn workflow_meta_transitions_end_to_end_with_real_review_flow() {
-        let mut meta = WorkflowMeta {
-            state: TaskState::Todo,
-            execution_owner: Some("eng-1-1".to_string()),
-            review_owner: Some("manager".to_string()),
-            worktree_path: Some(".batty/worktrees/eng-1-1".to_string()),
-            branch: Some("eng-1-1/task-34".to_string()),
-            commit: Some("abc1234".to_string()),
-            artifacts: vec!["target/nextest/default.xml".to_string()],
-            ..WorkflowMeta::default()
-        };
-
-        meta.transition(TaskState::InProgress).unwrap();
-        meta.next_action = Some("run tests".to_string());
-        meta.transition(TaskState::Review).unwrap();
-        meta.review = Some(ReviewState {
-            reviewer: "manager".to_string(),
-            packet_ref: Some("review/packet-34.json".to_string()),
-            disposition: MergeDisposition::MergeReady,
-            notes: Some("ready for merge".to_string()),
-            reviewed_at: None,
-            nudge_sent: false,
-        });
-
-        apply_review(&mut meta, MergeDisposition::MergeReady, "manager").unwrap();
-
-        assert_eq!(meta.state, TaskState::Done);
-        assert_eq!(meta.review_owner.as_deref(), Some("manager"));
-        assert_eq!(
-            meta.review_disposition,
-            Some(super::super::workflow::ReviewDisposition::Approved)
-        );
-        assert_eq!(
-            meta.review
-                .as_ref()
-                .and_then(|review| review.packet_ref.as_deref()),
-            Some("review/packet-34.json")
-        );
-        assert_eq!(meta.branch.as_deref(), Some("eng-1-1/task-34"));
-        assert_eq!(meta.commit.as_deref(), Some("abc1234"));
-        assert_eq!(meta.artifacts, vec!["target/nextest/default.xml"]);
     }
 
     #[test]

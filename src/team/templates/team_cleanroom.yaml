@@ -1,6 +1,5 @@
 name: my-cleanroom-project
 use_shim: true
-auto_respawn_on_crash: true
 orchestrator_pane: true
 orchestrator_position: left
 
@@ -52,7 +51,6 @@ roles:
     talks_to: [spec-writer]
     barrier_group: analysis
     nudge_interval_secs: 1200
-    owns: ["analysis/**", "planning/cleanroom-process.md", "**/*.z80", "**/*.sna"]
 
   - name: spec-writer
     role_type: manager
@@ -61,7 +59,6 @@ roles:
     prompt: batty_spec_writer.md
     talks_to: [decompiler, test-writer, implementer]
     barrier_group: analysis
-    owns: ["SPEC.md", "PARITY.md", "specs/**"]
 
   - name: test-writer
     role_type: engineer
@@ -71,7 +68,6 @@ roles:
     talks_to: [spec-writer]
     barrier_group: implementation
     use_worktrees: true
-    owns: ["implementation/tests/**"]
 
   - name: implementer
     role_type: engineer
@@ -81,4 +77,3 @@ roles:
     talks_to: [spec-writer]
     barrier_group: implementation
     use_worktrees: true
-    owns: ["implementation/**"]

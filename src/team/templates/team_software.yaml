@@ -1,6 +1,5 @@
 name: my-product
 use_shim: true
-auto_respawn_on_crash: true
 orchestrator_pane: true
 orchestrator_position: left
 
@@ -54,7 +53,6 @@ roles:
     prompt: tech_lead.md
     talks_to: [human, backend-mgr, frontend-mgr]
     nudge_interval_secs: 1200
-    owns: ["docs/**", "planning/**"]
 
   - name: backend-mgr
     role_type: manager

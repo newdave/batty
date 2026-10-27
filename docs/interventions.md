@@ -328,7 +328,7 @@ Detects when the board is running low on actionable work and nudges the architec
 - Pause marker not present
 - At least one architect and one engineer exist
 - Idle unassigned engineers exist (engineers who are idle and have no active claimed tasks)
-- The number of unblocked, unclaimed todo tasks is below `replenishment_threshold` (defaults to the total number of engineers)
+- The number of unblocked, unclaimed todo tasks is below the total number of engineers
 - Unblocked = no `blocked`, no `blocked_on`, and all `depends_on` tasks are done or missing
 - Architect is idle and past the idle grace period
 - Architect has no pending inbox messages
@@ -358,7 +358,6 @@ Board state changes (tasks added, completed, unblocked)
 
 | Field                          | Location     | Default             | Description                                            |
 | ------------------------------ | ------------ | ------------------- | ------------------------------------------------------ |
-| `replenishment_threshold`      | `automation` | number of engineers | Minimum unblocked todo tasks before intervention fires |
 | `intervention_idle_grace_secs` | `automation` | `60`                | Grace period before firing                             |
 | `intervention_cooldown_secs`   | `automation` | `120`               | Cooldown between fires                                 |
 
@@ -382,7 +381,6 @@ All intervention settings live in `team.yaml` under the `automation` and `workfl
 | `owned_task_interventions`            | bool        | `true`              | Enable owned-task interventions                                  |
 | `manager_dispatch_interventions`      | bool        | `true`              | Enable dispatch-gap interventions                                |
 | `architect_utilization_interventions` | bool        | `true`              | Enable utilization interventions                                 |
-| `replenishment_threshold`             | int or null | number of engineers | Unblocked todo threshold for replenishment                       |
 | `intervention_idle_grace_secs`        | int         | `60`                | Seconds a member must be idle before any intervention fires      |
 | `intervention_cooldown_secs`          | int         | `120`               | Seconds between repeated fires of the same intervention key      |
 | `utilization_recovery_interval_secs`  | int         | `1200`              | Seconds between utilization intervention fires (longer cooldown) |

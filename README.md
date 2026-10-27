@@ -140,7 +140,6 @@ agent: claude
 workflow_mode: hybrid
 use_shim: true
 use_sdk_mode: true
-auto_respawn_on_crash: true
 orchestrator_pane: true
 orchestrator_position: left
 external_senders: [slack-bridge]
@@ -178,7 +177,6 @@ automation:
   intervention_idle_grace_secs: 60
   intervention_cooldown_secs: 300
   utilization_recovery_interval_secs: 900
-  commit_before_reset: true
 
 workflow_policy:
   wip_limit_per_engineer: 1
@@ -276,7 +274,7 @@ batty grafana status
 
 ## Troubleshooting
 
-- **Claude or Codex stalls**: keep `auto_respawn_on_crash: true`; inspect
+- **Claude or Codex stalls**: inspect
   `.batty/daemon.log`, `batty status`, and `batty doctor` for restart evidence.
 - **Cargo lock contention**: use engineer worktrees with shared targets; avoid
   ad hoc `target/` directories inside each worktree.

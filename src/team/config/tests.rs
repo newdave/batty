@@ -22,6 +22,99 @@ roles:
 "#
 }
 
+#[test]
+fn unused_config_key_warnings_flags_each_deprecated_key() {
+    let yaml = r#"
+name: t
+auto_respawn_on_crash: true
+automation:
+  commit_before_reset: true
+  replenishment_threshold: 2
+  standups: true
+workflow_policy:
+  narration_threshold: 0.8
+  narration_nudge_max: 2
+  capability_overrides: {}
+  wip_limit_per_engineer: 1
+roles:
+  - name: architect
+    role_type: architect
+    owns: ["docs/**"]
+  - name: engineer
+    role_type: engineer
+"#;
+    let warnings = unused_config_key_warnings(yaml);
+    assert_eq!(warnings.len(), 7, "{warnings:?}");
+    for needle in [
+        "auto_respawn_on_crash",
+        "automation.commit_before_reset",
+        "automation.replenishment_threshold",
+        "workflow_policy.narration_threshold",
+        "workflow_policy.narration_nudge_max",
+        "workflow_policy.capability_overrides",
+        "roles[architect].owns",
+    ] {
+        assert!(warnings.iter().any(|w| w.contains(needle)), "{needle}");
+    }
+}
+
+#[test]
+fn unused_config_key_warnings_empty_for_clean_or_invalid_yaml() {
+    assert!(unused_config_key_warnings(minimal_yaml()).is_empty());
+    assert!(unused_config_key_warnings("name: [unclosed").is_empty());
+}
+
+#[test]
+fn deprecated_keys_still_load() {
+    let yaml = format!(
+        "{}\nauto_respawn_on_crash: true\nautomation:\n  commit_before_reset: false\n  replenishment_threshold: 3\n",
+        minimal_yaml()
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("team.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    TeamConfig::load(&path).unwrap();
+}
+
+#[test]
+fn load_existing_errors_when_config_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let error = TeamConfig::load_existing(&tmp.path().join("team.yaml"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("No team config found"), "{error}");
+    assert!(error.contains("batty init"), "{error}");
+}
+
+#[test]
+fn inspection_json_serializes_resolved_config_without_secrets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("team.yaml");
+    std::fs::write(
+        &path,
+        format!("{}\nautomation:\n  standups: false\n", minimal_yaml()),
+    )
+    .unwrap();
+    let config = TeamConfig::load_existing(&path).unwrap();
+    let json = config.to_inspection_json(&path, 5).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["config"]["name"], "test-team");
+    assert_eq!(value["members"], 5);
+    assert_eq!(value["config"]["roles"].as_array().unwrap().len(), 3);
+    assert_eq!(value["config"]["automation"]["standups"], false);
+    assert!(value["config"]["workflow_policy"].is_object());
+}
+
+#[test]
+fn inspection_json_omits_telegram_bot_token() {
+    let channel = ChannelConfig {
+        bot_token: Some("super-secret".to_string()),
+        ..serde_yaml::from_str::<ChannelConfig>("target: '1'\nprovider: x\n").unwrap()
+    };
+    let json = serde_json::to_string(&channel).unwrap();
+    assert!(!json.contains("super-secret"), "{json}");
+}
+
 fn git(repo: &std::path::Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .args([
@@ -471,7 +564,6 @@ fn team_cleanroom_template_parses_correctly() {
         serde_yaml::from_str(include_str!("../templates/team_cleanroom.yaml")).unwrap();
 
     assert!(config.use_shim);
-    assert!(config.auto_respawn_on_crash);
     assert!(config.workflow_policy.clean_room_mode);
     assert_eq!(
         config.workflow_policy.barrier_groups["analysis"],

@@ -56,7 +56,6 @@ This is controlled primarily by:
 
 - `board.auto_dispatch`
 - `workflow_policy.wip_limit_per_engineer`
-- `workflow_policy.capability_overrides`
 
 ## Intervention Matrix
 
@@ -317,7 +316,6 @@ The orchestrator-related `team.yaml` keys are spread across root config, board c
 | `workflow_policy.escalation_threshold_secs`    | Timeout threshold for escalation-sensitive workflow handling.  |
 | `workflow_policy.review_timeout_secs`          | Timeout threshold for overdue review work.                     |
 | `workflow_policy.auto_archive_done_after_secs` | Optional archival timeout for completed work.                  |
-| `workflow_policy.capability_overrides`         | Maps work types to roles/capabilities for dispatch decisions.  |
 
 ### Role-Level Keys
 

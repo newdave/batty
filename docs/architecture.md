@@ -105,10 +105,6 @@ automation:
 These switches let a project keep periodic timers enabled while turning specific
 reactive recovery paths on or off per team.
 
-In shim mode, `auto_respawn_on_crash` defaults to `true` and should usually stay
-enabled for unattended teams. Disable it only for debugging or when an operator
-intends to supervise crash recovery manually.
-
 When started with `--resume`, the daemon launches agents with session
 continuation flags when the saved launch identity still matches and the saved
 session is still available. If saved session state is stale or missing, that
@@ -221,7 +217,6 @@ When `use_sdk_mode: false`, the shim falls back to the original PTY-based runtim
 | --------------------------------- | ------- | ------- | ------------------------------------------------------------ |
 | `use_shim`                        | boolean | `true`  | Run each agent through a PTY-owning shim subprocess          |
 | `use_sdk_mode`                    | boolean | `true`  | Use structured JSON protocols instead of PTY screen-scraping |
-| `auto_respawn_on_crash`           | boolean | `true`  | Automatically respawn crashed agent shims                    |
 | `shim_health_check_interval_secs` | integer | `30`    | How often to send health pings to agent shims                |
 | `shim_health_timeout_secs`        | integer | `90`    | Max time without a pong before considering agent stalled     |
 | `shim_shutdown_timeout_secs`      | integer | `10`    | Grace period for graceful shutdown before SIGKILL            |

@@ -1,6 +1,5 @@
 name: my-research-project
 use_shim: true
-auto_respawn_on_crash: true
 orchestrator_pane: true
 orchestrator_position: left
 
@@ -43,7 +42,6 @@ roles:
     prompt: research_lead.md
     talks_to: [sub-lead]
     nudge_interval_secs: 1800
-    owns: ["docs/**", "planning/**"]
 
   - name: sub-lead
     role_type: manager

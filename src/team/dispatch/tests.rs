@@ -2355,3 +2355,24 @@ fn dispatch_queue_is_preserved_when_processing_errors() {
     let queued: Vec<u32> = daemon.dispatch_queue.iter().map(|e| e.task_id).collect();
     assert_eq!(queued, vec![101, 102]);
 }
+
+#[test]
+fn ignores_non_move_commands() {
+    assert!(validated_move(&["edit", "1", "--block", "x", "--dir", "/b"]).is_none());
+}
+
+#[test]
+fn rejects_illegal_transition_before_shelling_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tasks = tmp.path().join("tasks");
+    std::fs::create_dir_all(&tasks).unwrap();
+    std::fs::write(
+        tasks.join("001-t.md"),
+        "---\nid: 1\ntitle: T\nstatus: in-progress\npriority: medium\n---\nbody\n",
+    )
+    .unwrap();
+    let dir = tmp.path().to_string_lossy().into_owned();
+    let result = validated_move(&["move", "1", "done", "--claim", "eng-1", "--dir", &dir]).unwrap();
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("illegal task state transition"), "{error}");
+}

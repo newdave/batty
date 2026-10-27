@@ -9,7 +9,6 @@ use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 use tracing::info;
 
-use super::errors::BoardError;
 use super::test_results::TestResults;
 use crate::task::{
     Task, load_tasks_from_dir, parse_frontmatter_timestamp as parse_task_frontmatter_timestamp,
@@ -118,7 +117,7 @@ impl From<WorkflowFrontmatter> for WorkflowMetadata {
 pub(crate) fn read_workflow_metadata(task_path: &Path) -> Result<WorkflowMetadata> {
     let content = std::fs::read_to_string(task_path)
         .with_context(|| format!("failed to read {}", task_path.display()))?;
-    let (frontmatter, _) = split_task_frontmatter(&content)?;
+    let (frontmatter, _) = crate::task::frontmatter::split(&content)?;
     let parsed: WorkflowFrontmatter =
         serde_yaml::from_str(frontmatter).context("failed to parse task frontmatter")?;
     Ok(parsed.into())
@@ -214,7 +213,7 @@ pub(crate) fn compute_task_aging_from_tasks(
 pub(crate) fn write_workflow_metadata(task_path: &Path, metadata: &WorkflowMetadata) -> Result<()> {
     let content = std::fs::read_to_string(task_path)
         .with_context(|| format!("failed to read {}", task_path.display()))?;
-    let (frontmatter, body) = split_task_frontmatter(&content)?;
+    let (frontmatter, body) = crate::task::frontmatter::split(&content)?;
     let mut mapping: Mapping =
         serde_yaml::from_str(frontmatter).context("failed to parse task frontmatter")?;
 
@@ -273,7 +272,7 @@ struct TaskLifecycleFrontmatter {
 pub(crate) fn read_task_lifecycle_timestamps(task_path: &Path) -> Result<TaskLifecycleTimestamps> {
     let content = std::fs::read_to_string(task_path)
         .with_context(|| format!("failed to read {}", task_path.display()))?;
-    let (frontmatter, _) = split_task_frontmatter(&content)?;
+    let (frontmatter, _) = crate::task::frontmatter::split(&content)?;
     let parsed: TaskLifecycleFrontmatter =
         serde_yaml::from_str(frontmatter).context("failed to parse task frontmatter")?;
 
@@ -504,7 +503,7 @@ fn parse_frontmatter_timestamp(value: &str) -> Option<DateTime<FixedOffset>> {
 fn update_task_status(task_path: &Path, new_status: &str) -> Result<()> {
     let content = std::fs::read_to_string(task_path)
         .with_context(|| format!("failed to read {}", task_path.display()))?;
-    let (frontmatter, body) = split_task_frontmatter(&content)?;
+    let (frontmatter, body) = crate::task::frontmatter::split(&content)?;
     let mut mapping: Mapping =
         serde_yaml::from_str(frontmatter).context("failed to parse task frontmatter")?;
 
@@ -624,26 +623,6 @@ fn split_done_section(content: &str) -> (&str, Vec<&str>, &str) {
     (before_done, done_items, after_done)
 }
 
-fn split_task_frontmatter(content: &str) -> Result<(&str, &str)> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return Err(BoardError::InvalidFrontmatter {
-            detail: "no opening ---".to_string(),
-        }
-        .into());
-    }
-
-    let after_open = &trimmed[3..];
-    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
-    let close_pos = after_open
-        .find("\n---")
-        .context("task file missing closing --- for frontmatter")?;
-
-    let frontmatter = &after_open[..close_pos];
-    let body = &after_open[close_pos + 4..];
-    Ok((frontmatter, body.strip_prefix('\n').unwrap_or(body)))
-}
-
 #[derive(Debug, Clone, Copy)]
 enum AgeAnchor {
     Started,
@@ -653,7 +632,7 @@ enum AgeAnchor {
 fn task_age_from_frontmatter(task: &Task, now: DateTime<Utc>, anchor: AgeAnchor) -> Result<u64> {
     let content = std::fs::read_to_string(&task.source_path)
         .with_context(|| format!("failed to read {}", task.source_path.display()))?;
-    let (frontmatter, _) = split_task_frontmatter(&content)?;
+    let (frontmatter, _) = crate::task::frontmatter::split(&content)?;
     let parsed: TaskTimestampFrontmatter =
         serde_yaml::from_str(frontmatter).context("failed to parse task timestamp frontmatter")?;
 

@@ -765,44 +765,13 @@ fn main() -> Result<()> {
 
         Command::Config { json } => {
             let config_path = team::team_config_path(&root);
-            if !config_path.exists() {
-                println!("No team config found. Run `batty init` first.");
-                return Ok(());
-            }
-
-            let team_config = team::config::TeamConfig::load(&config_path)?;
+            let team_config = team::config::TeamConfig::load_existing(&config_path)?;
             if json {
-                // Serialize the config back to JSON for inspection
                 let members = team::hierarchy::resolve_hierarchy(&team_config)?;
-                let output = serde_json::json!({
-                    "config_path": config_path.display().to_string(),
-                    "team": team_config.name,
-                    "roles": team_config.roles.len(),
-                    "members": members.len(),
-                    "board": {
-                        "rotation_threshold": team_config.board.rotation_threshold,
-                        "auto_dispatch": team_config.board.auto_dispatch,
-                    },
-                    "standup": {
-                        "interval_secs": team_config.standup.interval_secs,
-                        "output_lines": team_config.standup.output_lines,
-                    },
-                    "automation": {
-                        "timeout_nudges": team_config.automation.timeout_nudges,
-                        "standups": team_config.automation.standups,
-                        "failure_pattern_detection": team_config.automation.failure_pattern_detection,
-                        "triage_interventions": team_config.automation.triage_interventions,
-                        "review_interventions": team_config.automation.review_interventions,
-                        "owned_task_interventions": team_config.automation.owned_task_interventions,
-                        "manager_dispatch_interventions": team_config.automation.manager_dispatch_interventions,
-                        "architect_utilization_interventions": team_config.automation.architect_utilization_interventions,
-                    },
-                    "workflow": {
-                        "mode": team_config.workflow_mode.as_str(),
-                        "orchestrator_pane": team_config.orchestrator_pane,
-                    },
-                });
-                println!("{}", serde_json::to_string_pretty(&output)?);
+                println!(
+                    "{}",
+                    team_config.to_inspection_json(&config_path, members.len())?
+                );
             } else {
                 println!("Config: {}", config_path.display());
                 println!("Team: {}", team_config.name);

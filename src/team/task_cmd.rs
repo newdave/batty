@@ -24,16 +24,6 @@ pub fn cmd_transition(board_dir: &Path, task_id: u32, target: &str) -> Result<()
     Ok(())
 }
 
-#[allow(dead_code)]
-pub(crate) fn transition_task(board_dir: &Path, task_id: u32, target: &str) -> Result<()> {
-    transition_task_with_attribution(
-        board_dir,
-        task_id,
-        target,
-        StatusTransitionAttribution::daemon("daemon.task.transition"),
-    )
-}
-
 pub(crate) fn transition_task_with_attribution(
     board_dir: &Path,
     task_id: u32,
@@ -59,26 +49,22 @@ pub(crate) fn transition_task_with_attribution(
     Ok(())
 }
 
-/// Orphan-rescue variant of `transition_task` that preserves `blocked` /
-/// `block_reason` / `blocked_on` frontmatter. Manual `batty move` via
-/// [`transition_task`] treats "target != Blocked" as "engineer is unblocking
-/// the task" and clears the block — which is correct for human intent but
-/// wrong for rescue: the engineer (or prior manager ruling) explicitly
-/// parked the task, and the rescue is just cleaning up a stuck claim, not
-/// revoking the block. Clearing here re-dispatches parked tasks on the next
-/// tick, burning engineer context on the same auto-refuse cascade.
-#[allow(dead_code)]
-pub(crate) fn transition_task_preserving_block(
+/// Move a task through `kanban-md move` (keeping its claim semantics and
+/// scheduling fields) after validating the transition against the workflow
+/// state machine, so daemon fallbacks cannot skip states.
+pub(crate) fn move_task_validated(
     board_dir: &Path,
     task_id: u32,
     target: &str,
+    claim: Option<&str>,
 ) -> Result<()> {
-    transition_task_preserving_block_with_attribution(
-        board_dir,
-        task_id,
-        target,
-        StatusTransitionAttribution::daemon("daemon.task.transition_preserving_block"),
-    )
+    let task_path = find_task_path(board_dir, task_id)?;
+    let task = Task::from_file(&task_path)?;
+    let current = parse_task_state(&task.status)?;
+    let target = parse_task_state(target)?;
+    can_transition(current, target).map_err(anyhow::Error::msg)?;
+    super::board_cmd::move_task(board_dir, &task_id.to_string(), state_name(target), claim)
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 pub(crate) fn transition_task_preserving_block_with_attribution(
@@ -106,16 +92,6 @@ pub(crate) fn transition_task_preserving_block_with_attribution(
 pub(crate) fn clear_blocked_fields(board_dir: &Path, task_id: u32) -> Result<()> {
     let task_path = find_task_path(board_dir, task_id)?;
     update_task_frontmatter(&task_path, clear_blocked)
-}
-
-#[allow(dead_code)]
-pub(crate) fn block_task_with_reason(board_dir: &Path, task_id: u32, reason: &str) -> Result<()> {
-    block_task_with_reason_and_attribution(
-        board_dir,
-        task_id,
-        reason,
-        StatusTransitionAttribution::daemon("daemon.task.block"),
-    )
 }
 
 pub(crate) fn block_task_with_reason_and_attribution(
@@ -293,16 +269,6 @@ pub(crate) fn mark_task_claim_warning(
         set_optional_string(mapping, "claim_warning_sent_at", Some(&now.to_rfc3339()));
     })?;
     Ok(())
-}
-
-#[allow(dead_code)]
-pub(crate) fn reclaim_task_claim(board_dir: &Path, task_id: u32, next_action: &str) -> Result<()> {
-    reclaim_task_claim_with_attribution(
-        board_dir,
-        task_id,
-        next_action,
-        StatusTransitionAttribution::daemon("daemon.task.reclaim_claim"),
-    )
 }
 
 pub(crate) fn reclaim_task_claim_with_attribution(
@@ -739,6 +705,16 @@ pub(crate) fn record_status_transition_activity(
         source: &attribution.source,
         actor_id: attribution.actor_id.as_deref(),
     };
+    let lock = super::board_write::BoardLock::acquire(board_dir)?;
+    let result = append_activity_entry(board_dir, &entry);
+    match (result, lock.release()) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+fn append_activity_entry(board_dir: &Path, entry: &StatusTransitionActivity<'_>) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -749,13 +725,33 @@ pub(crate) fn record_status_transition_activity(
                 board_dir.join("activity.jsonl").display()
             )
         })?;
-    serde_json::to_writer(&mut file, &entry).context("failed to serialize activity entry")?;
-    file.write_all(b"\n")
+    let mut line = serde_json::to_vec(entry).context("failed to serialize activity entry")?;
+    line.push(b'\n');
+    file.write_all(&line)
         .context("failed to write activity entry")?;
     Ok(())
 }
 
 pub(crate) fn annotate_latest_status_activity(
+    board_dir: &Path,
+    task_id: u32,
+    attribution: &StatusTransitionAttribution,
+) -> Result<()> {
+    if !board_dir.join("activity.jsonl").exists() {
+        return Ok(());
+    }
+    let lock = super::board_write::BoardLock::acquire(board_dir)?;
+    let result = annotate_latest_status_activity_locked(board_dir, task_id, attribution);
+    match (result, lock.release()) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+/// Caller must hold the board lock: the read-modify-write below would
+/// otherwise drop entries appended concurrently.
+fn annotate_latest_status_activity_locked(
     board_dir: &Path,
     task_id: u32,
     attribution: &StatusTransitionAttribution,
@@ -795,8 +791,7 @@ pub(crate) fn annotate_latest_status_activity(
                 .or_insert_with(|| serde_json::Value::String(actor_id.to_string()));
         }
         *line = serde_json::to_string(&value).context("failed to serialize activity entry")?;
-        std::fs::write(&activity_path, format!("{}\n", lines.join("\n")))
-            .with_context(|| format!("failed to write {}", activity_path.display()))?;
+        crate::atomic_file::write(&activity_path, format!("{}\n", lines.join("\n")))?;
         return Ok(());
     }
 
@@ -820,16 +815,7 @@ pub(crate) fn find_task_path(board_dir: &Path, task_id: u32) -> Result<PathBuf> 
 }
 
 fn parse_task_state(value: &str) -> Result<TaskState> {
-    match value.trim().replace('-', "_").as_str() {
-        "backlog" => Ok(TaskState::Backlog),
-        "todo" => Ok(TaskState::Todo),
-        "in_progress" => Ok(TaskState::InProgress),
-        "review" => Ok(TaskState::Review),
-        "blocked" => Ok(TaskState::Blocked),
-        "done" => Ok(TaskState::Done),
-        "archived" => Ok(TaskState::Archived),
-        other => bail!("unknown task state `{other}`"),
-    }
+    TaskState::parse(value).map_err(anyhow::Error::msg)
 }
 
 fn parse_review_disposition(value: &str) -> Result<ReviewDisposition> {
@@ -842,15 +828,7 @@ fn parse_review_disposition(value: &str) -> Result<ReviewDisposition> {
 }
 
 fn state_name(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Backlog => "backlog",
-        TaskState::Todo => "todo",
-        TaskState::InProgress => "in-progress",
-        TaskState::Review => "review",
-        TaskState::Blocked => "blocked",
-        TaskState::Done => "done",
-        TaskState::Archived => "archived",
-    }
+    state.board_name()
 }
 
 fn review_disposition_name(disposition: ReviewDisposition) -> &'static str {
@@ -867,45 +845,11 @@ where
 {
     let content = std::fs::read_to_string(task_path)
         .with_context(|| format!("failed to read {}", task_path.display()))?;
-    let (frontmatter, body) = split_task_frontmatter(&content)?;
-    let mut mapping: Mapping =
-        serde_yaml::from_str(frontmatter).context("failed to parse task frontmatter")?;
-    mutator(&mut mapping);
-
-    let mut rendered =
-        serde_yaml::to_string(&mapping).context("failed to serialize task frontmatter")?;
-    if let Some(stripped) = rendered.strip_prefix("---\n") {
-        rendered = stripped.to_string();
-    }
-
-    let mut updated = String::from("---\n");
-    updated.push_str(&rendered);
-    if !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str("---\n");
-    updated.push_str(body);
+    let updated = crate::task::frontmatter::update(&content, mutator)?;
 
     crate::team::board_write::write_task_file(task_path, &content, &updated)
         .with_context(|| format!("failed to write {}", task_path.display()))?;
     Ok(())
-}
-
-fn split_task_frontmatter(content: &str) -> Result<(&str, &str)> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        bail!("task file missing YAML frontmatter (no opening ---)");
-    }
-
-    let after_open = &trimmed[3..];
-    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
-    let close_pos = after_open
-        .find("\n---")
-        .context("task file missing closing --- for frontmatter")?;
-
-    let frontmatter = &after_open[..close_pos];
-    let body = &after_open[close_pos + 4..];
-    Ok((frontmatter, body.strip_prefix('\n').unwrap_or(body)))
 }
 
 fn set_status(mapping: &mut Mapping, state: TaskState) {
@@ -1209,6 +1153,43 @@ mod tests {
         assert_eq!(entry["actor"], "agent");
         assert_eq!(entry["actor_id"], "eng-1-2");
         assert_eq!(entry["source"], "kanban-md.move");
+    }
+
+    #[test]
+    fn concurrent_annotate_and_append_lose_no_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board_dir = tmp.path().to_path_buf();
+        std::fs::write(
+            board_dir.join("activity.jsonl"),
+            "{\"action\":\"move\",\"task_id\":42,\"detail\":\"todo -> in-progress\"}\n",
+        )
+        .unwrap();
+        let appender = {
+            let board_dir = board_dir.clone();
+            std::thread::spawn(move || {
+                for id in 100..130u32 {
+                    record_status_transition_activity(
+                        &board_dir,
+                        id,
+                        "todo",
+                        "in-progress",
+                        &StatusTransitionAttribution::daemon("test"),
+                    )
+                    .unwrap();
+                }
+            })
+        };
+        for _ in 0..30 {
+            annotate_latest_status_activity(
+                &board_dir,
+                42,
+                &StatusTransitionAttribution::daemon("test"),
+            )
+            .unwrap();
+        }
+        appender.join().unwrap();
+        let entries = read_activity_entries(&board_dir);
+        assert_eq!(entries.len(), 31);
     }
 
     #[test]

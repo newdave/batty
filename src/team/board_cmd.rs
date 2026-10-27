@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
@@ -52,81 +50,6 @@ pub fn move_task(
     // Restore scheduling fields that kanban-md stripped
     restore_scheduling_fields(board_dir, task_id, &saved_fields)?;
     Ok(())
-}
-
-pub fn edit_task(board_dir: &Path, task_id: &str, block_reason: &str) -> Result<(), BoardError> {
-    match run_board(board_dir, &["edit", task_id, "--block", block_reason]) {
-        Ok(_) => Ok(()),
-        Err(BoardError::Permanent { stderr, .. }) if claim_required_for_edit(&stderr) => {
-            let claim = show_task(board_dir, task_id)
-                .ok()
-                .and_then(|task| extract_claimed_by(&task));
-            if let Some(claim) = claim.as_deref() {
-                run_board(
-                    board_dir,
-                    &["edit", task_id, "--block", block_reason, "--claim", claim],
-                )
-                .map(|_| ())
-            } else {
-                Err(BoardError::ClaimOwnerUnknown {
-                    task_id: task_id.to_string(),
-                    stderr,
-                })
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub fn pick_task(
-    board_dir: &Path,
-    claim: &str,
-    move_to: &str,
-) -> Result<Option<String>, BoardError> {
-    // Save scheduling fields for all tasks before pick (we don't know which will be picked)
-    let saved = snapshot_scheduling_fields(board_dir);
-
-    match run_board(board_dir, &["pick", "--claim", claim, "--move", move_to]) {
-        Ok(output) => {
-            let task_id = extract_task_id(&output.stdout, "Picked and moved task #")
-                .or_else(|| extract_task_id(&output.stdout, "Picked task #"));
-            // Restore scheduling fields for the picked task
-            if let Some(ref id) = task_id {
-                if let Some(fields) = saved.get(id.as_str()) {
-                    restore_scheduling_fields(board_dir, id, fields)?;
-                }
-                if let Ok(parsed_id) = id.parse::<u32>() {
-                    let _ = super::task_cmd::annotate_latest_status_activity(
-                        board_dir,
-                        parsed_id,
-                        &super::task_cmd::StatusTransitionAttribution::current_cli(
-                            "kanban-md.pick",
-                        ),
-                    );
-                }
-            }
-            Ok(task_id)
-        }
-        Err(BoardError::Permanent { stderr, .. }) if is_empty_pick(&stderr) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-pub fn show_task(board_dir: &Path, task_id: &str) -> Result<String, BoardError> {
-    run_board(board_dir, &["show", task_id])
-        .map(|output| output.stdout)
-        .map_err(|error| match error {
-            BoardError::Permanent { stderr, .. }
-                if stderr
-                    .to_ascii_lowercase()
-                    .contains(&format!("task #{task_id} not found")) =>
-            {
-                BoardError::TaskNotFound {
-                    id: task_id.to_string(),
-                }
-            }
-            other => other,
-        })
 }
 
 pub fn list_tasks(board_dir: &Path, status: Option<&str>) -> Result<String, BoardError> {
@@ -281,39 +204,6 @@ fn restore_scheduling_fields(
     Ok(())
 }
 
-/// Snapshot scheduling fields for all tasks in the board (used before pick).
-fn snapshot_scheduling_fields(
-    board_dir: &Path,
-) -> std::collections::HashMap<String, Vec<(String, String)>> {
-    let tasks_dir = board_dir.join("tasks");
-    let mut map = std::collections::HashMap::new();
-    let entries = match std::fs::read_dir(&tasks_dir) {
-        Ok(e) => e,
-        Err(_) => return map,
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".md") {
-            continue;
-        }
-        // Extract task ID from filename prefix (e.g., "001-title.md" → "1")
-        if let Some(id_str) = name_str.split('-').next() {
-            if let Ok(id) = id_str.parse::<u32>() {
-                let content = match std::fs::read_to_string(entry.path()) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let fields = parse_scheduling_fields_from_frontmatter(&content);
-                if !fields.is_empty() {
-                    map.insert(id.to_string(), fields);
-                }
-            }
-        }
-    }
-    map
-}
-
 /// Find a task file by numeric ID in the board's tasks directory.
 fn find_task_file(board_dir: &Path, task_id: &str) -> Option<std::path::PathBuf> {
     let id: u32 = task_id.parse().ok()?;
@@ -433,36 +323,9 @@ fn is_transient_stderr(stderr: &str) -> bool {
         || lower.contains("try again")
 }
 
-fn is_empty_pick(stderr: &str) -> bool {
-    stderr
-        .to_ascii_lowercase()
-        .contains("no unblocked, unclaimed tasks found")
-}
-
-fn claim_required_for_edit(stderr: &str) -> bool {
-    stderr.to_ascii_lowercase().contains("is claimed by")
-}
-
 fn contains_word(text: &str, needle: &str) -> bool {
     text.split(|ch: char| !ch.is_ascii_alphabetic())
         .any(|word| word == needle)
-}
-
-fn extract_claimed_by(task_output: &str) -> Option<String> {
-    for line in task_output.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("Claimed by:") {
-            let claim = rest.trim();
-            if claim == "--" {
-                return None;
-            }
-            let claim = claim.split(" (").next().unwrap_or(claim).trim();
-            if !claim.is_empty() {
-                return Some(claim.to_string());
-            }
-        }
-    }
-    None
 }
 
 fn extract_task_id(text: &str, prefix: &str) -> Option<String> {
@@ -549,19 +412,6 @@ mod tests {
             ),
             stderr: output.stderr,
         })
-    }
-
-    fn pick_task_real(
-        board_dir: &Path,
-        claim: &str,
-        move_to: &str,
-    ) -> Result<Option<String>, BoardError> {
-        match run_real_board(board_dir, &["pick", "--claim", claim, "--move", move_to]) {
-            Ok(output) => Ok(extract_task_id(&output.stdout, "Picked and moved task #")
-                .or_else(|| extract_task_id(&output.stdout, "Picked task #"))),
-            Err(BoardError::Permanent { stderr, .. }) if is_empty_pick(&stderr) => Ok(None),
-            Err(error) => Err(error),
-        }
     }
 
     fn with_live_board_cwd<T>(action: impl FnOnce() -> T) -> T {
@@ -720,13 +570,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_claim_owner_from_show_output() {
-        let output = "Claimed by:  eng-1-2 (since 2026-03-21 01:11)";
-        assert_eq!(extract_claimed_by(output).as_deref(), Some("eng-1-2"));
-        assert_eq!(extract_claimed_by("Claimed by:  --"), None);
-    }
-
-    #[test]
     fn init_create_show_round_trip_when_kanban_available() {
         if !real_kanban_available() {
             return;
@@ -762,8 +605,11 @@ mod tests {
                 .stdout;
             assert!(list.contains("Test task"));
 
-            let picked = pick_task_real(&board_dir, "eng-1-2", "in-progress").unwrap();
-            assert_eq!(picked.as_deref(), Some("1"));
+            run_real_board(
+                &board_dir,
+                &["move", &task_id, "in-progress", "--claim", "eng-1-2"],
+            )
+            .unwrap();
 
             run_real_board(
                 &board_dir,
@@ -789,22 +635,6 @@ mod tests {
             .unwrap();
             let task_file = fs::read_to_string(board_dir.join("tasks/001-test-task.md")).unwrap();
             assert!(task_file.contains("block_reason: needs manager input"));
-        });
-    }
-
-    #[test]
-    fn pick_task_returns_none_when_board_is_empty() {
-        if !real_kanban_available() {
-            return;
-        }
-
-        with_live_board_cwd(|| {
-            let temp = TempDir::new().unwrap();
-            let board_dir = temp.path().join("board");
-            run_real_board(&board_dir, &["init"]).unwrap();
-
-            let picked = pick_task_real(&board_dir, "eng-1-2", "in-progress").unwrap();
-            assert_eq!(picked, None);
         });
     }
 
@@ -870,57 +700,9 @@ mod tests {
 
     // --- is_empty_pick ---
 
-    #[test]
-    fn empty_pick_detected() {
-        assert!(is_empty_pick("No unblocked, unclaimed tasks found in todo"));
-    }
-
-    #[test]
-    fn non_empty_pick_error_not_detected() {
-        assert!(!is_empty_pick("task #5 is already claimed"));
-    }
-
     // --- claim_required_for_edit ---
 
-    #[test]
-    fn claim_required_detected_in_stderr() {
-        assert!(claim_required_for_edit("task #5 is claimed by eng-1-2"));
-    }
-
-    #[test]
-    fn claim_not_required_for_unrelated_error() {
-        assert!(!claim_required_for_edit("unknown field \"foo\""));
-    }
-
     // --- extract_claimed_by edge cases ---
-
-    #[test]
-    fn extract_claimed_by_empty_input() {
-        assert_eq!(extract_claimed_by(""), None);
-    }
-
-    #[test]
-    fn extract_claimed_by_no_claimed_line() {
-        assert_eq!(extract_claimed_by("Status: todo\nPriority: high"), None);
-    }
-
-    #[test]
-    fn extract_claimed_by_empty_claim_value() {
-        assert_eq!(extract_claimed_by("Claimed by:  "), None);
-    }
-
-    #[test]
-    fn extract_claimed_by_without_timestamp() {
-        assert_eq!(
-            extract_claimed_by("Claimed by:  manager-1"),
-            Some("manager-1".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_claimed_by_dash_dash_is_none() {
-        assert_eq!(extract_claimed_by("Claimed by: --"), None);
-    }
 
     // --- contains_word ---
 
@@ -1129,34 +911,6 @@ mod tests {
             &[("cron_schedule".to_string(), "0 9 * * *".to_string())],
         )
         .unwrap();
-    }
-
-    #[test]
-    fn snapshot_scheduling_fields_indexes_by_task_id() {
-        let temp = TempDir::new().unwrap();
-        let tasks_dir = temp.path().join("tasks");
-        fs::create_dir_all(&tasks_dir).unwrap();
-
-        fs::write(
-            tasks_dir.join("010-scheduled.md"),
-            "---\nid: 10\ntitle: scheduled\nstatus: todo\nscheduled_for: 2026-05-01T00:00:00Z\n---\n\nBody.\n",
-        ).unwrap();
-        fs::write(
-            tasks_dir.join("011-plain.md"),
-            "---\nid: 11\ntitle: plain\nstatus: todo\n---\n\nBody.\n",
-        )
-        .unwrap();
-        fs::write(
-            tasks_dir.join("012-cron.md"),
-            "---\nid: 12\ntitle: cron\nstatus: todo\ncron_schedule: 30 8 * * *\n---\n\nBody.\n",
-        )
-        .unwrap();
-
-        let snapshot = snapshot_scheduling_fields(temp.path());
-        assert_eq!(snapshot.len(), 2);
-        assert!(snapshot.contains_key("10"));
-        assert!(snapshot.contains_key("12"));
-        assert!(!snapshot.contains_key("11"));
     }
 
     #[test]

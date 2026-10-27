@@ -128,9 +128,7 @@ pub fn init_team_with_overrides(
     };
     let mut yaml_content = yaml_content.to_string();
     if let Some(name) = project_name {
-        if let Some(end) = yaml_content.find('\n') {
-            yaml_content = format!("name: {name}{}", &yaml_content[end..]);
-        }
+        yaml_content = set_template_name(&yaml_content, name)?;
     }
     if let Some(agent_name) = agent {
         yaml_content = override_template_backend(&yaml_content, agent_name)?;
@@ -138,8 +136,7 @@ pub fn init_team_with_overrides(
     if let Some(ov) = overrides {
         yaml_content = apply_init_overrides(&yaml_content, ov);
     }
-    std::fs::write(&yaml_path, &yaml_content)
-        .with_context(|| format!("failed to write {}", yaml_path.display()))?;
+    crate::atomic_file::write(&yaml_path, &yaml_content)?;
     created.push(yaml_path);
 
     // Install prompt .md files matching the template's roles
@@ -224,8 +221,7 @@ pub fn init_team_with_overrides(
     for (name, content) in prompt_files {
         let path = config_dir.join(name);
         if force || !path.exists() {
-            std::fs::write(&path, content)
-                .with_context(|| format!("failed to write {}", path.display()))?;
+            crate::atomic_file::write(&path, content)?;
             created.push(path);
         }
     }
@@ -247,8 +243,7 @@ pub fn init_team_with_overrides(
     for (name, content) in directive_files {
         let path = config_dir.join(name);
         if force || !path.exists() {
-            std::fs::write(&path, content)
-                .with_context(|| format!("failed to write {}", path.display()))?;
+            crate::atomic_file::write(&path, content)?;
             created.push(path);
         }
     }
@@ -269,7 +264,7 @@ pub fn init_team_with_overrides(
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                warn!("kanban-md init failed: {stderr}; falling back to plain kanban.md");
+                warn_kanban_md_unavailable(&format!("`kanban-md init` failed: {}", stderr.trim()));
                 let kanban_path = config_dir.join("kanban.md");
                 std::fs::write(
                     &kanban_path,
@@ -278,7 +273,7 @@ pub fn init_team_with_overrides(
                 created.push(kanban_path);
             }
             Err(_) => {
-                warn!("kanban-md not found; falling back to plain kanban.md");
+                warn_kanban_md_unavailable("`kanban-md` was not found on PATH");
                 let kanban_path = config_dir.join("kanban.md");
                 std::fs::write(
                     &kanban_path,
@@ -291,6 +286,43 @@ pub fn init_team_with_overrides(
 
     info!(dir = %config_dir.display(), files = created.len(), "scaffolded team config");
     Ok(created)
+}
+
+/// Loudly tell the user the board could not be initialised: `batty start` and
+/// `batty board` hard-require kanban-md, so the plain kanban.md fallback alone
+/// does not make the project runnable.
+fn warn_kanban_md_unavailable(reason: &str) {
+    warn!("{reason}; falling back to plain kanban.md");
+    eprintln!("warning: {reason}; the task board was NOT initialised.");
+    eprintln!(
+        "warning: `batty start` and `batty board` require kanban-md. Install it \
+         (e.g. `go install github.com/antopolskiy/kanban-md/cmd/kanban-md@latest`, \
+         see https://github.com/antopolskiy/kanban-md), then run `kanban-md init --dir \
+         .batty/team_config/board`."
+    );
+}
+
+/// Replace the leading `name:` line of a template with `name`, serialised as a
+/// YAML scalar so `:`, `#` or leading `-[{` cannot produce invalid YAML.
+fn set_template_name(yaml: &str, name: &str) -> Result<String> {
+    if name.trim().is_empty() {
+        bail!("project name must not be empty");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("project name must not contain control characters");
+    }
+    let scalar = serde_yaml::to_string(name).context("failed to serialize project name")?;
+    let scalar = scalar.trim_end();
+    let Some(end) = yaml.find('\n') else {
+        return Ok(yaml.to_string());
+    };
+    let updated = format!("name: {scalar}{}", &yaml[end..]);
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&updated)
+        .with_context(|| format!("project name {name:?} produced invalid team config YAML"))?;
+    if parsed.get("name").and_then(serde_yaml::Value::as_str) != Some(name) {
+        bail!("project name {name:?} did not round-trip through team config YAML");
+    }
+    Ok(updated)
 }
 
 fn scaffold_cleanroom_assets(
@@ -384,8 +416,7 @@ fn write_scaffold_file(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        std::fs::write(path, content)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        crate::atomic_file::write(path, content)?;
         created.push(path.to_path_buf());
     }
     Ok(())
@@ -943,8 +974,6 @@ mod tests {
         // kanban-md creates board/ directory; fallback creates kanban.md
         let config = team_config_dir(tmp.path());
         assert!(config.join("board").is_dir() || config.join("kanban.md").exists());
-        let team_yaml = std::fs::read_to_string(team_config_path(tmp.path())).unwrap();
-        assert!(team_yaml.contains("auto_respawn_on_crash: false"));
     }
 
     #[test]
@@ -954,6 +983,35 @@ mod tests {
         let result = init_team(tmp.path(), "simple", None, None, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn set_template_name_quotes_special_names() {
+        let template = "name: old\nroles: []\n";
+        for name in [
+            "a: b", "x # y", "-lead", "[x]", "{x}", "plain", "'q'", "123", "true",
+        ] {
+            let out = set_template_name(template, name).unwrap();
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+            assert_eq!(parsed["name"].as_str(), Some(name), "name {name:?}");
+            assert!(parsed["roles"].is_sequence());
+        }
+    }
+
+    #[test]
+    fn set_template_name_rejects_empty_and_control_chars() {
+        assert!(set_template_name("name: old\n", "  ").is_err());
+        assert!(set_template_name("name: old\n", "a\nb: c").is_err());
+    }
+
+    #[test]
+    fn init_team_with_special_project_name_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_team(tmp.path(), "solo", Some("my: proj # x"), None, false).unwrap();
+        let yaml =
+            std::fs::read_to_string(team_config_dir(tmp.path()).join(TEAM_CONFIG_FILE)).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed["name"].as_str(), Some("my: proj # x"));
     }
 
     #[test]

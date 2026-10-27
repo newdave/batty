@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::super::DEFAULT_EVENT_LOG_MAX_BYTES;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TeamConfig {
     pub name: String,
     /// Repository trunk branch used for git comparisons, worktree resets, and
@@ -170,7 +170,7 @@ impl<'de> Deserialize<'de> for TeamConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrafanaConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -203,13 +203,13 @@ pub fn default_trunk_branch() -> String {
     "main".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CostConfig {
     #[serde(default)]
     pub models: HashMap<String, ModelPricing>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
     pub input_usd_per_mtok: f64,
     #[serde(default)]
@@ -227,7 +227,7 @@ pub struct ModelPricing {
     pub reasoning_output_usd_per_mtok: Option<f64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowPolicy {
     /// Optional bounded native runtime validation after startup.
     #[serde(default = "default_startup_validation_timeout")]
@@ -327,7 +327,7 @@ pub struct WorkflowPolicy {
     pub tiered_inboxes: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimTtlPolicy {
     #[serde(default = "default_claim_ttl_default_secs")]
     pub default_secs: u64,
@@ -356,7 +356,7 @@ impl Default for ClaimTtlPolicy {
 /// Per-priority override for review timeout thresholds.
 /// When a task's priority matches a key in `review_timeout_overrides`,
 /// these values replace the global defaults.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewTimeoutOverride {
     /// Nudge threshold override (seconds). Falls back to global if absent.
     pub review_nudge_threshold_secs: Option<u64>,
@@ -364,7 +364,7 @@ pub struct ReviewTimeoutOverride {
     pub review_timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ZeroDiffRecovery {
     Restart,
@@ -425,14 +425,14 @@ impl Default for WorkflowPolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocationStrategy {
     RoundRobin,
     Scored,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocationPolicy {
     #[serde(default = "default_allocation_strategy")]
     pub strategy: AllocationStrategy,
@@ -461,7 +461,7 @@ impl Default for AllocationPolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainSmokePolicy {
     #[serde(default = "default_main_smoke_enabled")]
     pub enabled: bool,
@@ -489,7 +489,7 @@ impl Default for MainSmokePolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationPolicy {
     #[serde(default = "default_verification_max_iterations")]
     pub max_iterations: u32,
@@ -628,7 +628,7 @@ fn default_sensitive_paths() -> Vec<String> {
     ]
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoMergePolicy {
     #[serde(default = "default_auto_merge_enabled")]
     pub enabled: bool,
@@ -697,7 +697,7 @@ impl Default for AutoMergePolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowMode {
     #[default]
@@ -707,7 +707,7 @@ pub enum WorkflowMode {
     BoardFirst,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchestratorPosition {
     #[default]
@@ -744,7 +744,7 @@ impl WorkflowMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardConfig {
     /// Optional explicit task-tag to role routing. Conflicting mapped tags are held.
     #[serde(default)]
@@ -810,7 +810,7 @@ impl Default for BoardConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StandupConfig {
     #[serde(default = "default_standup_interval")]
     pub interval_secs: u64,
@@ -827,7 +827,7 @@ impl Default for StandupConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomationConfig {
     #[serde(default = "default_enabled")]
     pub timeout_nudges: bool,
@@ -883,12 +883,12 @@ impl Default for AutomationConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     pub zones: Vec<ZoneDef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneDef {
     /// Ordered exact member or role selectors; empty retains legacy name matching.
     #[serde(default)]
@@ -899,12 +899,12 @@ pub struct ZoneDef {
     pub split: Option<SplitDef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitDef {
     pub horizontal: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleDef {
     pub name: String,
     pub role_type: RoleType,
@@ -991,7 +991,7 @@ impl Default for RoleDef {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoleInstanceOverride {
     #[serde(default)]
     pub agent: Option<String>,
@@ -1010,7 +1010,7 @@ pub struct RoleInstanceOverride {
     pub provider_overlay: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeAuthMode {
     #[default]
@@ -1019,7 +1019,7 @@ pub enum ClaudeAuthMode {
     Custom,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChannelConfig {
     #[serde(default)]
     pub target: String,
@@ -1028,6 +1028,7 @@ pub struct ChannelConfig {
     /// Telegram bot token for native API (optional; falls back to provider CLI).
     /// Can also be set via `BATTY_TELEGRAM_BOT_TOKEN` env var.
     #[serde(default)]
+    #[serde(skip_serializing)]
     pub bot_token: Option<String>,
     /// User IDs allowed to send messages (access control).
     ///
@@ -1068,7 +1069,7 @@ where
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RoleType {
     User,
@@ -1224,7 +1225,7 @@ fn default_disk_hygiene_log_rotation_hours() -> u64 {
 }
 
 /// Configuration for automated disk hygiene during long runs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskHygieneConfig {
     /// Enable automated disk hygiene checks.
     #[serde(default = "default_enabled")]

@@ -1,4 +1,6 @@
-use anyhow::{Context, Result, bail};
+pub(crate) mod frontmatter;
+
+use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Deserializer};
 use serde_yaml::{Mapping, Value};
@@ -198,7 +200,7 @@ impl Task {
 
     /// Parse a kanban-md task from its string content.
     pub fn parse(content: &str) -> Result<Self> {
-        let (frontmatter_str, body) = split_frontmatter(content)?;
+        let (frontmatter_str, body) = frontmatter::split(content)?;
 
         let fm: Frontmatter =
             serde_yaml::from_str(frontmatter_str).context("failed to parse YAML frontmatter")?;
@@ -243,28 +245,6 @@ impl Task {
             source_path: PathBuf::new(),
         })
     }
-}
-
-/// Split content into YAML frontmatter and Markdown body.
-fn split_frontmatter(content: &str) -> Result<(&str, &str)> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        bail!("task file missing YAML frontmatter (no opening ---)");
-    }
-
-    // Skip the opening "---\n"
-    let after_open = &trimmed[3..];
-    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
-
-    let close_pos = after_open
-        .find("\n---")
-        .context("task file missing closing --- for frontmatter")?;
-
-    let frontmatter = &after_open[..close_pos];
-    let body = &after_open[close_pos + 4..]; // skip "\n---"
-    let body = body.strip_prefix('\n').unwrap_or(body);
-
-    Ok((frontmatter, body))
 }
 
 fn yaml_key(key: &str) -> Value {
@@ -363,23 +343,6 @@ fn normalize_timestamp_frontmatter_fields(mapping: &mut Mapping) -> Vec<String> 
     repaired
 }
 
-fn render_frontmatter_content(mapping: &Mapping, body: &str) -> Result<String> {
-    let mut rendered =
-        serde_yaml::to_string(mapping).context("failed to serialize task frontmatter")?;
-    if let Some(stripped) = rendered.strip_prefix("---\n") {
-        rendered = stripped.to_string();
-    }
-
-    let mut updated = String::from("---\n");
-    updated.push_str(&rendered);
-    if !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str("---\n");
-    updated.push_str(body);
-    Ok(updated)
-}
-
 fn extract_declared_files_frontmatter(task_path: &Path) -> Result<Vec<String>> {
     if task_path.as_os_str().is_empty() || !task_path.exists() {
         return Ok(Vec::new());
@@ -387,7 +350,7 @@ fn extract_declared_files_frontmatter(task_path: &Path) -> Result<Vec<String>> {
 
     let content = std::fs::read_to_string(task_path)
         .with_context(|| format!("failed to read task file: {}", task_path.display()))?;
-    let (frontmatter, _) = split_frontmatter(&content)?;
+    let (frontmatter, _) = frontmatter::split(&content)?;
     let parsed: TaskFilesFrontmatter =
         serde_yaml::from_str(frontmatter).context("failed to parse task file frontmatter")?;
     Ok(parsed.files)
@@ -446,7 +409,7 @@ pub(crate) fn task_file_hints(task: &Task) -> Result<Vec<String>> {
 fn normalize_task_frontmatter_content(
     content: &str,
 ) -> Result<Option<(String, TaskFrontmatterCompatRepair)>> {
-    let (frontmatter, body) = split_frontmatter(content)?;
+    let (frontmatter, body) = frontmatter::split(content)?;
     let mut mapping: Mapping =
         serde_yaml::from_str(frontmatter).context("failed to parse YAML frontmatter")?;
     let mut repaired_fields = normalize_timestamp_frontmatter_fields(&mut mapping);
@@ -518,7 +481,7 @@ fn normalize_task_frontmatter_content(
     repaired_fields.sort();
     repaired_fields.dedup();
 
-    let updated = render_frontmatter_content(&mapping, body)?;
+    let updated = frontmatter::render(&mapping, body)?;
     Ok(Some((
         updated,
         TaskFrontmatterCompatRepair {

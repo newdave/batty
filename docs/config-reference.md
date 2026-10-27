@@ -13,7 +13,6 @@ trunk_branch: main
 workflow_mode: hybrid
 use_shim: true
 use_sdk_mode: true
-auto_respawn_on_crash: true
 orchestrator_pane: true
 orchestrator_position: left
 automation_sender: human
@@ -50,11 +49,9 @@ automation:
   owned_task_interventions: true
   manager_dispatch_interventions: true
   architect_utilization_interventions: true
-  replenishment_threshold: 1
   intervention_idle_grace_secs: 60
   intervention_cooldown_secs: 300
   utilization_recovery_interval_secs: 900
-  commit_before_reset: true
 
 workflow_policy:
   clean_room_mode: false
@@ -72,8 +69,6 @@ workflow_policy:
   max_stall_restarts: 5
   health_check_interval_secs: 30
   planning_cycle_cooldown_secs: 300
-  narration_threshold: 0.8
-  narration_nudge_max: 2
   narration_detection_enabled: true
   narration_threshold_polls: 5
   context_pressure_threshold: 100
@@ -164,7 +159,6 @@ roles:
 | `workflow_mode`                                   | `legacy`, `hybrid`, or `workflow_first`                    |
 | `use_shim`                                        | Run members through the managed shim runtime               |
 | `use_sdk_mode`                                    | Prefer structured protocols over PTY parsing               |
-| `auto_respawn_on_crash`                           | Restart crashed agents automatically                       |
 | `orchestrator_pane` / `orchestrator_position`     | Show the orchestration surface in tmux                     |
 | `external_senders`                                | Allow non-team sources to message roles                    |
 | `shim_*` and `pending_queue_max_age_secs`         | Runtime health and delivery tuning                         |
@@ -205,7 +199,6 @@ These toggles turn runtime recovery systems on or off.
 - `manager_dispatch_interventions` and `architect_utilization_interventions`
   keep the hierarchy moving when reports go idle
 - `failure_pattern_detection` feeds long-running reliability analysis
-- `commit_before_reset` protects engineer changes before daemon-driven resets
 
 ## `workflow_policy`
 
@@ -247,7 +240,7 @@ Common fields:
 
 ## Recommended Defaults For Unattended Teams
 
-- Keep `use_shim: true`, `use_sdk_mode: true`, and `auto_respawn_on_crash: true`.
+- Keep `use_shim: true` and `use_sdk_mode: true`.
 - Leave `board.auto_dispatch: true` and `workflow_policy.auto_merge.enabled: true`.
 - Enable `use_worktrees: true` for engineers.
 - Use `workflow_mode: hybrid` unless you are intentionally forcing workflow-first behavior.
