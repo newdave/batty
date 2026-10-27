@@ -2,6 +2,8 @@
 
 Date: 2026-10-27
 
+> **Status (second comparison run, fork `96d2dc8`):** all tasks have landed: streams A–F, T-G1 and T-G2. 24 of the 29 issues are fixed and 5 are partly fixed. The second run found new issues N1–N17. See [fork-comparison.md](fork-comparison.md#new-issues-found-in-this-run) for their status and the next steps.
+
 This plan fixes the 27 issues in [fork-comparison.md](fork-comparison.md#issues-caused-regressions-and-risks). The `#n` references are that document's issue numbers.
 
 ## How to use this plan
