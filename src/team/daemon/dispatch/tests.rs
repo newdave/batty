@@ -2366,18 +2366,57 @@ fn ignores_non_move_commands() {
     assert!(validated_move(&["edit", "1", "--block", "x", "--dir", "/b"]).is_none());
 }
 
-#[test]
-fn rejects_illegal_transition_before_shelling_out() {
-    let tmp = tempfile::tempdir().unwrap();
-    let tasks = tmp.path().join("tasks");
+fn write_move_task(tmp: &std::path::Path, status: &str) -> String {
+    let tasks = tmp.join("tasks");
     std::fs::create_dir_all(&tasks).unwrap();
     std::fs::write(
         tasks.join("001-t.md"),
-        "---\nid: 1\ntitle: T\nstatus: in-progress\npriority: medium\n---\nbody\n",
+        format!("---\nid: 1\ntitle: T\nstatus: {status}\npriority: medium\n---\nbody\n"),
     )
     .unwrap();
-    let dir = tmp.path().to_string_lossy().into_owned();
-    let result = validated_move(&["move", "1", "done", "--claim", "eng-1", "--dir", &dir]).unwrap();
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains("illegal task state transition"), "{error}");
+    tmp.to_string_lossy().into_owned()
+}
+
+#[test]
+fn rejects_illegal_transition_before_shelling_out() {
+    for status in ["todo", "backlog", "blocked"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_move_task(tmp.path(), status);
+        let result =
+            validated_move(&["move", "1", "done", "--claim", "eng-1", "--dir", &dir]).unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("illegal task state transition"), "{error}");
+        let task = crate::task::Task::from_file(&tmp.path().join("tasks/001-t.md")).unwrap();
+        assert_eq!(task.status, status, "refused move must not change status");
+    }
+}
+
+#[test]
+fn landed_merge_moves_in_progress_task_to_done_via_review() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = write_move_task(tmp.path(), "in-progress");
+    validated_move(&["move", "1", "done", "--claim", "eng-1", "--dir", &dir])
+        .unwrap()
+        .unwrap();
+    let task = crate::task::Task::from_file(&tmp.path().join("tasks/001-t.md")).unwrap();
+    assert_eq!(task.status, "done");
+    let activity = std::fs::read_to_string(tmp.path().join("activity.jsonl")).unwrap();
+    let entries: Vec<serde_json::Value> = activity
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let details: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["detail"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        details,
+        vec!["in-progress -> review", "review -> done"],
+        "{activity}"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["source"] == "daemon.merge")
+    );
 }

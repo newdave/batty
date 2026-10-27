@@ -29,6 +29,11 @@ fn template_has_per_role_backends(template: cli::InitTemplate) -> bool {
     matches!(template, cli::InitTemplate::Mixed)
 }
 
+/// Merging to trunk unattended is opt-in: the prompt defaults to "no".
+fn auto_merge_prompt_default() -> bool {
+    false
+}
+
 fn collect_init_overrides() -> Result<team::InitOverrides> {
     let mut ov = team::InitOverrides::default();
 
@@ -87,7 +92,7 @@ fn collect_init_overrides() -> Result<team::InitOverrides> {
     println!("── Auto-Merge ───────────────────────────────────────────");
     println!("When enabled, completed engineer branches that pass tests and");
     println!("score above a confidence threshold are merged automatically.");
-    ov.auto_merge_enabled = Some(confirm("Enable auto-merge?", true)?);
+    ov.auto_merge_enabled = Some(confirm("Enable auto-merge?", auto_merge_prompt_default())?);
 
     println!();
     println!("── Timing (seconds) ─────────────────────────────────────");
@@ -387,6 +392,11 @@ pub(super) fn run_worktree(root: &Path, health: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_merge_prompt_defaults_to_no() {
+        assert!(!auto_merge_prompt_default());
+    }
 
     #[test]
     fn only_mixed_template_keeps_per_role_backends() {

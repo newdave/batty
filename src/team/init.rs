@@ -10,46 +10,264 @@ use super::{
     team_config_path, team_events_path,
 };
 
-fn override_template_backend(yaml: &str, agent: &str) -> Result<String> {
+fn canonical_backend(agent: &str) -> String {
+    crate::agent::adapter_from_name(agent)
+        .map(|adapter| adapter.name().to_string())
+        .unwrap_or_else(|| agent.into())
+}
+
+fn backend_supports_effort(agent: &str) -> bool {
+    matches!(
+        canonical_backend(agent).as_str(),
+        "claude-code" | "codex-cli"
+    )
+}
+
+/// Claude model pins are aliases (`sonnet`, `opus`, `haiku`) or `claude-*` ids;
+/// they only make sense on a Claude backend. Any other model name is assumed
+/// valid for every non-Claude backend.
+fn model_valid_for_backend(model: &str, agent: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let claude_model = model.starts_with("claude")
+        || ["sonnet", "opus", "haiku"]
+            .iter()
+            .any(|alias| model.starts_with(alias));
+    claude_model == (canonical_backend(agent) == "claude-code")
+}
+
+/// Leading-space count of `line`.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// Split `key: value  # comment` into `(key, value, comment)` where `comment`
+/// keeps its leading whitespace and `#`.
+fn split_key_line(line: &str) -> Option<(&str, &str, &str)> {
+    let body = line.trim_start_matches(' ');
+    let body = body.strip_prefix("- ").map(str::trim_start).unwrap_or(body);
+    let (key, rest) = body.split_once(':')?;
+    if key.is_empty() || key.contains([' ', '#', '"', '\'']) {
+        return None;
+    }
+    let (value, comment) = match rest.find(" #") {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, ""),
+    };
+    Some((key, value.trim(), comment))
+}
+
+#[derive(Default)]
+struct MappingLines {
+    /// Line index of the `agent:`, `model:` and `effort:` keys, if present.
+    agent: Option<usize>,
+    model: Option<usize>,
+    effort: Option<usize>,
+    /// Index into the group list of the enclosing mapping.
+    parent: Option<usize>,
+}
+
+/// Point the roles of `yaml` at `agent` with targeted line edits, so comments,
+/// ordering and quoting elsewhere in the template survive.
+///
+/// `model` and `effort` pins are kept unless they are invalid for the new
+/// backend (a Claude model alias on another backend, or an effort on a backend
+/// that has no effort control). Returns the new text and one human-readable
+/// note per role whose pins changed.
+fn override_template_backend_with_notes(yaml: &str, agent: &str) -> Result<(String, Vec<String>)> {
     use serde_yaml::Value;
-    fn canonical(agent: &str) -> String {
-        crate::agent::adapter_from_name(agent)
-            .map(|adapter| adapter.name().to_string())
-            .unwrap_or_else(|| agent.into())
-    }
-    fn replace_role(role: &mut serde_yaml::Mapping, agent: &str, inherited_change: bool) {
-        let changed = role
-            .get("agent")
-            .and_then(Value::as_str)
-            .map(|old| canonical(old) != canonical(agent))
-            .unwrap_or(inherited_change);
-        role.insert(Value::String("agent".into()), Value::String(agent.into()));
-        if changed {
-            role.remove("model");
-            role.remove("effort");
+
+    let had_trailing_newline = yaml.ends_with('\n');
+    let mut lines: Vec<Option<String>> = yaml.lines().map(|l| Some(l.to_string())).collect();
+    let agent_scalar = serde_yaml::to_string(agent).context("failed to serialize agent name")?;
+    let agent_scalar = agent_scalar.trim_end().to_string();
+
+    let Some(roles_at) = lines.iter().position(|l| l.as_deref() == Some("roles:")) else {
+        return Ok((yaml.to_string(), Vec::new()));
+    };
+    let roles_end = lines[roles_at + 1..]
+        .iter()
+        .position(|l| {
+            l.as_deref()
+                .is_some_and(|l| !l.trim().is_empty() && !l.starts_with([' ', '#', '-']))
+        })
+        .map_or(lines.len(), |p| roles_at + 1 + p);
+
+    // Role items start at the smallest indent carrying a `- ` marker.
+    let item_indent = lines[roles_at + 1..roles_end]
+        .iter()
+        .flatten()
+        .filter(|l| l.trim_start().starts_with("- "))
+        .map(|l| indent_of(l))
+        .min();
+    let Some(item_indent) = item_indent else {
+        return Ok((yaml.to_string(), Vec::new()));
+    };
+    let mut starts: Vec<usize> = (roles_at + 1..roles_end)
+        .filter(|&i| {
+            lines[i]
+                .as_deref()
+                .is_some_and(|l| indent_of(l) == item_indent && l.trim_start().starts_with("- "))
+        })
+        .collect();
+    starts.push(roles_end);
+
+    let mut notes = Vec::new();
+    let mut inserts: Vec<(usize, String)> = Vec::new();
+    for pair in starts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        let first = lines[start].clone().unwrap_or_default();
+        if first.contains('{') && first.trim_start().starts_with("- {") {
+            bail!("flow-style role at line {} is not supported", start + 1);
         }
-        if let Some(overrides) = role
-            .get_mut("instance_overrides")
-            .and_then(Value::as_mapping_mut)
-        {
-            for value in overrides.values_mut() {
-                if let Some(instance) = value.as_mapping_mut() {
-                    replace_role(instance, agent, changed);
+        let key_indent = item_indent + 2;
+
+        // Collect mappings (the role itself and nested instance overrides).
+        let mut role_name = String::new();
+        let mut is_user = false;
+        let mut groups: Vec<MappingLines> = vec![MappingLines::default()];
+        // (indent, group index) of the mappings currently open.
+        let mut stack: Vec<(usize, usize)> = vec![(key_indent, 0)];
+        let mut pending_child = false;
+        for (i, line) in lines.iter().enumerate().take(end).skip(start) {
+            let Some(line) = line.as_deref() else {
+                continue;
+            };
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let indent = if i == start {
+                key_indent
+            } else {
+                indent_of(line)
+            };
+            while stack.last().is_some_and(|&(ind, _)| ind > indent) {
+                stack.pop();
+            }
+            if pending_child && stack.last().is_none_or(|&(ind, _)| indent > ind) {
+                let parent = stack.last().map(|&(_, g)| g);
+                groups.push(MappingLines {
+                    parent,
+                    ..Default::default()
+                });
+                stack.push((indent, groups.len() - 1));
+            }
+            pending_child = false;
+            let Some(&(_, group)) = stack.last() else {
+                continue;
+            };
+            let Some((key, value, _)) = split_key_line(line) else {
+                continue;
+            };
+            if group == 0 {
+                match key {
+                    "name" => role_name = value.trim_matches(['"', '\'']).to_string(),
+                    "role_type" => is_user = value == "user",
+                    _ => {}
+                }
+            }
+            match key {
+                "agent" => groups[group].agent = Some(i),
+                "model" => groups[group].model = Some(i),
+                "effort" => groups[group].effort = Some(i),
+                _ => {}
+            }
+            if value.is_empty() {
+                pending_child = true;
+            }
+        }
+        if is_user {
+            continue;
+        }
+
+        let mut changed_flags: Vec<bool> = Vec::with_capacity(groups.len());
+        let mut role_notes = Vec::new();
+        for (idx, group) in groups.iter().enumerate() {
+            let inherited = group.parent.map(|p| changed_flags[p]).unwrap_or(true);
+            let old_agent = group.agent.and_then(|i| {
+                split_key_line(lines[i].as_deref()?)
+                    .map(|(_, v, _)| v.trim_matches(['"', '\'']).to_string())
+            });
+            let changed = old_agent
+                .as_deref()
+                .map(|old| canonical_backend(old) != canonical_backend(agent))
+                .unwrap_or(inherited);
+            changed_flags.push(changed);
+
+            if let Some(i) = group.agent {
+                let old = lines[i].clone().unwrap_or_default();
+                if let Some((_, _, comment)) = split_key_line(&old) {
+                    lines[i] = Some(format!(
+                        "{}agent: {agent_scalar}{comment}",
+                        " ".repeat(indent_of(&old))
+                    ));
+                }
+            } else if idx == 0 {
+                inserts.push((
+                    start + 1,
+                    format!("{}agent: {agent_scalar}", " ".repeat(key_indent)),
+                ));
+            }
+            if !changed {
+                continue;
+            }
+            for (slot, kind) in [(group.model, "model"), (group.effort, "effort")] {
+                let Some(i) = slot else { continue };
+                let Some((_, value, _)) = lines[i].as_deref().and_then(split_key_line) else {
+                    continue;
+                };
+                let value = value.trim_matches(['"', '\'']).to_string();
+                let valid = if kind == "model" {
+                    model_valid_for_backend(&value, agent)
+                } else {
+                    backend_supports_effort(agent)
+                };
+                if valid {
+                    role_notes.push(format!("kept {kind} '{value}'"));
+                } else {
+                    lines[i] = None;
+                    role_notes.push(format!("dropped {kind} '{value}' (not valid for {agent})"));
                 }
             }
         }
+        if !role_notes.is_empty() {
+            notes.push(format!("role '{role_name}': {}", role_notes.join(", ")));
+        }
     }
-    let mut config: Value = serde_yaml::from_str(yaml)?;
-    if let Some(roles) = config.get_mut("roles").and_then(Value::as_sequence_mut) {
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + inserts.len());
+    for (i, line) in lines.into_iter().enumerate() {
+        for (at, text) in &inserts {
+            if *at == i {
+                out.push(text.clone());
+            }
+        }
+        if let Some(line) = line {
+            out.push(line);
+        }
+    }
+    let mut updated = out.join("\n");
+    if had_trailing_newline {
+        updated.push('\n');
+    }
+
+    // Safety net: every non-user role must now name the requested backend.
+    let parsed: Value = serde_yaml::from_str(&updated)
+        .context("backend override produced invalid team config YAML")?;
+    if let Some(roles) = parsed.get("roles").and_then(Value::as_sequence) {
         for role in roles {
-            if let Some(role) = role.as_mapping_mut() {
-                if role.get("role_type").and_then(Value::as_str) != Some("user") {
-                    replace_role(role, agent, true);
-                }
+            let is_user = role.get("role_type").and_then(Value::as_str) == Some("user");
+            let backend = role.get("agent").and_then(Value::as_str);
+            if !is_user && backend.map(canonical_backend) != Some(canonical_backend(agent)) {
+                bail!("backend override did not apply to every role; check the template layout");
             }
         }
     }
-    Ok(serde_yaml::to_string(&config)?)
+    Ok((updated, notes))
+}
+
+#[cfg(test)]
+fn override_template_backend(yaml: &str, agent: &str) -> Result<String> {
+    override_template_backend_with_notes(yaml, agent).map(|(yaml, _)| yaml)
 }
 
 /// Returns `~/.batty/templates/`.
@@ -131,7 +349,11 @@ pub fn init_team_with_overrides(
         yaml_content = set_template_name(&yaml_content, name)?;
     }
     if let Some(agent_name) = agent {
-        yaml_content = override_template_backend(&yaml_content, agent_name)?;
+        let (updated, notes) = override_template_backend_with_notes(&yaml_content, agent_name)?;
+        yaml_content = updated;
+        for note in notes {
+            println!("note: --agent {agent_name}: {note}");
+        }
     }
     if let Some(ov) = overrides {
         yaml_content = apply_init_overrides(&yaml_content, ov);
@@ -920,6 +1142,20 @@ mod tests {
     };
 
     #[test]
+    fn default_templates_do_not_enable_auto_merge() {
+        for template in ["simple", "mixed"] {
+            let tmp = tempfile::tempdir().unwrap();
+            init_team(tmp.path(), template, None, None, false).unwrap();
+            let config =
+                crate::team::config::TeamConfig::load(&team_config_path(tmp.path())).unwrap();
+            assert!(
+                !config.workflow_policy.auto_merge.enabled,
+                "{template} template must not enable auto-merge"
+            );
+        }
+    }
+
+    #[test]
     fn init_team_creates_scaffolding() {
         let tmp = tempfile::tempdir().unwrap();
         let created = init_team(tmp.path(), "simple", None, None, false).unwrap();
@@ -955,6 +1191,134 @@ mod tests {
         let result = init_team(tmp.path(), "simple", None, None, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    const COMMENTED: &str = "\
+# top comment
+name: old # keep
+roles:
+  # the human
+  - name: human
+    role_type: user
+  # lead
+  - name: architect   # inline
+    role_type: architect
+    agent: claude # backend
+    model: sonnet
+    effort: high
+    instances: 1
+    instance_overrides:
+      architect-1:
+        model: opus
+        effort: low
+  - name: engineer
+    role_type: engineer
+    agent: claude
+    model: 'haiku'
+    instances: 2
+";
+
+    #[test]
+    fn backend_override_preserves_comments_and_untouched_lines() {
+        let (out, _) = override_template_backend_with_notes(COMMENTED, "codex").unwrap();
+        let before: Vec<&str> = COMMENTED.lines().collect();
+        let after: Vec<&str> = out.lines().collect();
+        // Every comment survives.
+        for line in &before {
+            if line.trim_start().starts_with('#') {
+                assert!(after.contains(line), "lost comment line {line:?}");
+            }
+        }
+        assert!(out.contains("agent: codex # backend"), "{out}");
+        assert!(out.contains("name: old # keep"));
+        // Only agent/model lines differ: effort pins stay (codex supports effort).
+        for line in &before {
+            if !after.contains(line) {
+                let t = line.trim_start();
+                assert!(
+                    t.starts_with("agent:") || t.starts_with("model:"),
+                    "unexpected change to {line:?}"
+                );
+            }
+        }
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        let roles = parsed["roles"].as_sequence().unwrap();
+        assert!(roles[0].get("agent").is_none(), "user role untouched");
+        assert_eq!(roles[1]["agent"].as_str(), Some("codex"));
+        assert_eq!(roles[1]["effort"].as_str(), Some("high"));
+        assert!(roles[1].get("model").is_none());
+        assert_eq!(
+            roles[1]["instance_overrides"]["architect-1"]["effort"].as_str(),
+            Some("low")
+        );
+        assert!(
+            roles[1]["instance_overrides"]["architect-1"]
+                .get("model")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn backend_override_reports_dropped_pins_and_keeps_valid_ones() {
+        let (out, notes) = override_template_backend_with_notes(COMMENTED, "kiro").unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        // kiro has no effort control, and claude models do not apply.
+        assert!(parsed["roles"][1].get("effort").is_none());
+        assert!(parsed["roles"][1].get("model").is_none());
+        let joined = notes.join("\n");
+        assert!(joined.contains("dropped effort 'high'"), "{joined}");
+        assert!(joined.contains("dropped model 'sonnet'"), "{joined}");
+        assert!(joined.contains("role 'engineer'"), "{joined}");
+
+        // Switching to another Claude spelling is not a backend change.
+        let (same, notes) = override_template_backend_with_notes(COMMENTED, "claude-code").unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(same.contains("model: sonnet") && same.contains("effort: high"));
+
+        // A non-Claude model pin survives a switch to codex; a Claude one does not.
+        let yaml =
+            "roles:\n  - name: e\n    role_type: engineer\n    agent: kiro\n    model: gpt-5\n";
+        let (out, _) = override_template_backend_with_notes(yaml, "codex").unwrap();
+        assert!(out.contains("model: gpt-5"), "{out}");
+        let (out, _) = override_template_backend_with_notes(&out, "claude").unwrap();
+        assert!(!out.contains("model:"), "{out}");
+    }
+
+    #[test]
+    fn init_agent_and_name_only_edit_expected_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_team_with_overrides(
+            tmp.path(),
+            "simple",
+            Some("a: b # c"),
+            Some("codex"),
+            false,
+            None,
+        )
+        .unwrap();
+        let out = std::fs::read_to_string(team_config_path(tmp.path())).unwrap();
+        let template = include_str!("templates/team_simple.yaml");
+        let after: Vec<&str> = out.lines().collect();
+        let mut changed = 0;
+        for line in template.lines() {
+            if !after.contains(&line) {
+                let t = line.trim_start();
+                assert!(
+                    t.starts_with("name: my-project")
+                        || t.starts_with("agent:")
+                        || t.starts_with("model:"),
+                    "unexpected change to {line:?}"
+                );
+                changed += 1;
+            }
+        }
+        assert!(changed > 0);
+        assert_eq!(
+            serde_yaml::from_str::<serde_yaml::Value>(&out).unwrap()["name"].as_str(),
+            Some("a: b # c")
+        );
+        // Effort pins from the template survive the switch.
+        assert!(out.contains("effort: medium"));
     }
 
     #[test]

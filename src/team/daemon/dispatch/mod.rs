@@ -791,7 +791,8 @@ impl TeamDaemon {
 
 /// If `args` is a `kanban-md move <id> <status> [--claim <who>] [--dir <board>]`
 /// invocation, run it through the workflow state machine instead of shelling
-/// out blindly. Returns `None` for other commands.
+/// out blindly. Returns `None` for other commands. Moves to `done` are treated
+/// as "the merge landed" (see `move_landed_task_to_done`).
 fn validated_move(args: &[&str]) -> Option<anyhow::Result<()>> {
     if args.first() != Some(&"move") {
         return None;
@@ -805,8 +806,18 @@ fn validated_move(args: &[&str]) -> Option<anyhow::Result<()>> {
     let task_id = args.get(1)?.parse::<u32>().ok()?;
     let status = args.get(2).filter(|status| !status.starts_with("--"))?;
     let board_dir = value_of("--dir")?;
+    let board_dir = std::path::Path::new(board_dir);
+    // Every daemon `move ... done` follows a merge that already landed, so an
+    // in-progress task is stepped through review instead of being refused.
+    if *status == "done" {
+        return Some(crate::team::task_cmd::move_landed_task_to_done(
+            board_dir,
+            task_id,
+            value_of("--claim"),
+        ));
+    }
     Some(crate::team::task_cmd::move_task_validated(
-        std::path::Path::new(board_dir),
+        board_dir,
         task_id,
         status,
         value_of("--claim"),

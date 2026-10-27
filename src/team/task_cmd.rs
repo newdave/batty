@@ -67,6 +67,28 @@ pub(crate) fn move_task_validated(
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
+/// Move a task whose merge has already landed on trunk to `done`.
+///
+/// A task still `in-progress` cannot legally reach `done`, so it is stepped
+/// through `review` first, recording both transitions with the
+/// `daemon.merge` attribution. Every other state goes through
+/// [`move_task_validated`], which refuses states that cannot reach `done`
+/// (`backlog`, `todo`, `blocked`).
+pub(crate) fn move_landed_task_to_done(
+    board_dir: &Path,
+    task_id: u32,
+    claim: Option<&str>,
+) -> Result<()> {
+    let task_path = find_task_path(board_dir, task_id)?;
+    let task = Task::from_file(&task_path)?;
+    if parse_task_state(&task.status)? == TaskState::InProgress {
+        let attribution = || StatusTransitionAttribution::daemon("daemon.merge");
+        transition_task_with_attribution(board_dir, task_id, "review", attribution())?;
+        return transition_task_with_attribution(board_dir, task_id, "done", attribution());
+    }
+    move_task_validated(board_dir, task_id, "done", claim)
+}
+
 pub(crate) fn transition_task_preserving_block_with_attribution(
     board_dir: &Path,
     task_id: u32,
