@@ -1,10 +1,12 @@
 //! Daemon-owned merge state: the serial merge queue (including any in-flight
-//! merge) and per-task auto-merge overrides set at runtime.
+//! merge), deferred multi-repo direct merges, and per-task auto-merge
+//! overrides set at runtime.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use super::MergeQueue;
+use crate::team::merge::DeferredDirectMerge;
 
 #[derive(Default)]
 pub(in crate::team) struct MergeState {
@@ -12,6 +14,8 @@ pub(in crate::team) struct MergeState {
     pub(in crate::team) queue: MergeQueue,
     /// In-memory auto-merge overrides; take priority over the on-disk file.
     pub(in crate::team) overrides: HashMap<u32, bool>,
+    /// Multi-repo direct merges waiting for the merge lock; retried each tick.
+    pub(in crate::team) deferred_direct: Vec<DeferredDirectMerge>,
 }
 
 impl MergeState {

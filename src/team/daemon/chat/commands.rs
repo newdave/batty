@@ -230,6 +230,12 @@ impl TeamDaemon {
         if task.status != "review" {
             bail!("Task #{task_id} is not in review.");
         }
+        if self.is_multi_repo {
+            bail!("Merging from chat is not supported for multi-repo projects.");
+        }
+        if self.merge.queue.contains_task(task_id) {
+            return Ok(format!("Task #{task_id} is already queued for merge."));
+        }
         if self
             .verification
             .background_tests
@@ -271,7 +277,7 @@ impl TeamDaemon {
                 job,
             });
         Ok(format!(
-            "Running verification for Task #{task_id} from {engineer}; will merge and reply when it passes."
+            "Running verification for Task #{task_id} from {engineer}; will queue the merge and reply when it passes."
         ))
     }
 
@@ -294,19 +300,24 @@ impl TeamDaemon {
                 duration_ms,
                 "chat merge verification finished"
             );
-            let reply = match self.finish_chat_merge(job.task_id, &job.engineer, result) {
-                Ok(reply) => reply,
-                Err(error) => format!("Command failed: {error}"),
-            };
+            let reply =
+                match self.finish_chat_merge(job.task_id, &job.engineer, result, duration_ms) {
+                    Ok(reply) => reply,
+                    Err(error) => format!("Command failed: {error}"),
+                };
             self.integrations.send_chat_reply(&job.reply_to, &reply);
         }
     }
 
+    /// Hand a chat merge whose verification passed to the merge queue, which
+    /// takes the merge lock without blocking, serializes it with other
+    /// merges, and runs post-merge verification.
     fn finish_chat_merge(
         &mut self,
         task_id: u32,
         engineer: &str,
         result: Result<crate::team::test_results::TestRunOutput>,
+        test_duration_ms: u64,
     ) -> Result<String> {
         let test_run = result?;
         if !test_run.passed {
@@ -333,23 +344,26 @@ impl TeamDaemon {
             bail!("Task #{task_id} changed while its tests ran; merge skipped.");
         }
 
-        crate::team::messaging::merge_worktree(&self.config.project_root, engineer)?;
-        crate::team::task_cmd::cmd_review_structured_with_attribution(
-            &board_dir,
-            task_id,
-            "approve",
-            None,
-            "telegram",
-            crate::team::task_cmd::StatusTransitionAttribution::bridge("bridge.telegram.merge"),
-        )?;
         let test_summary = test_run.results.summary.clone().unwrap_or_else(|| {
             format!(
                 "{} passed, {} failed",
                 test_run.results.passed, test_run.results.failed
             )
         });
+        if self.merge.queue.contains_task(task_id) {
+            return Ok(format!(
+                "Task #{task_id} is already queued for merge. Tests: {test_summary}"
+            ));
+        }
+        crate::team::merge::enqueue_reviewed_merge(
+            self,
+            task_id,
+            engineer,
+            test_run.results,
+            test_duration_ms,
+        )?;
         Ok(format!(
-            "Merged Task #{task_id} from {engineer}. Tests: {test_summary}"
+            "Queued Task #{task_id} from {engineer} for merge. Tests: {test_summary}"
         ))
     }
 

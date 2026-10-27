@@ -1442,6 +1442,78 @@ mod tests {
     }
 
     #[test]
+    fn telegram_merge_command_routes_through_merge_queue() {
+        use crate::team::test_support::{
+            engineer_member, git_stdout, init_git_repo, manager_member,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "chat-merge-queue");
+        let team_config_dir = repo.join(".batty").join("team_config");
+        let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+        crate::team::task_loop::setup_engineer_worktree(
+            &repo,
+            &worktree_dir,
+            "eng-1",
+            &team_config_dir,
+        )
+        .unwrap();
+        std::fs::write(worktree_dir.join("note.txt"), "chat merge\n").unwrap();
+        git_ok(&worktree_dir, &["add", "note.txt"]);
+        git_ok(&worktree_dir, &["commit", "-m", "chat work"]);
+        write_board_task(
+            &repo,
+            "041-chat-merge.md",
+            "---\nid: 41\ntitle: chat-merge\nstatus: review\npriority: high\nclaimed_by: eng-1\nclass: standard\n---\n",
+        );
+        let mut daemon = crate::team::test_helpers::make_test_daemon(
+            &repo,
+            vec![
+                manager_member("manager", None),
+                engineer_member("eng-1", Some("manager"), true),
+            ],
+        );
+        daemon.config.team_config.workflow_policy.test_command = Some("true".to_string());
+        // The engineer has moved on; merging the review task must not touch
+        // the current assignment.
+        daemon.set_active_task_for_test("eng-1", 99);
+        let main_before = git_stdout(&repo, &["rev-parse", "main"]);
+
+        daemon
+            .execute_telegram_command(TelegramCommand::Merge { task_id: 41 })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !daemon.verification.background_tests.chat_merges.is_empty() {
+            assert!(Instant::now() < deadline, "chat merge never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            daemon.poll_chat_merge_jobs();
+        }
+
+        // Verified, but only queued: nothing landed on main yet.
+        assert_eq!(git_stdout(&repo, &["rev-parse", "main"]), main_before);
+        assert!(daemon.merge.queue.contains_task(41));
+        let queued = daemon.merge.queue.snapshot().queue;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].origin, crate::team::daemon::MergeOrigin::Chat);
+        let again = daemon
+            .execute_telegram_command(TelegramCommand::Merge { task_id: 41 })
+            .unwrap();
+        assert!(again.contains("already queued"), "{again}");
+
+        daemon.process_merge_queue_for_test().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("note.txt")).unwrap(),
+            "chat merge\n"
+        );
+        let task = crate::task::Task::from_file(
+            &crate::team::task_cmd::find_task_path(&daemon.board_dir(), 41).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task.status, "done");
+        assert_eq!(daemon.active_task_id("eng-1"), Some(99));
+    }
+
+    #[test]
     fn pause_and_resume_commands_toggle_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = TeamDaemon::new(daemon_config_with_roles(tmp.path(), Vec::new())).unwrap();

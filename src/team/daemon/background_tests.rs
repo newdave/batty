@@ -52,6 +52,12 @@ pub(super) struct ChatMergeJob {
 }
 
 impl BackgroundTests {
+    /// True while the main smoke check runs on the root checkout; nothing
+    /// may merge into trunk underneath it.
+    pub(crate) fn main_smoke_running(&self) -> bool {
+        self.main_smoke.is_some()
+    }
+
     /// Verifications that must survive a restart: those in flight plus those
     /// still waiting to be re-run.
     pub(crate) fn pending_verifications(&self) -> HashMap<String, u32> {

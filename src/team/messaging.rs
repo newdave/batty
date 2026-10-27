@@ -515,9 +515,21 @@ pub fn purge_inbox(
 }
 
 /// Merge an engineer's worktree branch.
+///
+/// Never waits: fails when another merge holds the merge lock, or when the
+/// daemon's merge queue has a merge still in post-merge verification
+/// (landing more commits on trunk would make its automatic revert unsafe).
 pub fn merge_worktree(project_root: &Path, engineer: &str) -> Result<()> {
     let engineer = resolve_member_name(project_root, engineer)?;
     let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
+    if let Some(task_id) = crate::team::daemon::persisted_in_flight_merge(project_root) {
+        bail!(
+            "merge queue is still verifying the merge of task #{task_id} on {trunk_branch}; retry once it finishes"
+        );
+    }
+    let Some(_lock) = merge::MergeLock::try_acquire(project_root)? else {
+        bail!("another merge holds the merge lock; retry shortly");
+    };
     match merge::merge_engineer_branch_into_trunk(project_root, &engineer, &trunk_branch)? {
         merge::MergeOutcome::Success(_) => Ok(()),
         merge::MergeOutcome::RebaseConflict(stderr) => {
@@ -654,6 +666,16 @@ mod tests {
         assert_eq!(pending[0].to, "eng-1-1");
         assert_eq!(pending[0].body, "fix bug");
         assert_eq!(pending[0].msg_type, inbox::MessageType::Assign);
+    }
+
+    #[test]
+    fn merge_worktree_fails_fast_when_merge_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _held = merge::MergeLock::try_acquire(tmp.path()).unwrap().unwrap();
+
+        let error = merge_worktree(tmp.path(), "eng-1").unwrap_err();
+
+        assert!(error.to_string().contains("merge lock"), "{error:#}");
     }
 
     // #713 regression — `batty assign` must fail fast (bail, not deliver)

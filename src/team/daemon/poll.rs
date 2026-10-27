@@ -333,6 +333,9 @@ impl TeamDaemon {
             daemon.poll_background_tests()
         });
         self.run_recoverable_step("process_merge_queue", |daemon| daemon.process_merge_queue());
+        self.run_recoverable_step("poll_deferred_direct_merges", |daemon| {
+            crate::team::merge::poll_deferred_direct_merges(daemon)
+        });
         self.run_recoverable_step("maybe_refresh_stale_daemon_binary", |daemon| {
             daemon.maybe_refresh_stale_daemon_binary()
         });

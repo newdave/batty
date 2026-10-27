@@ -2,8 +2,9 @@
 //!
 //! This module owns the completion path after an engineer reports a task as
 //! done in a worktree-based flow. It validates that the branch contains real
-//! work, runs the configured test gate, serializes merges with a lock, and
-//! either lands the branch on `main` or escalates conflicts and failures back
+//! work, runs the configured test gate, serializes merges through the daemon
+//! merge queue (or a non-blocking lock for multi-repo projects), and either
+//! lands the branch on `main` or escalates conflicts and failures back
 //! through the daemon.
 //!
 //! The daemon calls into this module so the poll loop can stay focused on
@@ -17,8 +18,11 @@ mod operations;
 
 #[cfg(test)]
 pub(crate) use completion::handle_engineer_completion_and_wait;
-pub(crate) use completion::record_merge_test_timing;
-pub(crate) use completion::{VerificationJob, handle_engineer_completion, poll_verification_jobs};
+pub(crate) use completion::{
+    DeferredDirectMerge, VerificationJob, append_merge_learning, enqueue_reviewed_merge,
+    handle_engineer_completion, poll_deferred_direct_merges, poll_verification_jobs,
+    record_merge_test_timing,
+};
 pub(crate) use lock::{
     MergeLock, MergeMode, MergeOutcome, infer_merge_mode_from_failure, merge_lock_is_held,
 };

@@ -51,6 +51,23 @@ pub(crate) struct MergeRequest {
     pub confidence: f64,
     pub files_changed: usize,
     pub lines_changed: usize,
+    /// Which path queued the request.
+    #[serde(default)]
+    pub origin: MergeOrigin,
+}
+
+/// The path that queued a merge request. It selects the merge telemetry and
+/// how the board is updated once the merge lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MergeOrigin {
+    /// Auto-merge policy accepted the completion.
+    #[default]
+    AutoMerge,
+    /// Auto-merge is disabled: a verified completion merges without review.
+    DirectCompletion,
+    /// A chat (Telegram/Discord) `merge` command approved a review task.
+    Chat,
 }
 
 #[allow(dead_code)]
@@ -212,9 +229,32 @@ impl MergeQueue {
         self.active.as_ref().map(|request| request.task_id)
     }
 
+    /// True if `task_id` is queued, being merged, or being verified.
+    pub(crate) fn contains_task(&self, task_id: u32) -> bool {
+        self.queue
+            .iter()
+            .chain(self.active.iter())
+            .chain(self.in_flight.iter().map(|merge| &merge.request))
+            .any(|request| request.task_id == task_id)
+    }
+
     /// True while a landed merge is waiting for post-merge verification.
     pub(crate) fn is_verifying(&self) -> bool {
         self.in_flight.is_some()
+    }
+
+    /// Test helper: pretend `request` landed and awaits post-merge
+    /// verification.
+    #[cfg(test)]
+    pub(crate) fn mark_in_flight_for_test(&mut self, request: MergeRequest) {
+        self.in_flight = Some(InFlightMerge {
+            request,
+            pre_merge_head: String::new(),
+            post_merge_head: None,
+            mode: MergeMode::DirectRoot,
+            merge_reason: None,
+            verify: PostMergeVerify::Pending,
+        });
     }
 
     #[cfg(test)]
@@ -595,6 +635,22 @@ impl TeamDaemon {
         }
     }
 
+    /// Clear the engineer's assignment once a queued merge is finished with
+    /// — unless the engineer has moved on to another task (a chat merge of
+    /// an older review task must not clobber the current assignment).
+    fn release_engineer_from_merged_task(&mut self, request: &MergeRequest) {
+        if self.engineer_still_owns(request) {
+            self.clear_active_task(&request.engineer);
+            self.set_member_idle(&request.engineer);
+        }
+    }
+
+    /// False when the engineer's active task is a different task.
+    fn engineer_still_owns(&self, request: &MergeRequest) -> bool {
+        self.active_task_id(&request.engineer)
+            .is_none_or(|task_id| task_id == request.task_id)
+    }
+
     pub(crate) fn enqueue_merge_request(&mut self, request: MergeRequest) {
         info!(
             task_id = request.task_id,
@@ -867,13 +923,16 @@ impl TeamDaemon {
             ),
         }
 
-        let board_update_ok = move_task_to_done(
-            self,
-            &board_dir,
-            &board_dir_str,
-            request,
-            manager_name.as_deref(),
-        );
+        let board_update_ok = match request.origin {
+            MergeOrigin::Chat => approve_chat_merge(self, &board_dir, &board_dir_str, request),
+            MergeOrigin::AutoMerge | MergeOrigin::DirectCompletion => move_task_to_done(
+                self,
+                &board_dir,
+                &board_dir_str,
+                request,
+                manager_name.as_deref(),
+            ),
+        };
         if let Err(error) = crate::team::merge::record_merge_test_timing(
             self,
             request.task_id,
@@ -888,14 +947,26 @@ impl TeamDaemon {
                 "failed to record merge test timing"
             );
         }
-        self.record_task_auto_merged(
-            &request.engineer,
-            request.task_id,
-            request.confidence,
-            request.files_changed,
-            request.lines_changed,
-            mode,
-        );
+        match request.origin {
+            MergeOrigin::AutoMerge => self.record_task_auto_merged(
+                &request.engineer,
+                request.task_id,
+                request.confidence,
+                request.files_changed,
+                request.lines_changed,
+                mode,
+            ),
+            MergeOrigin::DirectCompletion => {
+                self.record_task_manual_merged(request.task_id, mode);
+                crate::team::merge::append_merge_learning(
+                    self,
+                    &board_dir,
+                    request.task_id,
+                    &request.engineer,
+                );
+            }
+            MergeOrigin::Chat => self.record_task_manual_merged(request.task_id, mode),
+        }
         self.check_binary_freshness_after_merge();
 
         if let Some(ref manager_name) = manager_name {
@@ -958,9 +1029,14 @@ impl TeamDaemon {
             ));
         }
 
-        self.clear_active_task(&request.engineer);
+        let owns_task = self.engineer_still_owns(request);
+        if owns_task {
+            self.clear_active_task(&request.engineer);
+        }
         self.record_task_completed(&request.engineer, Some(request.task_id));
-        self.set_member_idle(&request.engineer);
+        if owns_task {
+            self.set_member_idle(&request.engineer);
+        }
         info!(
             engineer = request.engineer,
             task_id = request.task_id,
@@ -1171,8 +1247,7 @@ impl TeamDaemon {
                             .into_iter()
                             .chain(std::iter::once(request.engineer.as_str())),
                     );
-                    self.clear_active_task(&request.engineer);
-                    self.set_member_idle(&request.engineer);
+                    self.release_engineer_from_merged_task(request);
                 }
 
                 warn!(
@@ -1211,8 +1286,7 @@ impl TeamDaemon {
                     request.task_id.to_string(),
                     Some("merge_failure"),
                 );
-                self.clear_active_task(&request.engineer);
-                self.set_member_idle(&request.engineer);
+                self.release_engineer_from_merged_task(request);
                 warn!(
                     engineer = request.engineer,
                     task_id = request.task_id,
@@ -1223,6 +1297,16 @@ impl TeamDaemon {
             }
         }
     }
+}
+
+/// Task id of a merge the (possibly running) daemon has landed but not yet
+/// finished verifying, read from its persisted state. Lets out-of-process
+/// merges refuse to land on trunk underneath it.
+pub(crate) fn persisted_in_flight_merge(project_root: &std::path::Path) -> Option<u32> {
+    super::state::load_daemon_state(project_root)?
+        .merge_queue
+        .in_flight
+        .map(|merge| merge.request.task_id)
 }
 
 fn merge_request_skip_reason(
@@ -1675,6 +1759,44 @@ fn reset_main_to(repo_dir: &std::path::Path, target: &str) -> Result<()> {
     Ok(())
 }
 
+/// Land a chat-approved merge on the board: record the review approval
+/// (which moves the task to done), falling back to the plain done move.
+fn approve_chat_merge(
+    daemon: &mut TeamDaemon,
+    board_dir: &std::path::Path,
+    board_dir_str: &str,
+    request: &MergeRequest,
+) -> bool {
+    match crate::team::task_cmd::cmd_review_structured_with_attribution(
+        board_dir,
+        request.task_id,
+        "approve",
+        None,
+        "telegram",
+        crate::team::task_cmd::StatusTransitionAttribution::bridge("bridge.telegram.merge"),
+    ) {
+        Ok(()) => {
+            persist_completed_profile(daemon, board_dir, request.task_id);
+            true
+        }
+        Err(error) => {
+            warn!(
+                task_id = request.task_id,
+                error = %error,
+                "failed to record chat merge approval; moving task to done directly"
+            );
+            let manager_name = daemon.manager_name(&request.engineer);
+            move_task_to_done(
+                daemon,
+                board_dir,
+                board_dir_str,
+                request,
+                manager_name.as_deref(),
+            )
+        }
+    }
+}
+
 fn move_task_to_done(
     daemon: &mut TeamDaemon,
     board_dir: &std::path::Path,
@@ -1768,7 +1890,27 @@ mod tests {
             confidence: 0.95,
             files_changed: 1,
             lines_changed: 1,
+            origin: MergeOrigin::AutoMerge,
         }
+    }
+
+    #[test]
+    fn contains_task_covers_queued_and_in_flight_requests() {
+        let mut queue = MergeQueue::default();
+        assert!(!queue.contains_task(1));
+        queue.enqueue(request(1));
+        queue.mark_in_flight_for_test(request(2));
+        assert!(queue.contains_task(1));
+        assert!(queue.contains_task(2));
+        assert!(!queue.contains_task(3));
+    }
+
+    #[test]
+    fn merge_request_without_origin_deserializes_as_auto_merge() {
+        let mut value = serde_json::to_value(request(4)).unwrap();
+        value.as_object_mut().unwrap().remove("origin");
+        let restored: MergeRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.origin, MergeOrigin::AutoMerge);
     }
 
     fn finished_event(step: Option<MergeQueueStep>) -> MergeQueueEvent {
@@ -2434,6 +2576,7 @@ mod tests {
             confidence: 0.95,
             files_changed: 1,
             lines_changed: 1,
+            origin: MergeOrigin::AutoMerge,
         });
 
         drain_merge_queue(&mut daemon);
@@ -2535,6 +2678,7 @@ mod tests {
             confidence: 0.95,
             files_changed: 1,
             lines_changed: 1,
+            origin: MergeOrigin::AutoMerge,
         });
 
         drain_merge_queue(&mut daemon);
@@ -2613,6 +2757,7 @@ mod tests {
             confidence: 0.95,
             files_changed: 1,
             lines_changed: 1,
+            origin: MergeOrigin::AutoMerge,
         });
 
         drain_merge_queue(&mut daemon);
@@ -2674,6 +2819,7 @@ mod tests {
             confidence: 0.95,
             files_changed: 1,
             lines_changed: 1,
+            origin: MergeOrigin::AutoMerge,
         });
 
         drain_merge_queue(&mut daemon);
@@ -2764,6 +2910,7 @@ mod tests {
             confidence: 0.95,
             files_changed: 1,
             lines_changed: 1,
+            origin: MergeOrigin::AutoMerge,
         });
 
         drain_merge_queue(&mut daemon);
@@ -2820,6 +2967,7 @@ mod tests {
             confidence: 0.95,
             files_changed: 1,
             lines_changed: 1,
+            origin: MergeOrigin::AutoMerge,
         });
         (repo, daemon)
     }
@@ -3022,6 +3170,7 @@ mod tests {
                     confidence: 0.95,
                     files_changed: 1,
                     lines_changed: 1,
+                    origin: MergeOrigin::AutoMerge,
                 },
                 "main",
             )
@@ -3064,6 +3213,7 @@ mod tests {
                 confidence: 0.95,
                 files_changed: 1,
                 lines_changed: 1,
+                origin: MergeOrigin::AutoMerge,
             },
             "main",
         )
@@ -3112,6 +3262,7 @@ mod tests {
                 confidence: 0.95,
                 files_changed: 1,
                 lines_changed: 1,
+                origin: MergeOrigin::AutoMerge,
             },
             "mainline",
         )
@@ -3161,6 +3312,7 @@ mod tests {
             confidence: 0.95,
             files_changed: 1,
             lines_changed: 1,
+            origin: MergeOrigin::AutoMerge,
         });
 
         drain_merge_queue(&mut daemon);

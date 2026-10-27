@@ -312,9 +312,186 @@ pub(crate) fn force_clean_worktree(worktree_dir: &Path, engineer_name: &str) {
     }
 }
 
+/// Commit at `HEAD` in `worktree_dir`.
+pub(crate) fn head_commit(worktree_dir: &Path) -> Result<String> {
+    let output = crate::git::cmd(worktree_dir)
+        .args(["rev-parse", "HEAD"])
+        .allow_fail()
+        .run()
+        .with_context(|| {
+            format!(
+                "failed to invoke git rev-parse in {}",
+                worktree_dir.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse HEAD failed in {}: {}",
+            worktree_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Commit `branch` points at, or `None` when it cannot be resolved.
+pub(crate) fn branch_head(project_root: &Path, branch: &str) -> Option<String> {
+    let output = crate::git::cmd(project_root)
+        .args(["rev-parse", "--verify", branch])
+        .allow_fail()
+        .run()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!commit.is_empty()).then_some(commit)
+}
+
+/// Resolve `rev` in `repo`, failing when it does not exist.
+pub(crate) fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
+    let output = run_git_with_context(
+        repo,
+        &["rev-parse", "--verify", rev],
+        &format!("resolve {rev}"),
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn path_exists_on_trunk(worktree_dir: &Path, trunk_branch: &str, file: &str) -> Result<bool> {
+    let output = crate::git::cmd(worktree_dir)
+        .args(["ls-tree", "-r", "--name-only", trunk_branch, "--", file])
+        .allow_fail()
+        .run()
+        .with_context(|| {
+            format!(
+                "failed to inspect whether {file} exists on {trunk_branch} in {}",
+                worktree_dir.display()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "failed to inspect whether {file} exists on {trunk_branch} in {}: {}",
+            worktree_dir.display(),
+            stderr.trim()
+        );
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+/// Restore `out_of_scope` paths to their trunk version (removing paths that
+/// do not exist on trunk) and commit only those paths. Returns whether a
+/// revert commit was made.
+pub(crate) fn revert_out_of_scope_files(
+    worktree_dir: &Path,
+    out_of_scope: &[String],
+    trunk_branch: &str,
+) -> Result<bool> {
+    if out_of_scope.is_empty() {
+        return Ok(false);
+    }
+
+    let mut restored = Vec::new();
+    for file in out_of_scope {
+        if path_exists_on_trunk(worktree_dir, trunk_branch, file)? {
+            // `checkout <rev> -- <path>` updates both the index and the worktree.
+            run_git_with_context(
+                worktree_dir,
+                &["checkout", trunk_branch, "--", file],
+                "revert out-of-scope file",
+            )?;
+            restored.push(file.as_str());
+        } else {
+            run_git_with_context(
+                worktree_dir,
+                &["rm", "-f", "--ignore-unmatch", "--", file],
+                "remove out-of-scope file added outside the fence",
+            )?;
+        }
+    }
+
+    // Stage only the fenced paths; never sweep up unrelated worktree changes.
+    if !restored.is_empty() {
+        let mut add_args = vec!["add", "-A", "--"];
+        add_args.extend(restored.iter().copied());
+        run_git_with_context(worktree_dir, &add_args, "stage scope revert")?;
+    }
+
+    let mut staged_args = vec!["diff", "--cached", "--name-only", "--"];
+    staged_args.extend(out_of_scope.iter().map(String::as_str));
+    let staged = run_git_with_context(worktree_dir, &staged_args, "inspect staged scope revert")?;
+    let staged_paths: Vec<String> = String::from_utf8_lossy(&staged.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if staged_paths.is_empty() {
+        return Ok(false);
+    }
+
+    let mut commit_args = vec![
+        "commit",
+        "-m",
+        "Restore fenced files after automatic scope recovery",
+        "-m",
+        "Constraint: Scope fence violations must be reverted automatically\nConfidence: medium\nScope-risk: narrow\nDirective: This daemon-owned recovery commit keeps the branch clean after out-of-scope writes\nTested: scope fence auto-revert path\nNot-tested: multi-repo scope recovery",
+        "--only",
+        "--",
+    ];
+    commit_args.extend(staged_paths.iter().map(String::as_str));
+    run_git_with_context(worktree_dir, &commit_args, "commit scope revert")?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::test_support::{git_ok, git_stdout, init_git_repo};
+
+    #[test]
+    fn revert_out_of_scope_files_commits_only_fenced_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "scope-revert");
+        git_ok(&repo, &["checkout", "-b", "eng-1/9"]);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn out_of_scope() {}\n").unwrap();
+        std::fs::write(repo.join("added.txt"), "added\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-m", "work"]);
+        // Unrelated staged + unstaged work must not be swept into the revert.
+        std::fs::write(repo.join("keep.txt"), "keep\n").unwrap();
+        git_ok(&repo, &["add", "keep.txt"]);
+        std::fs::write(repo.join("Cargo.toml"), "# edited\n").unwrap();
+
+        let files = vec!["src/lib.rs".to_string(), "added.txt".to_string()];
+        assert!(revert_out_of_scope_files(&repo, &files, "main").unwrap());
+
+        let committed = git_stdout(&repo, &["show", "--name-only", "--format=", "HEAD"]);
+        let mut committed: Vec<&str> = committed.lines().collect();
+        committed.sort();
+        assert_eq!(committed, vec!["added.txt", "src/lib.rs"]);
+        assert_eq!(
+            git_stdout(&repo, &["diff", "--cached", "--name-only"]),
+            "keep.txt"
+        );
+        assert_eq!(git_stdout(&repo, &["diff", "--name-only"]), "Cargo.toml");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+            git_stdout(&repo, &["show", "main:src/lib.rs"]) + "\n"
+        );
+
+        // Nothing left to revert: report false rather than a phantom revert.
+        assert!(!revert_out_of_scope_files(&repo, &files, "main").unwrap());
+    }
+
+    #[test]
+    fn revert_out_of_scope_files_propagates_git_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "scope-revert-fail");
+        let err = revert_out_of_scope_files(&repo, &["src/lib.rs".to_string()], "no-such-trunk")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no-such-trunk"), "{err:#}");
+    }
 
     #[test]
     fn abort_failed_merge_clears_conflicted_merge_state() {

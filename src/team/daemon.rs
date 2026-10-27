@@ -120,7 +120,9 @@ pub(crate) use self::interventions::NudgeSchedule;
 use self::launcher::{
     duplicate_claude_session_ids, load_launch_state, member_session_tracker_config,
 };
-pub(crate) use self::merge_queue::{MergeQueue, MergeRequest};
+pub(crate) use self::merge_queue::{
+    MergeOrigin, MergeQueue, MergeRequest, persisted_in_flight_merge,
+};
 pub use self::state::load_dispatch_queue_snapshot;
 #[cfg(test)]
 use self::state::{

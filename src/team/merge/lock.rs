@@ -15,15 +15,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// A non-empty lock file without a readable PID (written by an older batty
 /// or another tool) is treated as held until it is this old.
 const UNOWNED_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
-
-/// How long the blocking [`MergeLock::acquire`] waits before giving up.
-const BLOCKING_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct MergeLock {
     // Keeping the file open keeps the flock; dropping it releases the lock.
@@ -138,24 +135,6 @@ impl MergeLock {
         file.flush()?;
         Ok(Some(Self { file }))
     }
-
-    /// Blocking acquire (up to 60s) for one-shot callers outside the
-    /// daemon's merge queue.
-    pub fn acquire(project_root: &Path) -> Result<Self> {
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(lock) = Self::try_acquire(project_root)? {
-                return Ok(lock);
-            }
-            if start.elapsed() > BLOCKING_ACQUIRE_TIMEOUT {
-                bail!(
-                    "merge lock timeout after 60s: {}",
-                    merge_lock_path(project_root).display()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
 }
 
 impl Drop for MergeLock {
@@ -211,14 +190,14 @@ mod tests {
     use super::*;
     use std::sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     };
     use std::thread;
 
     #[test]
     fn merge_lock_records_pid_and_releases_on_drop() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = MergeLock::acquire(tmp.path()).unwrap();
+        let lock = MergeLock::try_acquire(tmp.path()).unwrap().unwrap();
         let content = std::fs::read_to_string(merge_lock_path(tmp.path())).unwrap();
         assert_eq!(content.trim(), std::process::id().to_string());
         assert!(merge_lock_is_held(tmp.path()));
@@ -326,34 +305,6 @@ mod tests {
             handle.join().unwrap();
         }
         assert_eq!(max_holders.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn merge_lock_second_acquire_waits_for_release() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".batty")).unwrap();
-
-        let first_lock = MergeLock::acquire(tmp.path()).unwrap();
-        let project_root = tmp.path().to_path_buf();
-        let barrier = Arc::new(Barrier::new(2));
-        let acquired = Arc::new(AtomicBool::new(false));
-
-        let thread_barrier = Arc::clone(&barrier);
-        let thread_acquired = Arc::clone(&acquired);
-        let handle = thread::spawn(move || {
-            thread_barrier.wait();
-            let second_lock = MergeLock::acquire(&project_root).unwrap();
-            thread_acquired.store(true, Ordering::SeqCst);
-            drop(second_lock);
-        });
-
-        barrier.wait();
-        thread::sleep(Duration::from_millis(300));
-        assert!(!acquired.load(Ordering::SeqCst));
-
-        drop(first_lock);
-        handle.join().unwrap();
-        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -60,10 +60,12 @@ The extracted modules below keep that loop readable without changing the daemon'
 - Replaced in monolithic daemon: inline shell-script generation and launch-state persistence.
 - Called from daemon flow: startup, restart, resume, and task dispatch paths.
 
-### `src/team/merge.rs`
+### `src/team/merge/`
 
 - Responsibility: engineer completion handling, test gating, merge/rebase flow, conflict handling, and worktree reset.
-- Key entrypoints: `handle_engineer_completion`, `merge_engineer_branch`, `reset_engineer_worktree`, `MergeLock`, `MergeOutcome`.
+- Layout: `completion/` splits the "engineer says done" path by concern — `gates.rs` (diff evidence, scope fence, rejections), `verification.rs` (background verification and snapshots), `decision.rs` (confidence scoring and auto-merge routing), `execute.rs` (hand-off to the merge queue; non-blocking multi-repo direct merge), `multi_repo.rs`, `messaging.rs`; `mod.rs` holds the two short orchestrators. `git_ops.rs`, `lock.rs`, and `operations.rs` hold the git helpers, the merge lock, and the single-repo merge.
+- Merge routing: single-repo merges always go through the merge queue (auto-merge, completions with auto-merge disabled, and the chat `merge` command), so the poll loop never waits on the merge lock and every merge gets post-merge verification. Multi-repo projects (not yet supported by the queue) merge directly with `MergeLock::try_acquire`; a busy lock, an in-flight queue verification, or a running main smoke check defers the merge (the task waits in review) and `poll_deferred_direct_merges` retries it each tick.
+- Key entrypoints: `handle_engineer_completion`, `poll_verification_jobs`, `poll_deferred_direct_merges`, `enqueue_reviewed_merge`, `merge_engineer_branch_into_trunk`, `MergeLock`, `MergeOutcome`.
 - Replaced in monolithic daemon: the entire "engineer says done" control path, including merge failure escalation and post-merge cleanup.
 - Called from daemon flow: `poll_watchers()` when an engineer completion event is detected.
 
