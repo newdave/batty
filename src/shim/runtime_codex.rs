@@ -593,10 +593,11 @@ fn run_codex_exec_attempt(
                             let mut st = state.lock().unwrap();
                             // Replace accumulated response on each complete agent_message
                             // (Codex sends the full text each time, not deltas)
+                            // so count the bytes once, on completion.
                             if evt.event_type == "item.completed" {
                                 st.accumulated_response = text.to_string();
+                                st.cumulative_output_bytes += text.len() as u64;
                             }
-                            st.cumulative_output_bytes += text.len() as u64;
 
                             // Check for context approaching limit (proactive).
                             if !st.context_approaching_emitted
@@ -1347,6 +1348,32 @@ mod tests {
             matches!(parent.recv::<Event>().unwrap().unwrap(),Event::SessionStarted{session_id} if session_id==id)
         );
     }
+    #[test]
+    fn item_updates_do_not_inflate_output_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let program = tmp.path().join("fake-codex");
+        // Codex repeats the item's full text on every update and on completion.
+        std::fs::write(&program, "#!/bin/sh\n/bin/cat > /dev/null\nprintf '%s\\n' '{\"type\":\"item.updated\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"do\"}}' '{\"type\":\"item.updated\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"done\"}}' '{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"done!\"}}' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = fake_working_state(tmp.path());
+        let (parent, child) = protocol::socketpair().unwrap();
+        let _parent = protocol::Channel::new(parent);
+        let mut child = protocol::Channel::new(child);
+        run_codex_exec(
+            "worker",
+            program.to_str().unwrap(),
+            &[],
+            "task",
+            tmp.path(),
+            &state,
+            &mut child,
+            None,
+        );
+        let st = state.lock().unwrap();
+        assert_eq!(st.cumulative_output_bytes, "done!".len() as u64);
+    }
+
     fn fake_working_state(cwd: &std::path::Path) -> Arc<Mutex<CodexState>> {
         Arc::new(Mutex::new(CodexState {
             state: ShimState::Working,
