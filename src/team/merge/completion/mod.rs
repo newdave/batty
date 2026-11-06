@@ -19,7 +19,7 @@ mod execute;
 mod gates;
 mod messaging;
 mod multi_repo;
-mod verification;
+mod verify_job;
 
 #[cfg(test)]
 mod tests;
@@ -29,17 +29,17 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::task::load_tasks_from_dir;
-use crate::team::daemon::verification::VerificationRunResult;
+use crate::team::daemon::completion_checks::VerificationRunResult;
 use crate::team::daemon::{MergeOrigin, TeamDaemon};
 use crate::team::task_loop::current_worktree_branch;
-use crate::team::verification::VerificationState;
+use crate::team::verification_state::VerificationState;
 
 pub(crate) use execute::{
     DeferredDirectMerge, append_merge_learning, enqueue_reviewed_merge,
     poll_deferred_direct_merges, record_merge_test_timing, restore_deferred_direct_merges,
 };
 pub(crate) use multi_repo::multi_repo_changed_paths;
-pub(crate) use verification::{VerificationJob, poll_verification_jobs};
+pub(crate) use verify_job::{VerificationJob, poll_verification_jobs};
 
 use decision::MergeRoute;
 use gates::DiffEvidence;
@@ -74,7 +74,7 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
     let Some(task_id) = daemon.active_task_id(engineer) else {
         return Ok(());
     };
-    if verification::verification_already_running(daemon, engineer, task_id) {
+    if verify_job::verification_already_running(daemon, engineer, task_id) {
         return Ok(());
     }
     if !daemon.member_uses_worktrees(engineer) {
@@ -105,7 +105,7 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
             .clone()
     });
     let mut verification_state =
-        verification::begin_verification(daemon, engineer, task_id, &verification_policy);
+        verify_job::begin_verification(daemon, engineer, task_id, &verification_policy);
 
     let scope_fence =
         gates::enforce_scope_fence(daemon, engineer, task_id, &worktree_dir, &trunk_branch)?;
@@ -142,11 +142,11 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         if ctx.records_test_evidence {
             ctx.verification_state.begin_iteration();
         }
-        verification::start_verification_job(daemon, engineer, ctx, test_command);
+        verify_job::start_verification_job(daemon, engineer, ctx, test_command);
         return Ok(());
     }
 
-    let verification_run = verification::skipped_verification_run(daemon, engineer, &mut ctx);
+    let verification_run = verify_job::skipped_verification_run(daemon, engineer, &mut ctx);
     finish_engineer_completion(daemon, engineer, ctx, verification_run, 0)
 }
 
@@ -160,7 +160,7 @@ fn finish_engineer_completion(
     test_duration_ms: u64,
 ) -> Result<()> {
     if let Some(recovery) = verification_run.recovery.as_ref() {
-        return verification::handle_branch_recovery(
+        return verify_job::handle_branch_recovery(
             daemon,
             engineer,
             ctx,
@@ -180,7 +180,7 @@ fn finish_engineer_completion(
         );
     }
 
-    verification::complete_verification(daemon, engineer, &mut ctx, &verification_run)?;
+    verify_job::complete_verification(daemon, engineer, &mut ctx, &verification_run)?;
     let task_branch = if daemon.is_multi_repo {
         multi_repo::multi_repo_task_branch(
             &ctx.worktree_dir,
@@ -190,7 +190,7 @@ fn finish_engineer_completion(
     } else {
         current_worktree_branch(&ctx.worktree_dir)?
     };
-    verification::record_test_telemetry(daemon, engineer, &ctx, &verification_run)?;
+    verify_job::record_test_telemetry(daemon, engineer, &ctx, &verification_run)?;
 
     let verified = VerifiedCompletion {
         engineer,
@@ -228,5 +228,5 @@ pub(crate) fn handle_engineer_completion_and_wait(
     engineer: &str,
 ) -> Result<()> {
     handle_engineer_completion(daemon, engineer)?;
-    verification::wait_for_verification_jobs(daemon)
+    verify_job::wait_for_verification_jobs(daemon)
 }

@@ -24,7 +24,7 @@ pub(super) fn run_completions(shell: cli::CompletionShell) -> Result<()> {
 }
 
 pub(super) fn run_verify(root: &Path) -> Result<()> {
-    team::verification::cmd_verify(root)?;
+    team::parity_verify::cmd_verify(root)?;
     Ok(())
 }
 

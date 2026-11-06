@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::team::config::TeamConfig;
-use crate::team::daemon::verification::run_automatic_verification;
+use crate::team::daemon::completion_checks::run_automatic_verification;
 use crate::team::events::{EventSink, TeamEvent};
 use crate::team::github_feedback::{GithubReleaseFeedbackItem, GithubReleaseFeedbackSummary};
 

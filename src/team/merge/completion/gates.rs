@@ -7,11 +7,11 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 use crate::team::daemon::TeamDaemon;
-use crate::team::daemon::verification::{
+use crate::team::daemon::completion_checks::{
     ScopeFenceCheck, VerificationRunResult, inspect_scope_fence,
 };
 use crate::team::telemetry_db;
-use crate::team::verification::{EvidenceKind, VerificationPhase};
+use crate::team::verification_state::{EvidenceKind, VerificationPhase};
 
 use super::super::git_ops::{
     code_files_changed_from_trunk, commits_ahead_of_trunk, diff_stat_from_trunk,
@@ -26,7 +26,7 @@ use super::multi_repo::{
     multi_repo_diff_stat_from_trunk, multi_repo_files_changed_from_trunk,
     revert_multi_repo_out_of_scope_files,
 };
-use super::verification::{
+use super::verify_job::{
     persist_verification_snapshot, record_verification_evidence, transition_verification_phase,
 };
 use super::{CompletionContext, task_status};
@@ -81,7 +81,7 @@ impl DiffEvidence {
         daemon: &mut TeamDaemon,
         engineer: &str,
         task_id: u32,
-        state: &mut crate::team::verification::VerificationState,
+        state: &mut crate::team::verification_state::VerificationState,
     ) {
         let counts = [
             (

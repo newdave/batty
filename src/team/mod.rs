@@ -77,6 +77,7 @@ pub mod nudge;
 pub mod openclaw;
 pub mod openclaw_contract;
 pub mod parity;
+pub mod parity_verify;
 pub mod policy;
 pub(crate) mod process_tree;
 pub mod prompt_compose;
@@ -104,7 +105,7 @@ pub mod test_results;
 #[cfg(test)]
 pub mod test_support;
 pub mod validation;
-pub mod verification;
+pub mod verification_state;
 pub mod watcher;
 pub mod workflow;
 pub mod workspace;

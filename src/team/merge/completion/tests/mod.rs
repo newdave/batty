@@ -5,7 +5,7 @@ mod decision;
 mod execute;
 mod gates;
 mod multi_repo;
-mod verification;
+mod verify_job;
 
 use super::decision::{
     analyze_completion_diff, move_task_to_review, record_completion_packet_metadata,
@@ -14,7 +14,7 @@ use super::multi_repo::{
     merge_multi_repo_engineer_branch, multi_repo_code_files_changed_from_trunk,
     multi_repo_diff_stat_from_trunk, multi_repo_files_changed_from_trunk,
 };
-use super::verification::{poll_verification_jobs, wait_for_verification_jobs};
+use super::verify_job::{poll_verification_jobs, wait_for_verification_jobs};
 use super::*;
 use crate::shim::protocol::{Command, ShimState, socketpair};
 use crate::team::artifact::read_test_timing_log;
@@ -34,7 +34,7 @@ use crate::team::test_helpers::make_test_daemon;
 use crate::team::test_support::{
     engineer_member, git_ok, git_stdout, init_git_repo, manager_member,
 };
-use crate::team::verification::VerificationPhase;
+use crate::team::verification_state::VerificationPhase;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -399,7 +399,7 @@ fn production_merge_completion_has_no_unwrap_or_expect_calls() {
         ("gates.rs", include_str!("../gates.rs")),
         ("messaging.rs", include_str!("../messaging.rs")),
         ("multi_repo.rs", include_str!("../multi_repo.rs")),
-        ("verification.rs", include_str!("../verification.rs")),
+        ("verify_job.rs", include_str!("../verify_job.rs")),
     ];
     for (name, src) in sources {
         assert_eq!(

@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use super::TeamDaemon;
 use crate::task::load_tasks_from_dir;
 use crate::team::board::{WorkflowMetadata, read_workflow_metadata};
-use crate::team::daemon::verification::VerificationRunResult;
+use crate::team::daemon::completion_checks::VerificationRunResult;
 use crate::team::merge::{
     DeferredDirectMerge, MergeLock, MergeMode, MergeOutcome, RootCheckoutDirty, RootDirtyState,
     infer_merge_mode_from_failure, inspect_root_dirty_state, merge_engineer_branch_into_trunk,

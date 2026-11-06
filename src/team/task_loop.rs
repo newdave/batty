@@ -323,7 +323,7 @@ pub(crate) fn validate_review_ready_worktree(
         retry_git(|| git_cmd::run_git(worktree_dir, &["diff", "--stat", &range])),
         "failed to inspect engineer branch diff",
     )?;
-    let declared_scope = crate::team::daemon::verification::parse_scope_fence(task_text);
+    let declared_scope = crate::team::daemon::completion_checks::parse_scope_fence(task_text);
     Ok(validate_review_ready_diff_stat_with_scope(&diff.stdout, &declared_scope).blockers)
 }
 

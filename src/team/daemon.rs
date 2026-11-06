@@ -74,6 +74,7 @@ pub(crate) mod board_snapshot;
 #[cfg(test)]
 mod board_snapshot_tests;
 mod chat;
+pub(crate) mod completion_checks;
 mod config_reload;
 mod deferred;
 mod delivery_state;
@@ -101,7 +102,6 @@ mod spec_gen;
 mod state;
 pub(crate) mod telemetry;
 pub mod tick_report;
-pub(crate) mod verification;
 mod verification_tracking;
 
 pub(crate) use self::chat::discord::{
