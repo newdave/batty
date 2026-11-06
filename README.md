@@ -64,25 +64,6 @@ batty send architect "Build a small API with auth, tests, and CI."
 
 For the step-by-step setup flow, see [docs/getting-started.md](docs/getting-started.md).
 
-## What v0.10.0 Adds
-
-Batty v0.10.0 closes the autonomous development loop. Type `$go` in Discord,
-go to sleep, wake up to merged features.
-
-- **Discord control surface** — three-channel bot (`#commands`, `#events`,
-  `#agents`) with `$go`/`$stop`/`$status`/`$board` commands and rich embeds
-- **Closed verification loop** — daemon auto-tests completions, retries on
-  failure, merges on green. No agent in the merge path.
-- **Notification isolation** — daemon chatter stays in the orchestrator log,
-  not in agent PTY context. Agents stay focused on code.
-- **Supervisory stall detection** — architect and manager roles get the same
-  health monitoring as engineers. No more silent 30-minute stalls.
-- **Manager inbox signal shaping** — 200 raw messages/session batched into
-  prioritized digests. Manager sees what matters.
-- **Hashline-style edit validation** — content-hash checks prevent stale-file
-  corruption when multiple agents edit concurrently.
-- **3,080+ tests**, up from 2,854 in v0.9.0.
-
 ## Architecture
 
 ```text
@@ -137,7 +118,7 @@ shim-owned PTY runtime.
 ## Configuration
 
 Batty topology and runtime workflow live in `.batty/team_config/team.yaml`.
-This is a complete example with the fields most teams touch in v0.10.0:
+This example shows the fields most teams touch:
 
 ```yaml
 name: my-project
@@ -293,24 +274,6 @@ batty grafana status
 
 More operational guidance lives in [docs/troubleshooting.md](docs/troubleshooting.md).
 
-## Documentation
-
-- [Getting Started](docs/getting-started.md)
-- [CLI Reference](docs/cli-reference.md)
-- [Team Config Reference](docs/config-reference.md)
-- [Architecture](docs/architecture.md)
-- [Troubleshooting](docs/troubleshooting.md)
-
-## Highlights
-
-- Hierarchical agent teams instead of one overloaded coding agent
-- SDK mode by default for Claude Code, Codex CLI, and Kiro CLI
-- PTY shim fallback when typed protocol support is unavailable
-- tmux-backed visibility with persistent panes and resume support
-- Stable per-engineer worktrees with fresh task branches
-- Auto-dispatch, verification, review routing, and auto-merge
-- SQLite telemetry, Grafana monitoring, and board health reporting
-
 ## Telegram Integration
 
 Batty can expose a human endpoint over Telegram through a `user` role. This is
@@ -374,27 +337,23 @@ Pre-configured alerts:
 | Context Exhaustion     | Agent context window nearly full   |
 | Session Idle           | Entire team idle too long          |
 
-## Docs and Links
+## Documentation
 
-- [Getting Started](docs/getting-started.md)
-- [CLI Reference](docs/cli-reference.md)
-- [Team Config Reference](docs/config-reference.md)
-- [Generated CLI Reference](docs/reference/cli.md)
-- [Module Reference](docs/reference/modules.md)
-- [Scheduled Tasks & Cron](docs/scheduled-tasks.md)
-- [Intervention System](docs/interventions.md)
-- [Orchestrator Guide](docs/orchestrator.md)
-- [Architecture](docs/architecture.md)
-- [Troubleshooting](docs/troubleshooting.md)
 - [Full docs site](https://battysh.github.io/batty/)
-- [Examples](examples/) — Ready-to-run team configs
+- [Getting Started](docs/getting-started.md)
+- [Team Config Reference](docs/config-reference.md)
+- [CLI Reference](docs/reference/cli.md) (generated)
+- [Architecture](docs/architecture.md)
+- [Orchestrator Guide](docs/orchestrator.md)
+- [Intervention System](docs/interventions.md)
+- [Scheduled Tasks & Cron](docs/scheduled-tasks.md)
+- [Agent efficiency and session accounting](docs/reference/agent-efficiency.md): per-member launch options, lower-usage defaults, recovery and operator commands
+- [Troubleshooting](docs/troubleshooting.md)
+- [Examples](examples/): ready-to-run team configs
 - [Use Cases](USECASES.md)
-- [Contributing](CONTRIBUTING.md)
+- [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
 - [Good First Issues](https://github.com/battysh/batty/labels/good%20first%20issue?utm_source=crates-io&utm_medium=readme&utm_campaign=0.11.x)
-- [GitHub](https://github.com/battysh/batty?utm_source=crates-io&utm_medium=readme&utm_campaign=0.11.x)
 
 ## License
 
 MIT
-
-See [agent efficiency and session accounting](docs/reference/agent-efficiency.md) for per-member launch options, lower-usage defaults, recovery and native operator commands.
