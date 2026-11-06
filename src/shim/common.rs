@@ -126,6 +126,51 @@ pub fn drain_queue_errors(
     events
 }
 
+/// Handle a `SendMessage` that arrived while the agent is not Idle.
+///
+/// Working: queue the message (dropping the oldest at `MAX_QUEUE_DEPTH`) and
+/// return the events to send, in order. Any other state: leave the queue
+/// alone and return the "cannot accept message" Error.
+///
+/// Pure state mutation; callers send the events (after releasing their state
+/// lock, except where they deliberately keep it).
+pub fn enqueue_or_reject(
+    queue: &mut VecDeque<QueuedMessage>,
+    state: ShimState,
+    msg: QueuedMessage,
+) -> Vec<Event> {
+    if state != ShimState::Working {
+        return vec![Event::Error {
+            command: "SendMessage".into(),
+            reason: format!("agent in {state} state, cannot accept message"),
+        }];
+    }
+
+    let mut events = Vec::new();
+    if queue.len() >= MAX_QUEUE_DEPTH {
+        let dropped = queue.pop_front();
+        let dropped_id = dropped.as_ref().and_then(|m| m.message_id.clone());
+        events.push(Event::Error {
+            command: "SendMessage".into(),
+            reason: format!(
+                "message queue full ({MAX_QUEUE_DEPTH}), dropped oldest message{}",
+                dropped_id
+                    .map(|id| format!(" (id: {id})"))
+                    .unwrap_or_default(),
+            ),
+        });
+    }
+    queue.push_back(msg);
+    events.push(Event::Warning {
+        message: format!(
+            "message queued while agent working (depth: {})",
+            queue.len()
+        ),
+        idle_secs: None,
+    });
+    events
+}
+
 // ---------------------------------------------------------------------------
 // Context exhaustion detection
 // ---------------------------------------------------------------------------
@@ -410,5 +455,84 @@ mod tests {
         assert!(escalation.escalate);
         assert_eq!(escalation.next_iteration_count, TEST_FAILURE_MAX_ITERATIONS);
         assert!(escalation.notice.contains("escalation required"));
+    }
+
+    fn queued(id: Option<&str>) -> QueuedMessage {
+        QueuedMessage {
+            from: "user".into(),
+            body: "body".into(),
+            message_id: id.map(String::from),
+        }
+    }
+
+    #[test]
+    fn enqueue_under_cap_queues_and_warns() {
+        let mut queue = VecDeque::new();
+        let events = enqueue_or_reject(&mut queue, ShimState::Working, queued(Some("a")));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Warning { message, idle_secs } => {
+                assert_eq!(message, "message queued while agent working (depth: 1)");
+                assert!(idle_secs.is_none());
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enqueue_at_cap_drops_oldest_with_id_in_reason() {
+        let mut queue = VecDeque::new();
+        for i in 0..MAX_QUEUE_DEPTH {
+            queue.push_back(queued(Some(&format!("m{i}"))));
+        }
+        let events = enqueue_or_reject(&mut queue, ShimState::Working, queued(Some("new")));
+        assert_eq!(queue.len(), MAX_QUEUE_DEPTH);
+        assert_eq!(queue.front().unwrap().message_id.as_deref(), Some("m1"));
+        assert_eq!(queue.back().unwrap().message_id.as_deref(), Some("new"));
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            Event::Error { command, reason } => {
+                assert_eq!(command, "SendMessage");
+                assert_eq!(
+                    reason,
+                    "message queue full (16), dropped oldest message (id: m0)"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(matches!(
+            &events[1],
+            Event::Warning { message, .. }
+                if message == "message queued while agent working (depth: 16)"
+        ));
+    }
+
+    #[test]
+    fn enqueue_at_cap_without_dropped_id_omits_suffix() {
+        let mut queue = VecDeque::new();
+        for _ in 0..MAX_QUEUE_DEPTH {
+            queue.push_back(queued(None));
+        }
+        let events = enqueue_or_reject(&mut queue, ShimState::Working, queued(None));
+        assert!(matches!(
+            &events[0],
+            Event::Error { reason, .. }
+                if reason == "message queue full (16), dropped oldest message"
+        ));
+    }
+
+    #[test]
+    fn enqueue_in_non_working_state_rejects_without_queueing() {
+        let mut queue = VecDeque::new();
+        let events = enqueue_or_reject(&mut queue, ShimState::Dead, queued(Some("a")));
+        assert!(queue.is_empty());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            Event::Error { command, reason }
+                if command == "SendMessage"
+                    && reason == "agent in dead state, cannot accept message"
+        ));
     }
 }

@@ -19,7 +19,9 @@ use portable_pty::{Child, CommandBuilder, PtySize};
 
 use super::classifier::{self, AgentType, ScreenVerdict};
 use super::common::shim_eprintln;
-use super::common::{self, QueuedMessage, drain_queue_errors, format_injected_message};
+use super::common::{
+    self, QueuedMessage, drain_queue_errors, enqueue_or_reject, format_injected_message,
+};
 use super::protocol::{Channel, Command, Event, ShimState};
 use super::pty_log::PtyLogWriter;
 use crate::prompt::strip_ansi;
@@ -47,7 +49,6 @@ const KIRO_IDLE_SETTLE_MS: u64 = 1200;
 
 /// Max time to wait for agent to show its first prompt (secs).
 const READY_TIMEOUT_SECS: u64 = 120;
-use common::MAX_QUEUE_DEPTH;
 use common::SESSION_STATS_INTERVAL_SECS;
 
 const PROCESS_EXIT_POLL_MS: u64 = 100;
@@ -1242,56 +1243,24 @@ pub fn run(args: ShimArgs, channel: Channel) -> Result<()> {
                             summary,
                         })?;
                     }
-                    ShimState::Working => {
-                        // Queue the message for delivery when agent returns to Idle
-                        if inner.message_queue.len() >= MAX_QUEUE_DEPTH {
-                            let dropped = inner.message_queue.pop_front();
-                            let dropped_id = dropped.as_ref().and_then(|m| m.message_id.clone());
-                            inner.message_queue.push_back(QueuedMessage {
+                    state => {
+                        let events = enqueue_or_reject(
+                            &mut inner.message_queue,
+                            state,
+                            QueuedMessage {
                                 from,
                                 body,
                                 message_id,
-                            });
-                            let depth = inner.message_queue.len();
+                            },
+                        );
+                        // Only the Working path releases the lock before sending; rejecting
+                        // in any other state keeps sending while the lock is held.
+                        if state == ShimState::Working {
                             drop(inner);
-
-                            cmd_channel.send(&Event::Error {
-                                command: "SendMessage".into(),
-                                reason: format!(
-                                    "message queue full ({MAX_QUEUE_DEPTH}), dropped oldest message{}",
-                                    dropped_id
-                                        .map(|id| format!(" (id: {id})"))
-                                        .unwrap_or_default(),
-                                ),
-                            })?;
-                            cmd_channel.send(&Event::Warning {
-                                message: format!(
-                                    "message queued while agent working (depth: {depth})"
-                                ),
-                                idle_secs: None,
-                            })?;
-                        } else {
-                            inner.message_queue.push_back(QueuedMessage {
-                                from,
-                                body,
-                                message_id,
-                            });
-                            let depth = inner.message_queue.len();
-                            drop(inner);
-
-                            cmd_channel.send(&Event::Warning {
-                                message: format!(
-                                    "message queued while agent working (depth: {depth})"
-                                ),
-                                idle_secs: None,
-                            })?;
                         }
-                    }
-                    other => {
-                        cmd_channel.send(&Event::Error {
-                            command: "SendMessage".into(),
-                            reason: format!("agent in {other} state, cannot accept message"),
-                        })?;
+                        for event in &events {
+                            cmd_channel.send(event)?;
+                        }
                     }
                 }
             }
@@ -1659,6 +1628,7 @@ fn is_prompt_line(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::common::MAX_QUEUE_DEPTH;
     use super::*;
 
     #[test]

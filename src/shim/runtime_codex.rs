@@ -26,7 +26,7 @@ use super::child::{OwnedChild, spawn_stderr_logger, terminate_shared};
 use super::codex_types::{self, CodexEvent};
 use super::common::shim_eprintln;
 use super::common::{
-    self, MAX_QUEUE_DEPTH, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors,
+    self, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors, enqueue_or_reject,
     format_injected_message, last_n_lines_of,
 };
 use super::protocol::{Channel, Command as ShimCommand, Event, ShimState};
@@ -254,57 +254,20 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                             );
                         });
                     }
-                    ShimState::Working => {
-                        // Queue the message
-                        if st.message_queue.len() >= MAX_QUEUE_DEPTH {
-                            let dropped = st.message_queue.pop_front();
-                            let dropped_id = dropped.as_ref().and_then(|m| m.message_id.clone());
-                            st.message_queue.push_back(QueuedMessage {
+                    state => {
+                        let events = enqueue_or_reject(
+                            &mut st.message_queue,
+                            state,
+                            QueuedMessage {
                                 from,
                                 body,
                                 message_id,
-                            });
-                            let depth = st.message_queue.len();
-                            drop(st);
-
-                            cmd_channel.send(&Event::Error {
-                                command: "SendMessage".into(),
-                                reason: format!(
-                                    "message queue full ({MAX_QUEUE_DEPTH}), dropped oldest message{}",
-                                    dropped_id
-                                        .map(|id| format!(" (id: {id})"))
-                                        .unwrap_or_default(),
-                                ),
-                            })?;
-                            cmd_channel.send(&Event::Warning {
-                                message: format!(
-                                    "message queued while agent working (depth: {depth})"
-                                ),
-                                idle_secs: None,
-                            })?;
-                        } else {
-                            st.message_queue.push_back(QueuedMessage {
-                                from,
-                                body,
-                                message_id,
-                            });
-                            let depth = st.message_queue.len();
-                            drop(st);
-
-                            cmd_channel.send(&Event::Warning {
-                                message: format!(
-                                    "message queued while agent working (depth: {depth})"
-                                ),
-                                idle_secs: None,
-                            })?;
-                        }
-                    }
-                    other => {
+                            },
+                        );
                         drop(st);
-                        cmd_channel.send(&Event::Error {
-                            command: "SendMessage".into(),
-                            reason: format!("agent in {other} state, cannot accept message"),
-                        })?;
+                        for event in &events {
+                            cmd_channel.send(event)?;
+                        }
                     }
                 }
             }
