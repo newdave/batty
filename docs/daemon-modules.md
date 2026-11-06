@@ -46,6 +46,19 @@ The extracted modules below keep that loop readable without changing the daemon'
 - Replaced in monolithic daemon: all intervention threshold, cooldown, dedupe, and idle-grace logic.
 - Called from daemon flow: the middle of each poll loop after delivery retry and before standups.
 
+### `src/team/daemon/automation/`
+
+- Responsibility: periodic board and worktree automation run from the poll loop, split by concern. Each submodule adds `impl TeamDaemon` methods; `mod.rs` only declares them.
+- `claims.rs`: claim TTL management, claimed-branch mismatch alerts, automation nudge delivery (`maybe_manage_task_claim_ttls`, `deliver_automation_nudge`).
+- `claim_progress.rs`: liveness and progress detection for in-progress claimed tasks.
+- `reconcile.rs`: state reconciliation of active tasks against worktrees (`reconcile_active_tasks`).
+- `ownership.rs`: resolving conflicting engineer task ownership.
+- `reviews.rs`: stale review escalation (`maybe_escalate_stale_reviews`).
+- `aging.rs`: task aging alerts, dependency auto-unblock, stale preserve-blocker cleanup.
+- `planning.rs`: pipeline starvation detection, tact check, planning cycle (`maybe_trigger_planning_cycle`, `handle_planning_response`).
+- `housekeeping.rs`: stale worktree reconciliation, board rotation and archive, cron recycling, retrospectives, stale daemon binary refresh.
+- Tests for all submodules live in `automation/tests.rs`.
+
 ### `src/team/daemon/telemetry.rs`
 
 - Responsibility: event emission and orchestrator log recording that should not clutter business logic.
