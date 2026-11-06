@@ -215,6 +215,46 @@ jobs:
             echo "::endgroup::"
           done
 
+  integration:
+    name: Integration Tests (live tmux)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.non_docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install kanban-md
+        run: |
+          KMD_VERSION="0.32.2"
+          curl -sL "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_linux_amd64.tar.gz" | sudo tar xz -C /usr/local/bin kanban-md
+        shell: bash
+
+      - name: Configure git identity and default branch
+        run: |
+          git config --global user.email "ci@batty.test"
+          git config --global user.name "Batty CI"
+          git config --global init.defaultBranch main
+        shell: bash
+
+      # Tests start their own tmux server under a job-local socket directory,
+      # so nothing on the runner's default server is touched.
+      - name: Lib tests with the integration feature
+        shell: bash
+        run: |
+          export TMUX_TMPDIR="$RUNNER_TEMP/batty-tmux"
+          mkdir -p "$TMUX_TMPDIR"
+          unset TMUX
+          cargo test --lib --features integration
+
   coverage:
     name: Code Coverage
     needs: changes
