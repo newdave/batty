@@ -2157,6 +2157,55 @@ roles:
         }
     }
 
+    const DEFAULT_TEAM: &str = "name: test\nroles:\n- name: architect\n  role_type: architect\n  agent: claude\n- name: manager\n  role_type: manager\n  agent: claude\n- name: engineer\n  role_type: engineer\n  agent: claude\n  instances: 3\n";
+
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn auto_layout_daemon_startup_finds_every_member_pane() {
+        // The default 1/1/3 team has five agents, so `auto` picks windows.
+        // Daemon startup rebuilds its pane map from tmux and launches each
+        // member into the pane found there; a member missing from the map
+        // never starts (N1).
+        let _env_lock = crate::team::test_support::env_lock();
+        let session = "batty-uxtest-auto-startup";
+        let _ = crate::tmux::kill_session(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let members = make_members(DEFAULT_TEAM);
+        let built = build_layout(
+            session,
+            &members,
+            &layout_with_mode(super::super::config::LayoutMode::Auto),
+            tmp.path(),
+            WorkflowMode::Legacy,
+            false,
+            OrchestratorPosition::Bottom,
+        )
+        .unwrap();
+        let windows = crate::tmux::tmux_command()
+            .args(["list-windows", "-t", session, "-F", "#{window_name}"])
+            .output()
+            .unwrap();
+        let rebuilt = crate::team::daemon_mgmt::rebuild_pane_map(session, &members);
+        let daemon = crate::team::test_support::TestDaemonBuilder::new(tmp.path())
+            .session(session)
+            .members(members.clone())
+            .pane_map(rebuilt.clone())
+            .build();
+        let _ = crate::tmux::kill_session(session);
+
+        let window_count = String::from_utf8_lossy(&windows.stdout).lines().count();
+        assert!(window_count > 1, "auto should pick windows for five agents");
+        assert_eq!(rebuilt, built);
+        for member in members.iter().filter(|m| m.role_type != RoleType::User) {
+            assert_eq!(
+                daemon.config.pane_map.get(&member.name),
+                built.get(&member.name),
+                "launcher has no pane for {}",
+                member.name
+            );
+        }
+    }
+
     #[test]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn focus_mode_keeps_all_members_in_one_window() {
