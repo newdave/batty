@@ -489,3 +489,131 @@ fn sdk_shutdown_terminates_cleanly() {
     });
     assert!(evt.is_some(), "expected Died or Dead state after shutdown");
 }
+
+/// Read events until the channel goes quiet (read timeout) or closes.
+fn drain_events(ch: &mut Channel) -> Vec<Event> {
+    let mut events = Vec::new();
+    loop {
+        match ch.recv::<Event>() {
+            Ok(Some(evt)) => events.push(evt),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    events
+}
+
+/// Characterization: an Idle SendMessage reports MessageDelivered before the
+/// Idle -> Working StateChanged.
+#[test]
+#[cfg_attr(not(feature = "shim-integration"), ignore)]
+fn sdk_idle_send_message_emits_delivered_then_state_changed() {
+    let mut ch = spawn_sdk_mock("bash -c 'while read line; do :; done'");
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Ready)
+    })
+    .expect("Ready");
+
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "first".into(),
+        message_id: Some("m1".into()),
+    })
+    .unwrap();
+
+    let events = drain_events(&mut ch);
+    assert!(
+        matches!(&events[..], [
+            Event::MessageDelivered { id },
+            Event::StateChanged {
+                from: ShimState::Idle,
+                to: ShimState::Working,
+                ..
+            },
+            ..
+        ] if id == "m1"),
+        "unexpected events: {events:?}"
+    );
+
+    ch.send(&Command::Shutdown {
+        timeout_secs: 2,
+        reason: crate::shim::protocol::ShutdownReason::Requested,
+    })
+    .ok();
+}
+
+/// Characterization: filling the queue past MAX_QUEUE_DEPTH (16) while Working
+/// drops the oldest message with an Error, then still emits the queued Warning.
+#[test]
+#[cfg_attr(not(feature = "shim-integration"), ignore)]
+fn sdk_queue_overflow_drops_oldest_with_error_then_warning() {
+    // Mock never answers, so the agent stays Working.
+    let mut ch = spawn_sdk_mock("bash -c 'while read line; do :; done'");
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Ready)
+    })
+    .expect("Ready");
+
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "first".into(),
+        message_id: Some("m0".into()),
+    })
+    .unwrap();
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(
+            e,
+            Event::StateChanged {
+                to: ShimState::Working,
+                ..
+            }
+        )
+    })
+    .expect("Working");
+
+    for i in 1..=17 {
+        ch.send(&Command::SendMessage {
+            from: "user".into(),
+            body: format!("queued {i}"),
+            message_id: Some(format!("q{i}")),
+        })
+        .unwrap();
+    }
+
+    let events = drain_events(&mut ch);
+    assert_eq!(events.len(), 18, "unexpected events: {events:?}");
+    for (i, evt) in events[..16].iter().enumerate() {
+        match evt {
+            Event::Warning { message, idle_secs } => {
+                assert_eq!(
+                    message,
+                    &format!("message queued while agent working (depth: {})", i + 1)
+                );
+                assert!(idle_secs.is_none());
+            }
+            other => panic!("expected Warning at {i}, got {other:?}"),
+        }
+    }
+    match &events[16] {
+        Event::Error { command, reason } => {
+            assert_eq!(command, "SendMessage");
+            assert_eq!(
+                reason,
+                "message queue full (16), dropped oldest message (id: q1)"
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    match &events[17] {
+        Event::Warning { message, .. } => {
+            assert_eq!(message, "message queued while agent working (depth: 16)");
+        }
+        other => panic!("expected Warning, got {other:?}"),
+    }
+
+    ch.send(&Command::Shutdown {
+        timeout_secs: 2,
+        reason: crate::shim::protocol::ShutdownReason::Requested,
+    })
+    .ok();
+}
