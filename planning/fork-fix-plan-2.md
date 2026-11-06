@@ -22,6 +22,13 @@ Streams own disjoint files and run in parallel.
   - The project-rename feature is dropped.
   - The default `simple` template is one architect, one manager and three engineers.
 - **Still watched for load flakes:** `merge_queue::post_merge_verification_runs_off_the_poll_loop`, `health::checks::reconcile_preserves_dirty_work_before_resetting_merged_branch` and `worktree::tests::reset_worktree_to_base_archives_*`, which depend on the 5s preserve-commit timeout.
+- **Handover open items (done 2026-11-07, PRs #13–#19):**
+  - `allow(dead_code)`: all 76 removed. Unused code is deleted; test-only code is `#[cfg(test)]`. The clean-room disassembly chain, `read_handoff_artifact`, `record_barrier_artifact_read` and `board_reconciliation` were never wired into production and are test-only for now.
+  - The four `verification` modules are renamed: `verification_state`, `parity_verify`, `daemon::completion_checks`, `merge::completion::verify_job`, `delivery::recovery`.
+  - `daemon/automation.rs` and `status.rs` are split into submodules by concern.
+  - Shared `StructuredRuntime`: a full trait over the sdk, codex and kiro loops was rejected (different process models and about 16 lifecycle differences). Only verbatim helpers moved to `shim/common.rs`. Five latent lifecycle bugs found on the way are fixed, each with a test; a sixth suspected race (kiro request id) was not a bug.
+  - Test hygiene: leaked test tmux servers and `/tmp/bt-*` dirs are reclaimed on the next test run; the `doctor --fix` test no longer kills other tests' sessions; verification commands that ignore their input no longer fail with EPIPE.
+  - Comparison issues #8, #12, #14 and #25 are resolved or mitigated as far as they can be; #23 (stricter frontmatter closers) is kept on purpose.
 - **Test rules:** run the integration suite only on a private tmux server: `env -u TMUX TMUX_TMPDIR=<job-local dir> cargo test --lib --features integration`. Never run a bare `tmux kill-server`.
 
 ## Stream R1: tmux layouts (N2, N11, N12)
