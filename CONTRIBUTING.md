@@ -31,17 +31,17 @@ All tests must pass before submitting a PR. The CI runs on both Ubuntu and macOS
 
 ## Commit Messages
 
-Follow this format:
+Use a plain imperative sentence as the subject, with no Conventional Commit prefix:
 
 ```
-<scope>: <short summary>
+Escalate busy merge locks after a configurable wait
 
-What: <what was implemented/changed>
-Why: <why this approach was chosen>
-How: <key implementation details>
+What: merges waiting on a busy lock escalate after lock_busy_escalate_after_secs.
+Why: a stuck holder otherwise blocks the queue with no signal.
+How: the queue tracks when each waiter started; escalation names the holder PID.
 ```
 
-Keep the first line under 72 characters. The body should give enough context that `git log` tells the full story.
+Keep the subject under 72 characters. The body should give enough context that `git log` tells the full story.
 
 ## Testing
 
@@ -95,7 +95,7 @@ docs/              # User documentation (MkDocs)
 planning/          # Architecture, roadmap, philosophy
 assets/            # Static assets
 scripts/           # Utility scripts
-.batty/kanban/     # Phase boards
+.batty/team_config/ # Team topology, role prompts, shared board
 ```
 
 ## Questions?
