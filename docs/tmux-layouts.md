@@ -79,12 +79,12 @@ support roles, each tiled inside.
 
 ## Comparison
 
-| Option | Readable at 8+ members | Needs tmux knowledge | See all at once |
-| --- | --- | --- | --- |
-| panes | no | medium | yes |
-| windows | yes | low (click tabs) | via dashboard |
-| focus | partly | low (F-keys) | partly |
-| grouped | partly | low | partly |
+| Option  | Readable at 8+ members | Needs tmux knowledge | See all at once |
+| ------- | ---------------------- | -------------------- | --------------- |
+| panes   | no                     | medium               | yes             |
+| windows | yes                    | low (click tabs)     | via dashboard   |
+| focus   | partly                 | low (F-keys)         | partly          |
+| grouped | partly                 | low                  | partly          |
 
 ## Recommendation
 
@@ -107,19 +107,19 @@ everything" benefit of tiling.
 
 All are session- or window-scoped.
 
-| Setting | Why |
-| --- | --- |
-| `mouse on` | click tabs and panes, wheel scrolls history |
-| two-line status bar | clickable window tabs, plus a permanent key hint |
-| `base-index 1`, `pane-base-index 1` | tabs match the keyboard (1 is first) |
-| `renumber-windows on` | no gaps after a window closes |
-| `aggressive-resize on`, `window-size latest` | fits the window to the client you are using |
-| `history-limit 20000` | scrollback survives long agent output |
-| `automatic-rename off`, `allow-rename off` | agents cannot rename tabs |
-| F1 | help popup with keys and batty commands (`Ctrl-b ?` stays tmux's own list) |
-| F2-F10 | jump to the dashboard/members |
-| F12 | zoom the current pane to full screen |
-| F11 (focus mode) | cycle which member is in the big pane |
+| Setting                                      | Why                                                                        |
+| -------------------------------------------- | -------------------------------------------------------------------------- |
+| `mouse on`                                   | click tabs and panes, wheel scrolls history                                |
+| two-line status bar                          | clickable window tabs, plus a permanent key hint                           |
+| `base-index 1`, `pane-base-index 1`          | tabs match the keyboard (1 is first)                                       |
+| `renumber-windows on`                        | no gaps after a window closes                                              |
+| `aggressive-resize on`, `window-size latest` | fits the window to the client you are using                                |
+| `history-limit 20000`                        | scrollback survives long agent output                                      |
+| `automatic-rename off`, `allow-rename off`   | agents cannot rename tabs                                                  |
+| F1                                           | help popup with keys and batty commands (`Ctrl-b ?` stays tmux's own list) |
+| F2-F10                                       | jump to the dashboard/members                                              |
+| F12                                          | zoom the current pane to full screen                                       |
+| F11 (focus mode)                             | cycle which member is in the big pane                                      |
 
 How the keys are installed (tmux 3.2 or later):
 
@@ -181,14 +181,14 @@ batty attach eng-1-1    # attach and select that member's window/pane
 
 ## Version requirements
 
-| Feature | tmux |
-| --- | --- |
-| tiled panes, windows, mouse, tabs | any recent version |
-| two-line status bar (hint line) | 2.9 |
-| F-key bindings, `Ctrl-b ?` help | 3.0 |
-| `window-size latest` | 3.1 |
-| focus layout 65% main pane | 3.1 |
-| help popup | 3.2 (falls back to `display-message`) |
+| Feature                           | tmux                                  |
+| --------------------------------- | ------------------------------------- |
+| tiled panes, windows, mouse, tabs | any recent version                    |
+| two-line status bar (hint line)   | 2.9                                   |
+| F-key bindings, `Ctrl-b ?` help   | 3.0                                   |
+| `window-size latest`              | 3.1                                   |
+| focus layout 65% main pane        | 3.1                                   |
+| help popup                        | 3.2 (falls back to `display-message`) |
 
 Batty detects the version with `tmux -V` and skips features that are not
 available; unavailable options never stop startup.

@@ -2,7 +2,7 @@
 
 This guide covers changes you may need to act on when upgrading from batty 0.11.x
 (including upstream `battysh/batty`). The full list is in the
-[changelog](../CHANGELOG.md).
+[changelog](https://github.com/newdave/batty/blob/main/CHANGELOG.md).
 
 ## Upgrade steps
 
@@ -10,9 +10,9 @@ This guide covers changes you may need to act on when upgrading from batty 0.11.
    don't let old and new binaries merge in the same project at the same time.
    An older binary's empty `merge.lock` is treated as held for up to an hour,
    so a mixed setup can stall merges rather than corrupt them.
-2. Install the new binary and run `batty validate` in each project. Fix any
+1. Install the new binary and run `batty validate` in each project. Fix any
    errors it reports about channels; review its warnings about unused keys.
-3. Start the team with `batty start`. Teams with more than four agents now open
+1. Start the team with `batty start`. Teams with more than four agents now open
    with one window per member plus a dashboard (see [tmux layouts](tmux-layouts.md)).
 
 ## Behaviour changes to check

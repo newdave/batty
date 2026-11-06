@@ -4,35 +4,35 @@ Contributor-facing map of Batty source modules.
 
 ## Module Index
 
-| Path                    | Purpose                                                                   |
-| ----------------------- | ------------------------------------------------------------------------- |
-| `src/main.rs`           | CLI entrypoint, project-root resolution, and top-level command dispatch.  |
-| `src/cli.rs`            | clap command and flag definitions for the team-mode CLI.                  |
-| `src/team/mod.rs`       | Team lifecycle: init, start, stop, attach, validate, send, merge.         |
-| `src/team/config.rs`    | `.batty/team_config/team.yaml` parsing, defaults, and validation.         |
-| `src/team/hierarchy.rs` | Role expansion, instance naming, and reporting relationships.             |
-| `src/team/layout.rs`    | tmux pane layout builder for team zones and manager/engineer groupings.   |
-| `src/team/daemon.rs`    | Background runtime loop: spawn shims, poll state, route messages.         |
-| `src/team/inbox.rs`     | Maildir inbox storage for inter-role messages.                            |
-| `src/team/legacy_command_queue.rs` | Legacy command queue types and atomic drain. |
-| `src/team/comms.rs`     | Outbound channel abstraction for user roles, including Telegram delivery. |
-| `src/team/telegram.rs`  | Telegram Bot API client and setup wizard behind `batty telegram`.         |
-| `src/team/standup.rs`   | Standup report generation from current member state.                      |
-| `src/team/board.rs`     | Board rotation and archive helpers for the shared kanban board.           |
-| `src/team/task_loop.rs` | Task claiming, refresh, tests, and merge handoff logic for engineers.     |
-| `src/team/events.rs`    | Structured team runtime event sink.                                       |
-| `src/team/watcher.rs`   | tmux-pane watcher and idle/completion detection.                          |
-| `src/shim/`             | Shim runtime: PTY ownership, protocol, screen classifier, and chat mode.  |
-| `src/team/templates/`   | Built-in team templates and role prompt scaffolds.                        |
-| `src/tmux.rs`           | tmux command wrapper for sessions, panes, layout, and capability probes.  |
-| `src/agent/mod.rs`      | `AgentAdapter` trait, registry, and shared spawn contract.                |
-| `src/agent/claude.rs`   | Claude Code adapter implementation.                                       |
-| `src/agent/codex.rs`    | Codex CLI adapter implementation.                                         |
-| `src/prompt/mod.rs`     | ANSI escape stripping for agent PTY output.                               |
-| `src/worktree.rs`       | Git worktree creation, reuse, sync, and cleanup helpers.                  |
-| `src/task/mod.rs`       | Task parsing utilities for kanban-backed work items.                      |
-| `src/paths.rs`          | Shared filesystem path helpers under `.batty/`.                           |
-| `src/bin/docsgen.rs`    | Generator for `docs/reference/cli.md`.                                    |
+| Path                               | Purpose                                                                   |
+| ---------------------------------- | ------------------------------------------------------------------------- |
+| `src/main.rs`                      | CLI entrypoint, project-root resolution, and top-level command dispatch.  |
+| `src/cli.rs`                       | clap command and flag definitions for the team-mode CLI.                  |
+| `src/team/mod.rs`                  | Team lifecycle: init, start, stop, attach, validate, send, merge.         |
+| `src/team/config.rs`               | `.batty/team_config/team.yaml` parsing, defaults, and validation.         |
+| `src/team/hierarchy.rs`            | Role expansion, instance naming, and reporting relationships.             |
+| `src/team/layout.rs`               | tmux pane layout builder for team zones and manager/engineer groupings.   |
+| `src/team/daemon.rs`               | Background runtime loop: spawn shims, poll state, route messages.         |
+| `src/team/inbox.rs`                | Maildir inbox storage for inter-role messages.                            |
+| `src/team/legacy_command_queue.rs` | Legacy command queue types and atomic drain.                              |
+| `src/team/comms.rs`                | Outbound channel abstraction for user roles, including Telegram delivery. |
+| `src/team/telegram.rs`             | Telegram Bot API client and setup wizard behind `batty telegram`.         |
+| `src/team/standup.rs`              | Standup report generation from current member state.                      |
+| `src/team/board.rs`                | Board rotation and archive helpers for the shared kanban board.           |
+| `src/team/task_loop.rs`            | Task claiming, refresh, tests, and merge handoff logic for engineers.     |
+| `src/team/events.rs`               | Structured team runtime event sink.                                       |
+| `src/team/watcher.rs`              | tmux-pane watcher and idle/completion detection.                          |
+| `src/shim/`                        | Shim runtime: PTY ownership, protocol, screen classifier, and chat mode.  |
+| `src/team/templates/`              | Built-in team templates and role prompt scaffolds.                        |
+| `src/tmux.rs`                      | tmux command wrapper for sessions, panes, layout, and capability probes.  |
+| `src/agent/mod.rs`                 | `AgentAdapter` trait, registry, and shared spawn contract.                |
+| `src/agent/claude.rs`              | Claude Code adapter implementation.                                       |
+| `src/agent/codex.rs`               | Codex CLI adapter implementation.                                         |
+| `src/prompt/mod.rs`                | ANSI escape stripping for agent PTY output.                               |
+| `src/worktree.rs`                  | Git worktree creation, reuse, sync, and cleanup helpers.                  |
+| `src/task/mod.rs`                  | Task parsing utilities for kanban-backed work items.                      |
+| `src/paths.rs`                     | Shared filesystem path helpers under `.batty/`.                           |
+| `src/bin/docsgen.rs`               | Generator for `docs/reference/cli.md`.                                    |
 
 ## Key Traits and Types
 
