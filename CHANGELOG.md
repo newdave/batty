@@ -142,6 +142,12 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
   `layout: {mode: panes}` without `zones` started no member panes. Members added
   at runtime follow the layout mode. `auto` reads the terminal size from
   `/dev/tty`.
+- A member relaunched after a stall, context exhaustion or a narration loop
+  gets its resume instructions, handoff and checkpoint again instead of a plain
+  new assignment.
+- Pane cwd correction waits up to 3s for a slow-starting shell, so a successful
+  correction is recorded instead of being logged as failed.
+- CI runs the live tmux integration tests on a job-local tmux server.
 
 ### Removed
 

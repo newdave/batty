@@ -11,15 +11,18 @@ Rules are the same as round 1:
 
 Streams own disjoint files and run in parallel.
 
-## Status (2026-11-05)
+## Status (2026-11-07)
 
-- **R1–R4: landed on `main`.** R1 `96707cd`, R2 `18f6579`, R3 `180f55a`, R4 `d0a21c9`. The R1.2 defaults (`layout.mode: auto`, `layout.keys: true`) are restored and documented. The CHANGELOG 0.12.0 section carries their lines.
-- **R5: not landed.** No commit exists. The worktree `.claude/worktrees/agent-a1e77df76af67d1b9` is gone, and its uncommitted diff went with it. Restart R5 from this plan. Do not look for a recovery patch.
+- **R1–R5: landed on `main`.** R1 `96707cd`, R2 `18f6579`, R3 `180f55a`, R4 `d0a21c9`. R5 is the commit series that adds the Integration Tests CI job. The R1.2 defaults (`layout.mode: auto`, `layout.keys: true`) are restored and documented.
+- **R5 outcome:** the integration suite passes on a private tmux server. Of the 14 failures (R5.1 plus 13 shared with upstream), two were real bugs: restart relaunches lost their resume text, and the pane cwd check gave up before a slow shell ran `cd`. The rest were fixtures: a dropped active task (R5.1), missing role definitions, too-short pane-death waits, a base branch that clashed with the task branch, stale assertions, and the lifecycle and nudge tests predating off-loop verification and nudge diversion.
+- **R5.3:** CI job `integration` runs `cargo test --lib --features integration` with `TMUX_TMPDIR` under `$RUNNER_TEMP`.
+- **R5.4:** `layout::tests::auto_layout_daemon_startup_finds_every_member_pane` builds the default 1/1/3 team in `auto` mode and checks the daemon's `rebuild_pane_map`.
 - **Settled decisions:**
   - `auto_merge` matches upstream: bundled templates set no `auto_merge` block, and the init prompt defaults to "no".
   - The project-rename feature is dropped.
-- **R5.1 still fails on `main`** with `--features integration`: `team::daemon::telemetry::tests::poll_watchers_emits_context_exhausted_event` panics at `src/team/daemon/telemetry.rs:1889` (`left: Some(Idle)`, `right: Some(Working)`). CI does not run the integration feature, so CI stays green.
-- **Test rules for R5:** run the integration suite only on a private tmux server: `env -u TMUX TMUX_TMPDIR=<job-local dir> cargo test --lib --features integration`. Never run a bare `tmux kill-server`.
+  - The default `simple` template is one architect, one manager and three engineers.
+- **Still watched for load flakes:** `merge_queue::post_merge_verification_runs_off_the_poll_loop`, `health::checks::reconcile_preserves_dirty_work_before_resetting_merged_branch` and `worktree::tests::reset_worktree_to_base_archives_*`, which depend on the 5s preserve-commit timeout.
+- **Test rules:** run the integration suite only on a private tmux server: `env -u TMUX TMUX_TMPDIR=<job-local dir> cargo test --lib --features integration`. Never run a bare `tmux kill-server`.
 
 ## Stream R1: tmux layouts (N2, N11, N12)
 
