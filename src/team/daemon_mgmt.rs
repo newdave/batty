@@ -1094,14 +1094,7 @@ pub fn run_daemon(project_root: &Path, resume: bool) -> Result<()> {
         bail!("tmux session '{session}' not found — did `batty start` create it?");
     }
 
-    // Reconstruct pane_map from tmux pane options
-    let mut pane_map = std::collections::HashMap::new();
-    for member in &members {
-        // Query tmux for the pane ID tagged with this member's role
-        if let Some(pane_id) = find_pane_for_member(&session, &member.name) {
-            pane_map.insert(member.name.clone(), pane_id);
-        }
-    }
+    let pane_map = rebuild_pane_map(&session, &members);
 
     let daemon_config = daemon::DaemonConfig {
         project_root: project_root.to_path_buf(),
@@ -1264,6 +1257,21 @@ pub fn run_watchdog(project_root: &Path, resume: bool) -> Result<()> {
             }
         }
     }
+}
+
+/// Reconstruct the daemon's member-to-pane map from tmux pane options.
+pub(crate) fn rebuild_pane_map(
+    session: &str,
+    members: &[hierarchy::MemberInstance],
+) -> std::collections::HashMap<String, String> {
+    let mut pane_map = std::collections::HashMap::new();
+    for member in members {
+        // Query tmux for the pane ID tagged with this member's role
+        if let Some(pane_id) = find_pane_for_member(session, &member.name) {
+            pane_map.insert(member.name.clone(), pane_id);
+        }
+    }
+    pane_map
 }
 
 /// Find the tmux pane ID tagged with `@batty_role=<member_name>` in a session.
