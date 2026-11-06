@@ -14,8 +14,8 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
 - `batty config` exits non-zero when no team config exists (it printed a message
   and exited 0). `--json` adds `schema_version: 2` and the full resolved `config`
   object next to the upstream top-level keys.
-- tmux window numbering starts at 1. Layouts still default to tiled panes
-  (`layout.mode: panes`, as upstream).
+- tmux window numbering starts at 1. `layout.mode` defaults to `auto`; see
+  docs/migrating-to-0.12.md.
 - Status moves made by the daemon go through the task state machine, so illegal
   moves are refused and reported instead of applied.
 - Every git command runs with a timeout (120s, or 600s for slow commands such as
@@ -30,13 +30,13 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
   New flags: `--wide` (all columns), `--watch [SECS]` (live refresh) and
   `--no-color`. Colour is used only on a TTY with `NO_COLOR` unset. `--json` is
   unchanged.
-- `layout.mode` (`panes` by default, `auto`, `windows`, `focus`). `windows`
-  gives a live status dashboard plus one window per member; `auto` picks windows
-  for teams of more than four agents. Batty sessions get clickable window tabs
-  and a key-hint line. See docs/tmux-layouts.md.
-- `layout.keys` (default `false`) installs F1 help, F2–F10 jumps, F11 focus and
-  F12 zoom in a per-session key table. It is off by default because that key
-  table currently disables tmux's mouse and root key bindings in the session.
+- `layout.mode` (`auto` by default, `panes`, `windows`, `focus`). `windows`
+  gives a live status dashboard plus one window per member; `auto` tiles small
+  teams and picks windows for teams of more than four agents. Batty sessions get
+  clickable window tabs and a key-hint line. See docs/tmux-layouts.md.
+- `layout.keys` (default `true`) installs F1 help, F2–F10 jumps, F11 focus and
+  F12 zoom. The keys live in tmux's root table but act only in batty sessions, so
+  mouse and your own `bind -n` keys keep working. They need tmux 3.2 or newer.
 - `batty attach [MEMBER]` jumps to a member's window or pane.
 - `telemetry.retention_days` (default 90, 0 disables) prunes old telemetry rows,
   starting on the first tick after startup.
@@ -51,6 +51,8 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
   whether Telegram uses the bot API or the CLI provider. It also warns about
   config keys that nothing reads.
 - `command_dropped` events when a legacy queued command gives up.
+- `batty merge --force-clear-stale` clears a merge left in verification when no
+  daemon is running. `batty status` flags such a stale in-flight merge.
 
 ### Changed
 
@@ -78,6 +80,16 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
   undocumented and flagged by `batty validate`.
 - The openclaw provider is called with `--channel telegram --target`, falling
   back once to `--to` for older releases.
+
+- `batty start` warns about an unknown channel or empty Telegram target instead
+  of refusing. `batty validate` still reports them as errors.
+- The channel provider `--version` probe runs only in `batty validate`, with a
+  5s timeout, once per process.
+- A merge lock that stays busy escalates after
+  `workflow_policy.auto_merge.lock_busy_escalate_after_secs` (default 600), naming
+  the holder PID, then hourly.
+- An empty or unreadable `merge.lock` from an older binary counts as held for up
+  to 1h, not 5s. Do not run old and new binaries' merges in one project at once.
 
 ### Fixed
 
@@ -107,6 +119,29 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
 - Repeating warnings are logged once or throttled instead of every poll.
 - Several timing-sensitive tests are deterministic, live-tmux tests run only
   with the `integration` feature, and tests never touch the default tmux server.
+- After a git timeout, `index.lock` is removed only when it is clearly batty's
+  own: the timed-out index-writing command ran in its own process group, which is
+  now gone, and the lock was unchanged on a recheck. Otherwise a warning is
+  logged. Timed-out fetch and push never touch it.
+- Recovery with a missing trunk reuses an identical `preserved/*` branch instead
+  of creating one on every retry.
+- `status --wide` prints full rows when piped; `status --watch` exits non-zero on
+  error when piped.
+- The openclaw `--to` fallback recognises more error wordings and retries the
+  modern form daily.
+- The offline-messages notice reports the real count (Telegram pending updates;
+  Discord newest 100), capped at 100+.
+- Post-merge verification in the verify worktree uses the shared cargo home and
+  `shared-target/verify`. Setup failures are retried and escalated, never
+  reverted, and setup time no longer counts against the test timeout.
+- `.batty/verify-worktree` is removed during disk hygiene and on `batty stop`.
+- A merge request in retry backoff no longer blocks other requests. Failed
+  multi-repo direct merges are kept and retried with backoff. Merge telemetry and
+  logs name the configured trunk.
+- Window tabs were blank in batty sessions, so they could not be clicked.
+  `layout: {mode: panes}` without `zones` started no member panes. Members added
+  at runtime follow the layout mode. `auto` reads the terminal size from
+  `/dev/tty`.
 
 ### Removed
 
