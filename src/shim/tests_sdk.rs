@@ -669,3 +669,71 @@ fn sdk_stdin_write_failure_returns_to_idle() {
     })
     .ok();
 }
+
+/// A queued message whose stdin write fails after a turn ends is reported
+/// as failed and the shim returns to Idle instead of waiting in Working.
+#[test]
+#[cfg_attr(not(feature = "shim-integration"), ignore)]
+fn sdk_queued_message_write_failure_returns_to_idle() {
+    // Mock: read the first message, close stdin, then finish the turn.
+    let mock_script = r#"bash -c '
+read line
+exec 0<&-
+sleep 0.5
+echo "{\"type\":\"assistant\",\"session_id\":\"s\",\"uuid\":\"u\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"response\"}]}}"
+echo "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"s\",\"uuid\":\"u2\",\"result\":\"ok\",\"num_turns\":1,\"is_error\":false,\"duration_ms\":1,\"duration_api_ms\":1,\"total_cost_usd\":0,\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"modelUsage\":{},\"permission_denials\":[]}"
+sleep 30
+'"#;
+    let mut ch = spawn_sdk_mock(mock_script);
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Ready)
+    })
+    .expect("Ready");
+
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "first".into(),
+        message_id: Some("m1".into()),
+    })
+    .unwrap();
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(
+            e,
+            Event::StateChanged {
+                to: ShimState::Working,
+                ..
+            }
+        )
+    })
+    .expect("Working after first message");
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "second".into(),
+        message_id: Some("m2".into()),
+    })
+    .unwrap();
+
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Error { reason, .. }
+            if reason.starts_with("stdin write failed for queued message (id: m2)"))
+    })
+    .expect("queued write failure reported");
+    ch.send(&Command::GetState).unwrap();
+    let events = drain_events(&mut ch);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::State {
+                state: ShimState::Idle,
+                ..
+            }
+        )),
+        "expected shim back in Idle: {events:?}"
+    );
+
+    ch.send(&Command::Shutdown {
+        timeout_secs: 2,
+        reason: crate::shim::protocol::ShutdownReason::Requested,
+    })
+    .ok();
+}

@@ -23,7 +23,7 @@ use super::common::shim_eprintln;
 use super::common::{
     self, GROUP_TERM_GRACE_SECS, PROCESS_EXIT_POLL_MS, QueuedMessage, drain_queue_errors,
     enqueue_or_reject, format_injected_message, last_n_lines_of, open_pty_log,
-    screen_capture_event, spawn_session_stats, state_event,
+    queued_write_failed_event, screen_capture_event, spawn_session_stats, state_event,
 };
 use super::kiro_types::{self, AcpMessage};
 use super::protocol::{Channel, Command as ShimCommand, Event, ShimState};
@@ -220,12 +220,12 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                                 response: format!("[error] {error_text}"),
                                 last_lines,
                             });
-                            if let Some((ndjson, queue_depth)) = queued {
+                            if let Some(prompt) = queued {
                                 deliver_queued_prompt(
                                     &stdin_for_approve,
+                                    &state_stdout,
                                     &mut evt_channel,
-                                    &ndjson,
-                                    queue_depth,
+                                    prompt,
                                 );
                             }
                         }
@@ -302,12 +302,12 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                         });
 
                         // Inject queued message
-                        if let Some((ndjson, queue_depth)) = queued {
+                        if let Some(prompt) = queued {
                             deliver_queued_prompt(
                                 &stdin_for_approve,
+                                &state_stdout,
                                 &mut evt_channel,
-                                &ndjson,
-                                queue_depth,
+                                prompt,
                             );
                         }
                     }
@@ -744,11 +744,18 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// A queued message taken off the queue and marked in flight.
+struct QueuedPrompt {
+    ndjson: String,
+    queue_depth: usize,
+    message_id: Option<String>,
+}
+
 /// Pop the next queued message after a turn ends and mark it in flight.
 /// Returns the prompt request to write and the remaining queue depth.
-fn take_next_queued_prompt(st: &mut KiroState) -> Option<(String, usize)> {
+fn take_next_queued_prompt(st: &mut KiroState) -> Option<QueuedPrompt> {
     let qm = st.message_queue.pop_front()?;
-    st.pending_message_id = qm.message_id;
+    st.pending_message_id = qm.message_id.clone();
     st.state = ShimState::Working;
     st.state_changed_at = Instant::now();
     st.accumulated_response.clear();
@@ -756,21 +763,46 @@ fn take_next_queued_prompt(st: &mut KiroState) -> Option<(String, usize)> {
     st.pending_prompt_request_id = Some(req_id);
     let text = format_injected_message(&qm.from, &qm.body);
     let prompt_req = kiro_types::session_prompt_request(req_id, &st.session_id, &text);
-    Some((prompt_req.to_ndjson(), st.message_queue.len()))
+    Some(QueuedPrompt {
+        ndjson: prompt_req.to_ndjson(),
+        queue_depth: st.message_queue.len(),
+        message_id: qm.message_id,
+    })
 }
 
 /// Write a prompt taken by `take_next_queued_prompt` and report Working.
+/// If the write fails, the unannounced Working state is undone so the shim
+/// does not wait forever for a turn that never started.
 fn deliver_queued_prompt(
     stdin: &Arc<Mutex<Option<std::process::ChildStdin>>>,
+    state: &Mutex<KiroState>,
     evt_channel: &mut Channel,
-    ndjson: &str,
-    queue_depth: usize,
+    prompt: QueuedPrompt,
 ) {
-    write_stdin(stdin, ndjson);
+    if !write_stdin(stdin, &prompt.ndjson) {
+        let mut st = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if st.state == ShimState::Working {
+            st.state = ShimState::Idle;
+            st.state_changed_at = Instant::now();
+            st.pending_message_id = None;
+            st.pending_prompt_request_id = None;
+        }
+        drop(st);
+        let _ = evt_channel.send(&queued_write_failed_event(
+            prompt.message_id.as_deref(),
+            "closed",
+        ));
+        return;
+    }
     let _ = evt_channel.send(&Event::StateChanged {
         from: ShimState::Idle,
         to: ShimState::Working,
-        summary: format!("delivering queued message ({queue_depth} remaining)"),
+        summary: format!(
+            "delivering queued message ({} remaining)",
+            prompt.queue_depth
+        ),
     });
 }
 
@@ -883,8 +915,13 @@ mod tests {
                 message_id: Some(id.into()),
             });
         }
-        let (ndjson, depth) = take_next_queued_prompt(&mut st).unwrap();
+        let QueuedPrompt {
+            ndjson,
+            queue_depth: depth,
+            message_id,
+        } = take_next_queued_prompt(&mut st).unwrap();
         assert_eq!(depth, 1);
+        assert_eq!(message_id.as_deref(), Some("q1"));
         assert_eq!(st.state, ShimState::Working);
         assert_eq!(st.pending_message_id.as_deref(), Some("q1"));
         assert!(st.accumulated_response.is_empty());

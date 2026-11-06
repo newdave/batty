@@ -139,6 +139,20 @@ pub fn drain_queue_errors(
     events
 }
 
+/// The error reported when a queued message (or a shim-generated follow-up)
+/// could not be written to the agent's stdin after a turn ended.
+pub fn queued_write_failed_event(message_id: Option<&str>, detail: &str) -> Event {
+    Event::Error {
+        command: "SendMessage".into(),
+        reason: format!(
+            "stdin write failed for queued message{}: {detail}",
+            message_id
+                .map(|id| format!(" (id: {id})"))
+                .unwrap_or_default(),
+        ),
+    }
+}
+
 /// Handle a `SendMessage` that arrived while the agent is not Idle.
 ///
 /// Working: queue the message (dropping the oldest at `MAX_QUEUE_DEPTH`) and
@@ -452,6 +466,23 @@ mod tests {
             }
             _ => panic!("expected Error event"),
         }
+    }
+
+    #[test]
+    fn queued_write_failed_event_names_the_message_when_known() {
+        let Event::Error { command, reason } = queued_write_failed_event(Some("q7"), "Broken pipe")
+        else {
+            panic!("expected Error");
+        };
+        assert_eq!(command, "SendMessage");
+        assert_eq!(
+            reason,
+            "stdin write failed for queued message (id: q7): Broken pipe"
+        );
+        let Event::Error { reason, .. } = queued_write_failed_event(None, "closed") else {
+            panic!("expected Error");
+        };
+        assert_eq!(reason, "stdin write failed for queued message: closed");
     }
 
     #[test]

@@ -514,6 +514,75 @@ sleep 30
     .ok();
 }
 
+/// A queued message whose stdin write fails after a turn ends is reported
+/// as failed and the shim returns to Idle instead of waiting in Working.
+#[test]
+#[cfg_attr(not(feature = "shim-integration"), ignore)]
+fn kiro_acp_queued_message_write_failure_returns_to_idle() {
+    let mock = write_mock_script(
+        r#"
+read line
+req_id=$(extract_id "$line")
+exec 0<&-
+sleep 0.5
+echo '{"jsonrpc":"2.0","id":'$req_id',"result":{"stopReason":"end_turn"}}'
+sleep 30
+"#,
+    );
+    let mut ch = spawn_kiro_mock(&mock);
+    wait_for_event(&mut ch, Duration::from_secs(10), |e| {
+        matches!(e, Event::Ready)
+    })
+    .expect("Ready");
+
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "first".into(),
+        message_id: Some("m1".into()),
+    })
+    .unwrap();
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(
+            e,
+            Event::StateChanged {
+                to: ShimState::Working,
+                ..
+            }
+        )
+    })
+    .expect("Working after first message");
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "second".into(),
+        message_id: Some("m2".into()),
+    })
+    .unwrap();
+
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Error { reason, .. }
+            if reason == "stdin write failed for queued message (id: m2): closed")
+    })
+    .expect("queued write failure reported");
+    ch.send(&Command::GetState).unwrap();
+    let events = drain_events(&mut ch);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::State {
+                state: ShimState::Idle,
+                ..
+            }
+        )),
+        "expected shim back in Idle: {events:?}"
+    );
+
+    ch.send(&Command::Shutdown {
+        timeout_secs: 2,
+        reason: crate::shim::protocol::ShutdownReason::Requested,
+    })
+    .ok();
+}
+
 /// Context exhaustion detected from high usage metadata notification.
 #[test]
 #[cfg_attr(not(feature = "shim-integration"), ignore)]
