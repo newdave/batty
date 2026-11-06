@@ -669,13 +669,7 @@ mod tests {
             .unwrap();
 
         crate::tmux::send_keys(&pane_id, "exit", true).unwrap();
-        for _ in 0..5 {
-            if crate::tmux::pane_dead(&pane_id).unwrap_or(false) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        assert!(crate::tmux::pane_dead(&pane_id).unwrap());
+        assert!(crate::team::test_support::wait_for_pane_dead(&pane_id));
 
         let mut watcher = SessionWatcher::new(&pane_id, "eng-1-1", 300, None);
         assert_eq!(watcher.poll().unwrap(), WatcherState::PaneDead);

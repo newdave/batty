@@ -330,6 +330,38 @@ pub(crate) fn write_owned_task_file_with_context(
     .unwrap();
 }
 
+/// Wait until an interactive shell in `pane_id` runs commands. A login shell
+/// can take seconds to start under test load; a `cd` sent before then lands
+/// after the caller has stopped checking.
+pub(crate) fn wait_for_shell_ready(pane_id: &str) {
+    crate::tmux::send_keys(pane_id, "echo batty-shell-ready", true).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let screen = crate::tmux::capture_pane(pane_id).unwrap_or_default();
+        if screen
+            .lines()
+            .any(|line| line.trim() == "batty-shell-ready")
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("shell in pane {pane_id} never became ready");
+}
+
+/// Wait for a pane to die after its shell was told to exit. Interactive shells
+/// can take seconds to start and act on `exit`, more so under test load.
+pub(crate) fn wait_for_pane_dead(pane_id: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if crate::tmux::pane_dead(pane_id).unwrap_or(false) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    crate::tmux::pane_dead(pane_id).unwrap_or(false)
+}
+
 pub(crate) fn setup_fake_claude(tmp: &tempfile::TempDir, member_name: &str) -> (PathBuf, PathBuf) {
     let project_slug = tmp
         .path()
@@ -656,8 +688,7 @@ impl<'a> TestDaemonBuilder<'a> {
     }
 }
 
-#[allow(dead_code)]
-fn test_role_defs(members: &[MemberInstance]) -> Vec<RoleDef> {
+pub(crate) fn test_role_defs(members: &[MemberInstance]) -> Vec<RoleDef> {
     let mut roles = Vec::new();
     for member in members {
         if let Some(existing) = roles

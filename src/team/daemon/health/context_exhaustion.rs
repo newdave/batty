@@ -382,6 +382,8 @@ mod tests {
             pane_map: HashMap::from([(member_name.to_string(), pane_id.clone())]),
         })
         .unwrap();
+        daemon.config.team_config.roles =
+            crate::team::test_support::test_role_defs(&daemon.config.members);
         daemon.active_tasks.insert(member_name.to_string(), 42);
 
         daemon.handle_context_exhaustion(member_name).unwrap();
@@ -395,7 +397,7 @@ mod tests {
                         return None;
                     }
                 };
-                if content.contains("--append-system-prompt") {
+                if content.contains("Continuing Task #42") {
                     Some(content)
                 } else {
                     std::thread::sleep(Duration::from_millis(100));
@@ -408,7 +410,7 @@ mod tests {
                     fake_log.display()
                 )
             });
-        assert!(log.contains("--append-system-prompt"));
+        assert!(log.contains("Continuing Task #42: test-task"));
 
         let events = crate::team::events::read_events(
             &tmp.path()
@@ -426,7 +428,7 @@ mod tests {
         assert!(
             restart_msg
                 .iter()
-                .any(|msg| msg.body.contains("context exhaustion")),
+                .any(|msg| msg.body.contains("Restarted after context exhausted")),
             "restart notice should be sent to the restarted member"
         );
 

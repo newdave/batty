@@ -1767,7 +1767,7 @@ mod tests {
         crate::team::task_loop::setup_engineer_worktree(
             &repo,
             &worktree_dir,
-            member_name,
+            &crate::team::task_loop::engineer_base_branch_name(member_name),
             &team_config_dir,
         )
         .unwrap();
@@ -1939,7 +1939,7 @@ mod tests {
         crate::team::task_loop::setup_engineer_worktree(
             &repo,
             &worktree_dir,
-            member_name,
+            &crate::team::task_loop::engineer_base_branch_name(member_name),
             &team_config_dir,
         )
         .unwrap();

@@ -389,18 +389,14 @@ mod tests {
             pane_map: HashMap::from([(member_name.to_string(), pane_id.clone())]),
         })
         .unwrap();
+        daemon.config.team_config.roles =
+            crate::team::test_support::test_role_defs(&daemon.config.members);
         daemon
             .states
             .insert(member_name.to_string(), MemberState::Working);
 
         crate::tmux::send_keys(&pane_id, "exit", true).unwrap();
-        for _ in 0..5 {
-            if crate::tmux::pane_dead(&pane_id).unwrap_or(false) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        assert!(crate::tmux::pane_dead(&pane_id).unwrap());
+        assert!(crate::team::test_support::wait_for_pane_dead(&pane_id));
 
         daemon.poll_watchers().unwrap();
         std::thread::sleep(Duration::from_millis(700));
@@ -474,6 +470,7 @@ mod tests {
         crate::tmux::create_session(&session, "bash", &[], wrong_dir.to_string_lossy().as_ref())
             .unwrap();
         let pane_id = crate::tmux::pane_id(&session).unwrap();
+        crate::team::test_support::wait_for_shell_ready(&pane_id);
 
         let member = MemberInstance {
             name: member_name.to_string(),
@@ -521,6 +518,8 @@ mod tests {
             pane_map: HashMap::from([(member_name.to_string(), pane_id.clone())]),
         })
         .unwrap();
+        daemon.config.team_config.roles =
+            crate::team::test_support::test_role_defs(&daemon.config.members);
 
         daemon.spawn_all_agents(false).unwrap();
 
@@ -662,15 +661,11 @@ mod tests {
             pane_map: HashMap::from([(member_name.to_string(), pane_id.clone())]),
         })
         .unwrap();
+        daemon.config.team_config.roles =
+            crate::team::test_support::test_role_defs(&daemon.config.members);
 
         crate::tmux::send_keys(&pane_id, "exit", true).unwrap();
-        for _ in 0..10 {
-            if crate::tmux::pane_dead(&pane_id).unwrap_or(false) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        assert!(crate::tmux::pane_dead(&pane_id).unwrap());
+        assert!(crate::team::test_support::wait_for_pane_dead(&pane_id));
 
         daemon.restart_member(member_name).unwrap();
 
