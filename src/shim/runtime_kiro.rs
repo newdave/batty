@@ -22,7 +22,7 @@ use super::child::{spawn_piped_agent, spawn_stderr_logger};
 use super::common::shim_eprintln;
 use super::common::{
     self, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors, enqueue_or_reject,
-    format_injected_message, last_n_lines_of,
+    format_injected_message, last_n_lines_of, screen_capture_event, state_event,
 };
 use super::kiro_types::{self, AcpMessage};
 use super::protocol::{Channel, Command as ShimCommand, Event, ShimState};
@@ -692,27 +692,16 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
 
             ShimCommand::CaptureScreen { last_n_lines } => {
                 let st = state_cmd.lock().unwrap();
-                let content = match last_n_lines {
-                    Some(n) => last_n_lines_of(&st.accumulated_response, n),
-                    None => st.accumulated_response.clone(),
-                };
+                let event = screen_capture_event(&st.accumulated_response, last_n_lines);
                 drop(st);
-                cmd_channel.send(&Event::ScreenCapture {
-                    content,
-                    cursor_row: 0,
-                    cursor_col: 0,
-                })?;
+                cmd_channel.send(&event)?;
             }
 
             ShimCommand::GetState => {
                 let st = state_cmd.lock().unwrap();
-                let since = st.state_changed_at.elapsed().as_secs();
-                let state = st.state;
+                let event = state_event(st.state, st.state_changed_at);
                 drop(st);
-                cmd_channel.send(&Event::State {
-                    state,
-                    since_secs: since,
-                })?;
+                cmd_channel.send(&event)?;
             }
 
             ShimCommand::Resize { .. } => {
