@@ -3,11 +3,12 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::protocol::{Event, ShimState};
+use super::protocol::{Channel, Event, ShimState};
 use super::pty_log::PtyLogWriter;
 
 // ---------------------------------------------------------------------------
@@ -193,6 +194,46 @@ pub fn open_pty_log(path: Option<&Path>) -> Result<Option<Arc<Mutex<PtyLogWriter
     path.map(|p| PtyLogWriter::new(p).context("failed to create PTY log"))
         .transpose()
         .map(|w| w.map(|w| Arc::new(Mutex::new(w))))
+}
+
+// ---------------------------------------------------------------------------
+// Session stats
+// ---------------------------------------------------------------------------
+
+/// Spawn the periodic session-stats reporter. Every
+/// `SESSION_STATS_INTERVAL_SECS` the thread calls `snapshot`, which should take
+/// and release its own state lock and return the event to send, or `None` to
+/// stop (e.g. the agent is Dead). The thread also stops if the send fails.
+pub fn spawn_session_stats<F>(channel: Channel, snapshot: F) -> JoinHandle<()>
+where
+    F: FnMut() -> Option<Event> + Send + 'static,
+{
+    spawn_session_stats_every(
+        channel,
+        Duration::from_secs(SESSION_STATS_INTERVAL_SECS),
+        snapshot,
+    )
+}
+
+fn spawn_session_stats_every<F>(
+    mut channel: Channel,
+    interval: Duration,
+    mut snapshot: F,
+) -> JoinHandle<()>
+where
+    F: FnMut() -> Option<Event> + Send + 'static,
+{
+    thread::spawn(move || {
+        loop {
+            thread::sleep(interval);
+            let Some(event) = snapshot() else {
+                return;
+            };
+            if channel.send(&event).is_err() {
+                return;
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +653,38 @@ mod tests {
             }
             other => panic!("expected State, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_stats_thread_exits_when_snapshot_returns_none() {
+        let (parent, child) = super::super::protocol::socketpair().unwrap();
+        let mut parent = Channel::new(parent);
+        parent
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut calls = 0;
+        let handle =
+            spawn_session_stats_every(Channel::new(child), Duration::from_millis(10), move || {
+                calls += 1;
+                (calls <= 2).then_some(Event::SessionStats {
+                    output_bytes: calls,
+                    uptime_secs: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    context_usage_pct: None,
+                })
+            });
+        handle.join().unwrap();
+        for expected in 1..=2 {
+            match parent.recv::<Event>().unwrap() {
+                Some(Event::SessionStats { output_bytes, .. }) => {
+                    assert_eq!(output_bytes, expected)
+                }
+                other => panic!("expected SessionStats, got {other:?}"),
+            }
+        }
+        // Thread (and its channel) is gone: no third event, just EOF.
+        assert!(parent.recv::<Event>().unwrap().is_none());
     }
 
     #[test]

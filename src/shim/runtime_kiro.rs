@@ -21,9 +21,9 @@ use anyhow::{Context, Result};
 use super::child::{spawn_piped_agent, spawn_stderr_logger};
 use super::common::shim_eprintln;
 use super::common::{
-    self, GROUP_TERM_GRACE_SECS, PROCESS_EXIT_POLL_MS, QueuedMessage, SESSION_STATS_INTERVAL_SECS,
-    drain_queue_errors, enqueue_or_reject, format_injected_message, last_n_lines_of, open_pty_log,
-    screen_capture_event, state_event,
+    self, GROUP_TERM_GRACE_SECS, PROCESS_EXIT_POLL_MS, QueuedMessage, drain_queue_errors,
+    enqueue_or_reject, format_injected_message, last_n_lines_of, open_pty_log,
+    screen_capture_event, spawn_session_stats, state_event,
 };
 use super::kiro_types::{self, AcpMessage};
 use super::protocol::{Channel, Command as ShimCommand, Event, ShimState};
@@ -541,33 +541,21 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
 
     // -- Session stats thread --
     let state_stats = Arc::clone(&state);
-    let mut stats_channel = cmd_channel
+    let stats_channel = cmd_channel
         .try_clone()
         .context("failed to clone channel for stats")?;
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(SESSION_STATS_INTERVAL_SECS));
-            let st = state_stats.lock().unwrap();
-            if st.state == ShimState::Dead {
-                return;
-            }
-            let output_bytes = st.cumulative_output_bytes;
-            let uptime_secs = st.started_at.elapsed().as_secs();
-            drop(st);
-
-            if stats_channel
-                .send(&Event::SessionStats {
-                    output_bytes,
-                    uptime_secs,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    context_usage_pct: None,
-                })
-                .is_err()
-            {
-                return;
-            }
+    spawn_session_stats(stats_channel, move || {
+        let st = state_stats.lock().unwrap();
+        if st.state == ShimState::Dead {
+            return None;
         }
+        Some(Event::SessionStats {
+            output_bytes: st.cumulative_output_bytes,
+            uptime_secs: st.started_at.elapsed().as_secs(),
+            input_tokens: 0,
+            output_tokens: 0,
+            context_usage_pct: None,
+        })
     });
 
     // -- Wait for initialization to complete before accepting commands --
