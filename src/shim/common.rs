@@ -1,6 +1,7 @@
 //! Shared utilities used by both PTY runtime and SDK runtime.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use super::protocol::{Event, ShimState};
 
@@ -169,6 +170,32 @@ pub fn enqueue_or_reject(
         idle_secs: None,
     });
     events
+}
+
+// ---------------------------------------------------------------------------
+// Command replies for non-PTY runtimes
+// ---------------------------------------------------------------------------
+
+/// Reply to `CaptureScreen` for runtimes without a terminal: the accumulated
+/// response (or its last `last_n_lines` lines) with the cursor at the origin.
+pub fn screen_capture_event(accumulated_response: &str, last_n_lines: Option<usize>) -> Event {
+    let content = match last_n_lines {
+        Some(n) => last_n_lines_of(accumulated_response, n),
+        None => accumulated_response.to_string(),
+    };
+    Event::ScreenCapture {
+        content,
+        cursor_row: 0,
+        cursor_col: 0,
+    }
+}
+
+/// Reply to `GetState`: the current state and whole seconds since it changed.
+pub fn state_event(state: ShimState, state_changed_at: Instant) -> Event {
+    Event::State {
+        state,
+        since_secs: state_changed_at.elapsed().as_secs(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +547,48 @@ mod tests {
             Event::Error { reason, .. }
                 if reason == "message queue full (16), dropped oldest message"
         ));
+    }
+
+    #[test]
+    fn screen_capture_event_none_returns_whole_response() {
+        match screen_capture_event("a\nb\nc", None) {
+            Event::ScreenCapture {
+                content,
+                cursor_row,
+                cursor_col,
+            } => {
+                assert_eq!(content, "a\nb\nc");
+                assert_eq!((cursor_row, cursor_col), (0, 0));
+            }
+            other => panic!("expected ScreenCapture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn screen_capture_event_some_returns_last_lines() {
+        match screen_capture_event("a\nb\nc", Some(2)) {
+            Event::ScreenCapture {
+                content,
+                cursor_row,
+                cursor_col,
+            } => {
+                assert_eq!(content, "b\nc");
+                assert_eq!((cursor_row, cursor_col), (0, 0));
+            }
+            other => panic!("expected ScreenCapture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_event_reports_state_and_elapsed_secs() {
+        let changed = Instant::now() - std::time::Duration::from_secs(5);
+        match state_event(ShimState::Working, changed) {
+            Event::State { state, since_secs } => {
+                assert_eq!(state, ShimState::Working);
+                assert!((5..=6).contains(&since_secs), "since_secs={since_secs}");
+            }
+            other => panic!("expected State, got {other:?}"),
+        }
     }
 
     #[test]
