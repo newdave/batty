@@ -274,35 +274,33 @@ pub fn run_codex_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                 cmd_channel.send(&Event::Pong)?;
             }
 
-            ShimCommand::Shutdown { reason, .. } => {
+            ShimCommand::Shutdown {
+                timeout_secs,
+                reason,
+            } => {
                 shim_eprintln!(
-                    "[shim-codex {shim_id}] shutdown requested ({})",
-                    reason.label()
+                    "[shim-codex {shim_id}] shutdown requested ({}, timeout: {}s)",
+                    reason.label(),
+                    timeout_secs
                 );
-                stop_codex_exec(&state_cmd);
-                if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
-                    shim_eprintln!(
-                        "[shim-codex {shim_id}] failed to preserve work before shutdown: {error:#}"
-                    );
-                }
-                let mut st = state_cmd.lock().unwrap();
-                st.state = ShimState::Dead;
-                st.state_changed_at = Instant::now();
-                drop(st);
+                shutdown_codex_exec(&state_cmd, Duration::from_secs(timeout_secs as u64), || {
+                    if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
+                        shim_eprintln!(
+                            "[shim-codex {shim_id}] failed to preserve work before shutdown: {error:#}"
+                        );
+                    }
+                });
                 break;
             }
 
             ShimCommand::Kill => {
-                stop_codex_exec(&state_cmd);
-                if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
-                    shim_eprintln!(
-                        "[shim-codex {shim_id}] failed to preserve work before kill: {error:#}"
-                    );
-                }
-                let mut st = state_cmd.lock().unwrap();
-                st.state = ShimState::Dead;
-                st.state_changed_at = Instant::now();
-                drop(st);
+                shutdown_codex_exec(&state_cmd, Duration::ZERO, || {
+                    if let Err(error) = super::runtime::preserve_work_before_kill(&args.cwd) {
+                        shim_eprintln!(
+                            "[shim-codex {shim_id}] failed to preserve work before kill: {error:#}"
+                        );
+                    }
+                });
                 break;
             }
         }
@@ -1154,6 +1152,33 @@ fn stop_codex_exec(state: &Arc<Mutex<CodexState>>) {
     }
 }
 
+/// Stop the shim for Shutdown (`timeout`) or Kill (zero timeout), matching
+/// the sdk and kiro shims: preserve the worktree while the exec is still
+/// alive, give it `timeout` to finish on its own, then terminate it.
+fn shutdown_codex_exec(state: &Arc<Mutex<CodexState>>, timeout: Duration, preserve: impl FnOnce()) {
+    // Mark Dead and drop queued work first so a turn that finishes during
+    // preservation cannot start the next queued message.
+    {
+        let mut st = state.lock().unwrap();
+        st.state = ShimState::Dead;
+        st.state_changed_at = Instant::now();
+        st.message_queue.clear();
+    }
+    preserve();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let child = state.lock().unwrap().active_child.clone();
+        let Some(child) = child else {
+            break;
+        };
+        if child.lock().unwrap().try_wait().ok().flatten().is_some() || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(PROCESS_EXIT_POLL_MS));
+    }
+    stop_codex_exec(state);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1410,5 +1435,63 @@ mod tests {
         assert_eq!(st.state, ShimState::Dead);
         assert!(st.message_queue.is_empty());
         assert!(st.active_child.is_none());
+    }
+
+    fn state_with_child(
+        cwd: &std::path::Path,
+        script: &str,
+    ) -> (Arc<Mutex<CodexState>>, Arc<Mutex<OwnedChild>>) {
+        let state = fake_working_state(cwd);
+        let child = Arc::new(Mutex::new(
+            OwnedChild::spawn(Command::new("/bin/sh").args(["-c", script])).unwrap(),
+        ));
+        state.lock().unwrap().active_child = Some(Arc::clone(&child));
+        (state, child)
+    }
+
+    #[test]
+    fn shutdown_preserves_work_then_lets_the_exec_finish_within_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, child) = state_with_child(tmp.path(), "sleep 1; exit 7");
+        let running_during_preserve = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&running_during_preserve);
+        let observed_child = Arc::clone(&child);
+        shutdown_codex_exec(&state, Duration::from_secs(10), move || {
+            let running = observed_child.lock().unwrap().try_wait().unwrap().is_none();
+            observed.store(running, Ordering::SeqCst);
+        });
+        assert!(
+            running_during_preserve.load(Ordering::SeqCst),
+            "work must be preserved before the exec is stopped"
+        );
+        let status = child.lock().unwrap().try_wait().unwrap().unwrap();
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "exec should exit on its own: {status:?}"
+        );
+        let st = state.lock().unwrap();
+        assert_eq!(st.state, ShimState::Dead);
+        assert!(st.active_child.is_none());
+    }
+
+    #[test]
+    fn kill_preserves_work_then_terminates_the_exec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, child) = state_with_child(tmp.path(), "sleep 30");
+        let running_during_preserve = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&running_during_preserve);
+        let observed_child = Arc::clone(&child);
+        let started = Instant::now();
+        shutdown_codex_exec(&state, Duration::ZERO, move || {
+            let running = observed_child.lock().unwrap().try_wait().unwrap().is_none();
+            observed.store(running, Ordering::SeqCst);
+        });
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(
+            running_during_preserve.load(Ordering::SeqCst),
+            "work must be preserved before the exec is killed"
+        );
+        assert!(child.lock().unwrap().try_wait().unwrap().is_some());
     }
 }
