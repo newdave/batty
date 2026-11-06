@@ -89,9 +89,10 @@ The extracted modules below keep that loop readable without changing the daemon'
 - Supported outcomes are intentionally heterogeneous per request: `Success`, `Conflict`, `Reverted`, and `Failed`. Operators should evaluate each task independently instead of expecting one queue drain to end in a uniform result.
 - Called from daemon flow: each poll loop after completion handling has queued mergeable work.
 
-### `src/team/status.rs`
+### `src/team/status/`
 
 - Responsibility: runtime/member status synthesis, inbox and triage counts, owned-task summaries, workflow metrics, and pane-label formatting.
+- Layout: `members.rs` (runtime member statuses and rows), `branch_signals.rs` (branch/worktree mismatch and staleness signals), `health.rs` and `supervisory.rs` (agent health summaries and supervisory stall labels), `subsystems.rs` (optional subsystems, watchdog, team health), `inbox.rs` (inbox, triage, and owned-task counts), `board.rs` (board task queues), `report.rs` (JSON status report), `metrics.rs` and `workflow.rs` (workflow metrics computation and rendering), `pane_labels.rs` (tmux pane labels). `mod.rs` only re-exports them, so `crate::team::status::X` paths are unchanged; tests live in `status/tests.rs`.
 - Key entrypoints: `list_runtime_member_statuses`, `build_team_status_rows`, `agent_health_by_member`, `triage_backlog_counts`, `pending_inbox_counts`, `owned_task_buckets`, `board_status_task_queues`, `compute_metrics`, `workflow_metrics_section`, `update_pane_status_labels`.
 - Replaced in monolithic daemon: status-report assembly and tmux label formatting code.
 - Called from daemon flow: status reporting, standup generation, intervention inputs, and UI label refresh.
@@ -134,7 +135,7 @@ The extracted modules below keep that loop readable without changing the daemon'
 - Responsibility: workflow-aware nudge target selection based on runnable work, review queues, and ownership.
 - Used by daemon: intervention and idle-automation decisions.
 
-### `src/team/delivery.rs`, `src/team/daemon/dispatch/`, `src/team/merge.rs`, `src/team/status.rs`, and `src/team/task_loop.rs`
+### `src/team/delivery.rs`, `src/team/daemon/dispatch/`, `src/team/merge.rs`, `src/team/status/`, and `src/team/task_loop.rs`
 
 - These are the primary extracted subsystems that replaced large inline sections of the original monolithic daemon and now define the daemon's boundary with delivery, assignment, merge, status, and worktree management.
 
