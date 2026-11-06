@@ -18,7 +18,7 @@ use super::common::shim_eprintln;
 use super::common::{
     self, GROUP_TERM_GRACE_SECS, PROCESS_EXIT_POLL_MS, QueuedMessage, drain_queue_errors,
     enqueue_or_reject, format_injected_message, last_n_lines_of, open_pty_log,
-    screen_capture_event, spawn_session_stats, state_event,
+    queued_write_failed_event, screen_capture_event, spawn_session_stats, state_event,
 };
 use super::protocol::{Channel, Command as ShimCommand, Event, ShimState};
 use super::pty_log::PtyLogWriter;
@@ -169,7 +169,12 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                     Ok(line_result) => Some(line_result),
                     Err(RecvTimeoutError::Timeout) => {
                         if let Some(forced) = force_stalled_completion(&state_stdout, &shim_id) {
-                            emit_forced_completion(&mut evt_channel, &stdin_for_approve, forced);
+                            emit_forced_completion(
+                                &mut evt_channel,
+                                &stdin_for_approve,
+                                &state_stdout,
+                                forced,
+                            );
                         }
                         continue;
                     }
@@ -393,9 +398,11 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                         let text = format_injected_message("batty", &followup.body);
                         let user_msg = SdkUserMessage::new(&session_id, &text);
                         let ndjson = user_msg.to_ndjson();
-                        if let Ok(mut writer) = stdin_for_approve.lock() {
-                            let _ = writeln!(writer, "{ndjson}");
-                            let _ = writer.flush();
+                        if let Err(e) = write_ndjson_line(&stdin_for_approve, &ndjson) {
+                            return_to_idle_after_failed_write(&state_stdout);
+                            let _ =
+                                evt_channel.send(&queued_write_failed_event(None, &e.to_string()));
+                            continue;
                         }
                         let _ = evt_channel.send(&Event::Warning {
                             message: followup.notice,
@@ -452,15 +459,21 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                         let text = format_injected_message(&qm.from, &qm.body);
                         let user_msg = SdkUserMessage::new(&session_id, &text);
                         let ndjson = user_msg.to_ndjson();
-                        if let Ok(mut writer) = stdin_for_approve.lock() {
-                            let _ = writeln!(writer, "{ndjson}");
-                            let _ = writer.flush();
+                        if let Err(e) = write_ndjson_line(&stdin_for_approve, &ndjson) {
+                            return_to_idle_after_failed_write(&state_stdout);
+                            let _ = evt_channel.send(&queued_write_failed_event(
+                                qm.message_id.as_deref(),
+                                &e.to_string(),
+                            ));
+                        } else {
+                            let _ = evt_channel.send(&Event::StateChanged {
+                                from: ShimState::Idle,
+                                to: ShimState::Working,
+                                summary: format!(
+                                    "delivering queued message ({queue_depth} remaining)"
+                                ),
+                            });
                         }
-                        let _ = evt_channel.send(&Event::StateChanged {
-                            from: ShimState::Idle,
-                            to: ShimState::Working,
-                            summary: format!("delivering queued message ({queue_depth} remaining)"),
-                        });
                     }
                 }
 
@@ -583,17 +596,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                         let ndjson = user_msg.to_ndjson();
 
                         if let Err(e) = write_ndjson_line(&stdin_writer, &ndjson) {
-                            // Working was never announced, so return to Idle
-                            // quietly; the next message can then be sent.
-                            let mut st = state_cmd.lock().unwrap();
-                            if st.state == ShimState::Working {
-                                st.state = ShimState::Idle;
-                                st.state_changed_at = Instant::now();
-                                st.pending_message_id = None;
-                                st.last_sent_message_from = None;
-                                st.last_sent_message_preview = None;
-                            }
-                            drop(st);
+                            return_to_idle_after_failed_write(&state_cmd);
                             if let Some(id) = delivery_id {
                                 cmd_channel.send(&Event::DeliveryFailed {
                                     id,
@@ -710,6 +713,22 @@ fn write_ndjson_line<W: IoWrite>(writer: &Mutex<W>, line: &str) -> std::io::Resu
         .map_err(|_| std::io::Error::other("stdin lock poisoned"))?;
     writeln!(writer, "{line}")?;
     writer.flush()
+}
+
+/// Undo a Working state that was set for a message whose stdin write failed.
+/// Working was never announced to the daemon, so the shim returns to Idle
+/// quietly and can accept the next message.
+fn return_to_idle_after_failed_write(state: &Mutex<SdkState>) {
+    let mut st = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if st.state == ShimState::Working {
+        st.state = ShimState::Idle;
+        st.state_changed_at = Instant::now();
+        st.pending_message_id = None;
+        st.last_sent_message_from = None;
+        st.last_sent_message_preview = None;
+    }
 }
 
 fn maybe_send_keepalive<W: IoWrite>(
@@ -968,6 +987,7 @@ fn force_stalled_completion(
 fn emit_forced_completion<W: IoWrite>(
     evt_channel: &mut Channel,
     stdin_writer: &Arc<Mutex<W>>,
+    state: &Mutex<SdkState>,
     forced: ForcedCompletion,
 ) {
     let _ = evt_channel.send(&Event::StateChanged {
@@ -985,9 +1005,13 @@ fn emit_forced_completion<W: IoWrite>(
         let text = format_injected_message(&qm.from, &qm.body);
         let user_msg = SdkUserMessage::new(&forced.session_id, &text);
         let ndjson = user_msg.to_ndjson();
-        if let Ok(mut writer) = stdin_writer.lock() {
-            let _ = writeln!(writer, "{ndjson}");
-            let _ = writer.flush();
+        if let Err(e) = write_ndjson_line(stdin_writer, &ndjson) {
+            return_to_idle_after_failed_write(state);
+            let _ = evt_channel.send(&queued_write_failed_event(
+                qm.message_id.as_deref(),
+                &e.to_string(),
+            ));
+            return;
         }
         let _ = evt_channel.send(&Event::StateChanged {
             from: ShimState::Idle,
