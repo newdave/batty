@@ -1217,7 +1217,9 @@ mod tests {
         let tmp = repo_with_pre_commit("sleep 30");
         let lock = tmp.path().join(".git/index.lock");
         // A separate process (not in git's group) takes the lock during the
-        // run and keeps writing to it, like a live editor integration.
+        // run and keeps writing to it, like a live editor integration. The
+        // 2s timeout leaves room for that process to start under load; with
+        // 800ms it sometimes had not created the lock before the timeout.
         let mut other = Command::new("sh")
             .arg("-c")
             .arg(format!(
@@ -1228,7 +1230,7 @@ mod tests {
             .unwrap();
         let error = cmd(tmp.path())
             .args(["commit", "-q", "--allow-empty", "-m", "x"])
-            .timeout(Duration::from_millis(800))
+            .timeout(Duration::from_secs(2))
             .run()
             .unwrap_err();
         let kept = lock.exists();
