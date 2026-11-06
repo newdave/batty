@@ -1,9 +1,14 @@
 //! Shared utilities used by both PTY runtime and SDK runtime.
 
 use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use anyhow::{Context, Result};
+
 use super::protocol::{Event, ShimState};
+use super::pty_log::PtyLogWriter;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -14,6 +19,12 @@ pub const MAX_QUEUE_DEPTH: usize = 16;
 
 /// How often to report session stats (secs).
 pub const SESSION_STATS_INTERVAL_SECS: u64 = 10;
+
+/// How often to poll a child process for exit (millis).
+pub const PROCESS_EXIT_POLL_MS: u64 = 100;
+
+/// Grace period between SIGTERM and SIGKILL when stopping an agent group (secs).
+pub const GROUP_TERM_GRACE_SECS: u64 = 2;
 
 /// Maximum number of automatic fix-and-retest loops before escalation.
 pub const TEST_FAILURE_MAX_ITERATIONS: u8 = 5;
@@ -170,6 +181,18 @@ pub fn enqueue_or_reject(
         idle_secs: None,
     });
     events
+}
+
+// ---------------------------------------------------------------------------
+// PTY log
+// ---------------------------------------------------------------------------
+
+/// Open the optional PTY log writer shared by the output reader and the
+/// command loop. `None` path means logging is disabled.
+pub fn open_pty_log(path: Option<&Path>) -> Result<Option<Arc<Mutex<PtyLogWriter>>>> {
+    path.map(|p| PtyLogWriter::new(p).context("failed to create PTY log"))
+        .transpose()
+        .map(|w| w.map(|w| Arc::new(Mutex::new(w))))
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +612,31 @@ mod tests {
             }
             other => panic!("expected State, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_pty_log_none_path_disables_logging() {
+        assert!(open_pty_log(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn open_pty_log_creates_file_and_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sub").join("agent.pty.log");
+        let log = open_pty_log(Some(&path)).unwrap();
+        assert!(log.is_some());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn open_pty_log_error_has_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("file");
+        std::fs::write(&blocker, "x").unwrap();
+        let err = open_pty_log(Some(&blocker.join("agent.pty.log")))
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), "failed to create PTY log");
     }
 
     #[test]
