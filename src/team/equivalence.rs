@@ -151,8 +151,17 @@ impl EmulatorBackend for CommandBackend {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             for input in &inputs.events {
-                writeln!(stdin, "{input}")
-                    .with_context(|| format!("failed to write input to `{}`", binary.display()))?;
+                match writeln!(stdin, "{input}") {
+                    Ok(()) => {}
+                    // The command stopped reading (it may not take input at
+                    // all); its exit status decides the outcome.
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to write input to `{}`", binary.display())
+                        });
+                    }
+                }
             }
         }
 
@@ -240,6 +249,23 @@ pub fn update_parity_from_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn command_backend_tolerates_a_command_that_ignores_its_input() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("no-input.sh");
+        std::fs::write(&script, "#!/bin/sh\necho frame-a\necho frame-b\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Far more input than a pipe buffer holds, so writing hits EPIPE
+        // once the script has exited.
+        let inputs = InputSequence::new((0..200_000).map(|i| format!("key-{i}")));
+
+        let capture = CommandBackend.run(&script, &inputs).unwrap();
+
+        assert_eq!(capture.frames, vec!["frame-a", "frame-b"]);
+    }
 
     const FIXTURE_PATH: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
