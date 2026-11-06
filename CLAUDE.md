@@ -50,7 +50,7 @@ planning/          # Architecture, roadmap, philosophy docs
 
 Tests are split into **unit** and **integration**:
 
-- **Unit tests** (`cargo test`): ~3,080 tests that run without tmux. Safe for CI without a tmux server.
+- **Unit tests** (`cargo test`): run without tmux. Safe for CI without a tmux server.
 - **Integration tests** (`cargo test --features integration`): tmux-dependent tests gated behind the `integration` Cargo feature. These require a running tmux server.
 - **Note:** `tmux::tests::*` failures in nested tmux environments (e.g. inside agent sessions) are expected — not real regressions.
 
@@ -100,22 +100,7 @@ macOS AppleSystemPolicy (ASP) kills unsigned or stale-signed binaries. Copying o
 
 ## CLI Commands
 
-- `batty init`: bootstrap Batty assets for a repo
-- `batty start`: start the team runtime
-- `batty stop`: stop the active team runtime
-- `batty attach`: attach to a running tmux session
-- `batty status`: show team/runtime status
-- `batty send`: send a message to another role
-- `batty assign`: assign work to an engineer
-- `batty inbox`: show queued messages for a role
-- `batty read`: read a message or inbox entry
-- `batty ack`: acknowledge a message
-- `batty board`: open the shared board
-- `batty merge`: merge completed work back to the main branch
-- `batty validate`: validate team configuration and runtime prerequisites
-- `batty config`: show resolved configuration
-- `batty telegram`: manage Telegram integration and setup
-- `batty completions`: generate shell completions
+The full command list is generated from clap: `docs/reference/cli.md` (regenerate with `./scripts/generate-docs.sh`). Do not hand-edit it.
 
 ## Development Priority: Self-Improvement and Stability
 
