@@ -2,20 +2,22 @@ mod routing;
 mod telegram;
 mod verification;
 
+#[cfg(test)]
+use crate::tmux;
 use std::time::{Duration, Instant};
 
-use crate::tmux;
-
+#[cfg(test)]
 pub(super) const DELIVERY_VERIFICATION_CAPTURE_LINES: u32 = 50;
 /// Increased capture window for agents that recently became ready, to account
 /// for startup output pushing the delivery marker further up the scrollback.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(super) const DELIVERY_VERIFICATION_CAPTURE_LINES_RECENTLY_READY: u32 = 100;
 pub(super) const FAILED_DELIVERY_RETRY_DELAY: Duration = Duration::from_secs(30);
 pub(super) const FAILED_DELIVERY_MAX_ATTEMPTS: u32 = 3;
 
 /// Check whether an agent's pane is showing a ready prompt by capturing
 /// the last 20 lines and looking for known agent input indicators.
+#[cfg(test)]
 pub(super) fn is_agent_ready(pane_id: &str) -> bool {
     match tmux::capture_pane_recent(pane_id, 20) {
         Ok(capture) => super::watcher::is_at_agent_prompt(&capture),
@@ -28,7 +30,6 @@ pub(super) struct PendingMessage {
     pub(super) from: String,
     pub(super) body: String,
     pub(super) message_id: Option<String>,
-    #[allow(dead_code)] // Useful for future queue-age diagnostics.
     pub(super) queued_at: Instant,
 }
 
@@ -81,6 +82,7 @@ pub(super) fn message_delivery_marker(sender: &str) -> String {
     format!("--- Message from {sender} ---")
 }
 
+#[cfg(test)]
 pub(super) fn capture_contains_message_marker(capture: &str, message_marker: &str) -> bool {
     capture.contains(message_marker)
 }

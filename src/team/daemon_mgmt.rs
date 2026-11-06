@@ -55,8 +55,6 @@ const WATCHDOG_MAX_BACKOFF_SECS: u64 = 30;
 const WATCHDOG_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
 const WATCHDOG_CIRCUIT_BREAKER_WINDOW_SECS: u64 = 60;
 const DAEMON_CHILD_PID_FILE: &str = "daemon-child.pid";
-#[allow(dead_code)] // reserved for future transient-exit classification
-pub(crate) const DAEMON_EXIT_CATEGORY_TRANSIENT: &str = "transient";
 pub(crate) const DAEMON_EXIT_CATEGORY_UNRECOVERABLE: &str = "unrecoverable";
 pub(crate) const DAEMON_EXIT_CATEGORY_UNKNOWN: &str = "unknown";
 

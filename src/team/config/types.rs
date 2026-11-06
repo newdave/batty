@@ -758,12 +758,10 @@ pub enum OrchestratorPosition {
 }
 
 impl WorkflowMode {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn legacy_runtime_enabled(self) -> bool {
         matches!(self, Self::Legacy | Self::Hybrid)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn workflow_state_primary(self) -> bool {
         matches!(self, Self::WorkflowFirst | Self::BoardFirst)
     }
@@ -1026,7 +1024,6 @@ pub struct RoleDef {
     #[serde(default)]
     pub standup_interval_secs: Option<u64>,
     #[serde(default)]
-    #[allow(dead_code)] // Parsed for future ownership semantics but not yet enforced.
     pub owns: Vec<String>,
     #[serde(default)]
     pub barrier_group: Option<String>,

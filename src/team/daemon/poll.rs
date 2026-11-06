@@ -423,7 +423,6 @@ impl TeamDaemon {
                 members: &daemon.config.members,
                 watchers: &daemon.watchers,
                 states: &daemon.states,
-                pane_map: &daemon.config.pane_map,
                 telegram_bot: daemon.integrations.telegram_bot.as_ref(),
                 paused_standups: &daemon.scheduler.paused_standups,
                 last_standup: &mut daemon.scheduler.last_standup,

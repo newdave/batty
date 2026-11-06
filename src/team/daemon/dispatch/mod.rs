@@ -698,11 +698,6 @@ impl TeamDaemon {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn assign_task(&mut self, engineer: &str, task: &str) -> Result<AssignmentLaunch> {
-        self.assign_task_with_task_id(engineer, task, None)
-    }
-
     pub(super) fn assign_task_with_task_id(
         &mut self,
         engineer: &str,

@@ -4,10 +4,13 @@ use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
 use anyhow::Result;
+#[cfg(test)]
 use tracing::warn;
 
 use super::super::*;
+#[cfg(test)]
 use super::{CONTEXT_RESTART_COOLDOWN, format_checkpoint_section};
 use crate::team::supervisory_notice::{
     SupervisoryMemberActivity, SupervisoryPressure, classify_supervisory_pressure,
@@ -42,7 +45,6 @@ pub(in super::super) enum SupervisoryProgress {
     // Retained for future use: pressure types that represent supervisory work
     // which IS actionable but doesn't block stall detection (e.g. a new pressure
     // type that requires immediate attention but not via the dispatch-gap path).
-    #[allow(dead_code)]
     Actionable(SupervisoryPressure),
     Expected(&'static str),
     Incidental(&'static str),
@@ -621,7 +623,7 @@ impl TeamDaemon {
     }
 
     /// Handle a stalled agent — no output change for longer than the configured threshold.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(in super::super) fn handle_stalled_agent(
         &mut self,
         member_name: &str,
@@ -724,7 +726,7 @@ impl TeamDaemon {
     }
 
     /// Escalate a stalled agent to its manager after max restarts exceeded.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn escalate_stalled_agent(
         &mut self,
         member: &MemberInstance,
@@ -761,7 +763,7 @@ impl TeamDaemon {
     }
 
     /// Count prior stall restarts for a given task from the event log.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(in super::super) fn stall_restart_count(&self, task_id: u32) -> Result<u32> {
         let events_path = self
             .config

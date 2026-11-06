@@ -16,8 +16,7 @@ use crate::team::legacy_command_queue;
 use crate::team::standup::MemberState;
 use crate::team::status;
 use crate::team::supervisory_notice::{
-    SupervisoryPressure, SupervisoryPressureSnapshot,
-    actionable_supervisory_pressure_count_from_bodies, classify_supervisory_pressure_normalized,
+    SupervisoryPressure, SupervisoryPressureSnapshot, classify_supervisory_pressure_normalized,
     extract_task_id, is_idle_nudge, is_review_nudge, is_status_update_normalized, normalized_body,
 };
 
@@ -252,15 +251,6 @@ fn should_batch_manager_notice(class: ManagerNoticeClass) -> bool {
             | ManagerNoticeClass::Review
             | ManagerNoticeClass::Recovery
             | ManagerNoticeClass::Status
-    )
-}
-
-#[allow(dead_code)]
-pub(in crate::team) fn actionable_supervisory_notice_count(
-    messages: &[inbox::InboxMessage],
-) -> usize {
-    actionable_supervisory_pressure_count_from_bodies(
-        messages.iter().map(|message| message.body.as_str()),
     )
 }
 

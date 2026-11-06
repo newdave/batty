@@ -843,9 +843,61 @@ pub fn validate_team(project_root: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+impl crate::cli::NudgeIntervention {
+    /// Return the marker file suffix for this intervention.
+    pub fn marker_name(self) -> &'static str {
+        match self {
+            Self::Replenish => "replenish",
+            Self::Triage => "triage",
+            Self::Review => "review",
+            Self::Dispatch => "dispatch",
+            Self::Utilization => "utilization",
+            Self::OwnedTask => "owned-task",
+        }
+    }
+
+    /// All known interventions.
+    pub const ALL: [crate::cli::NudgeIntervention; 6] = [
+        Self::Replenish,
+        Self::Triage,
+        Self::Review,
+        Self::Dispatch,
+        Self::Utilization,
+        Self::OwnedTask,
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nudge_intervention_marker_names() {
+        assert_eq!(
+            crate::cli::NudgeIntervention::Replenish.marker_name(),
+            "replenish"
+        );
+        assert_eq!(
+            crate::cli::NudgeIntervention::Triage.marker_name(),
+            "triage"
+        );
+        assert_eq!(
+            crate::cli::NudgeIntervention::Review.marker_name(),
+            "review"
+        );
+        assert_eq!(
+            crate::cli::NudgeIntervention::Dispatch.marker_name(),
+            "dispatch"
+        );
+        assert_eq!(
+            crate::cli::NudgeIntervention::Utilization.marker_name(),
+            "utilization"
+        );
+        assert_eq!(
+            crate::cli::NudgeIntervention::OwnedTask.marker_name(),
+            "owned-task"
+        );
+    }
 
     #[test]
     fn watch_frame_exits_on_error_when_piped_and_retries_on_tty() {

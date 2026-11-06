@@ -124,11 +124,6 @@ impl AgentHealthSummary {
             || !self.backend_health.is_healthy()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn supervisory_status_token(&self) -> Option<String> {
-        self.supervisory_status_token_for_role(None)
-    }
-
     pub(crate) fn supervisory_status_token_for_role(
         &self,
         role_type: Option<RoleType>,
@@ -1389,7 +1384,7 @@ fn parse_leading_task_id(value: &str) -> Option<u32> {
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn format_agent_health_summary(health: &AgentHealthSummary) -> String {
     format_agent_health_summary_for_role(health, None)
 }

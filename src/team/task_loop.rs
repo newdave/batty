@@ -1,5 +1,6 @@
 //! Task-loop helpers extracted from the team daemon.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -65,7 +66,7 @@ pub(crate) struct CommitValidationGate {
     pub(crate) blockers: Vec<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn priority_rank(p: &str) -> u32 {
     match p {
         "critical" => 0,
@@ -76,7 +77,7 @@ fn priority_rank(p: &str) -> u32 {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn next_unclaimed_task(board_dir: &Path) -> Result<Option<crate::task::Task>> {
     let tasks = crate::task::load_tasks_from_dir(&board_dir.join("tasks"))?;
     let task_status_by_id: HashMap<u32, String> = tasks
@@ -150,7 +151,7 @@ pub fn resolve_main_smoke_command(
     resolve_test_command(root, verification).ok()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn run_tests_in_worktree(
     worktree_dir: &Path,
     test_command: Option<&str>,
@@ -326,7 +327,7 @@ pub(crate) fn validate_review_ready_worktree(
     Ok(validate_review_ready_diff_stat_with_scope(&diff.stdout, &declared_scope).blockers)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn validate_review_ready_diff_stat(diff_stat: &str) -> CommitValidationGate {
     validate_review_ready_diff_stat_with_scope(diff_stat, &[])
 }
@@ -600,27 +601,6 @@ pub(crate) fn prepare_engineer_assignment_worktree_from_trunk(
     Ok(worktree_dir.to_path_buf())
 }
 
-/// Set up worktrees for a multi-repo project. Creates one git worktree per
-/// sub-repo inside `worktree_dir`, mirroring the original directory layout.
-#[allow(dead_code)]
-#[cfg(test)]
-pub(crate) fn setup_multi_repo_worktree(
-    project_root: &Path,
-    worktree_dir: &Path,
-    branch_name: &str,
-    team_config_dir: &Path,
-    sub_repo_names: &[String],
-) -> Result<PathBuf> {
-    setup_multi_repo_worktree_from_trunk(
-        project_root,
-        worktree_dir,
-        branch_name,
-        team_config_dir,
-        sub_repo_names,
-        "main",
-    )
-}
-
 pub(crate) fn setup_multi_repo_worktree_from_trunk(
     project_root: &Path,
     worktree_dir: &Path,
@@ -646,29 +626,6 @@ pub(crate) fn setup_multi_repo_worktree_from_trunk(
 
     ensure_engineer_worktree_links(worktree_dir, team_config_dir)?;
     Ok(worktree_dir.to_path_buf())
-}
-
-/// Prepare worktrees for a multi-repo task assignment. Creates task branches
-/// in every sub-repo so the engineer can work across all of them.
-#[allow(dead_code)]
-#[cfg(test)]
-pub(crate) fn prepare_multi_repo_assignment_worktree(
-    project_root: &Path,
-    worktree_dir: &Path,
-    engineer_name: &str,
-    task_branch: &str,
-    team_config_dir: &Path,
-    sub_repo_names: &[String],
-) -> Result<PathBuf> {
-    prepare_multi_repo_assignment_worktree_from_trunk(
-        project_root,
-        worktree_dir,
-        engineer_name,
-        task_branch,
-        team_config_dir,
-        sub_repo_names,
-        "main",
-    )
 }
 
 pub(crate) fn prepare_multi_repo_assignment_worktree_from_trunk(
@@ -729,25 +686,6 @@ pub(crate) fn worktree_commits_behind_trunk(
     )
 }
 
-#[allow(dead_code)]
-#[cfg(test)]
-pub(crate) fn refresh_engineer_worktree_if_stale(
-    project_root: &Path,
-    worktree_dir: &Path,
-    branch_name: &str,
-    team_config_dir: &Path,
-    stale_threshold: u32,
-) -> Result<WorktreeRefreshOutcome> {
-    refresh_engineer_worktree_if_stale_from_trunk(
-        project_root,
-        worktree_dir,
-        branch_name,
-        team_config_dir,
-        stale_threshold,
-        "main",
-    )
-}
-
 pub(crate) fn refresh_engineer_worktree_if_stale_from_trunk(
     project_root: &Path,
     worktree_dir: &Path,
@@ -803,7 +741,6 @@ fn ensure_engineer_worktree_health(
     Ok(())
 }
 
-#[allow(dead_code)] // Retained for existing tests and as a lower-level helper.
 #[cfg(test)]
 pub(crate) fn refresh_engineer_worktree(
     project_root: &Path,
@@ -1175,7 +1112,7 @@ pub(crate) fn worktree_has_user_changes(worktree_dir: &Path) -> Result<bool> {
     ops::is_dirty(worktree_dir, ExcludePolicy::BattyRuntime)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn preserve_worktree_with_commit(
     worktree_dir: &Path,
     commit_message: &str,
@@ -1498,11 +1435,9 @@ fn auto_clean_worktree(worktree_dir: &Path) -> Result<()> {
 /// accumulation. Returns `true` if changes were successfully committed or
 /// there was nothing to commit.
 ///
-/// Kept as a stable wrapper for the common-case reset flow; production code
-/// currently uses `preserve_worktree_with_commit` directly with custom
-/// messages. Test-only `dead_code` allow keeps the wrapper exercised via
-/// its tests without generating a build warning.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Kept as a stable wrapper for the common-case reset flow; compiled only for
+/// tests, which exercise it.
+#[cfg(test)]
 pub(crate) fn auto_commit_before_reset(worktree_dir: &Path) -> bool {
     let branch = retry_git(|| git_cmd::rev_parse_branch(worktree_dir)).unwrap_or_default();
     let msg = format!("wip: auto-save before worktree reset [{}]", branch);
@@ -1606,21 +1541,6 @@ pub(crate) fn branch_is_merged_into(
     map_git_error(
         retry_git(|| git_cmd::merge_base_is_ancestor(project_root, branch_name, base_branch)),
         &format!("failed to compare branch '{branch_name}' with '{base_branch}'"),
-    )
-}
-
-#[allow(dead_code)]
-#[cfg(test)]
-pub(crate) fn engineer_worktree_ready_for_dispatch(
-    project_root: &Path,
-    worktree_dir: &Path,
-    engineer_name: &str,
-) -> Result<()> {
-    engineer_worktree_ready_for_dispatch_from_trunk(
-        project_root,
-        worktree_dir,
-        engineer_name,
-        "main",
     )
 }
 

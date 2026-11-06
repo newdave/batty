@@ -1134,32 +1134,6 @@ pub enum OpenClawEventTopicArg {
     Lifecycle,
 }
 
-impl NudgeIntervention {
-    /// Return the marker file suffix for this intervention.
-    #[allow(dead_code)]
-    pub fn marker_name(self) -> &'static str {
-        match self {
-            Self::Replenish => "replenish",
-            Self::Triage => "triage",
-            Self::Review => "review",
-            Self::Dispatch => "dispatch",
-            Self::Utilization => "utilization",
-            Self::OwnedTask => "owned-task",
-        }
-    }
-
-    /// All known interventions.
-    #[allow(dead_code)]
-    pub const ALL: [NudgeIntervention; 6] = [
-        Self::Replenish,
-        Self::Triage,
-        Self::Review,
-        Self::Dispatch,
-        Self::Utilization,
-        Self::OwnedTask,
-    ];
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2625,16 +2599,6 @@ mod tests {
     fn nudge_rejects_unknown_intervention() {
         let result = Cli::try_parse_from(["batty", "nudge", "disable", "unknown"]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn nudge_intervention_marker_names() {
-        assert_eq!(NudgeIntervention::Replenish.marker_name(), "replenish");
-        assert_eq!(NudgeIntervention::Triage.marker_name(), "triage");
-        assert_eq!(NudgeIntervention::Review.marker_name(), "review");
-        assert_eq!(NudgeIntervention::Dispatch.marker_name(), "dispatch");
-        assert_eq!(NudgeIntervention::Utilization.marker_name(), "utilization");
-        assert_eq!(NudgeIntervention::OwnedTask.marker_name(), "owned-task");
     }
 
     #[test]

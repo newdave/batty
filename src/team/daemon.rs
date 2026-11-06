@@ -264,12 +264,14 @@ impl ReleaseRecord {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CleanroomBackend {
     SkoolKit,
     Ghidra,
 }
 
+#[cfg(test)]
 impl CleanroomBackend {
     fn detect(input_path: &Path) -> Result<Self> {
         let extension = input_path
@@ -411,74 +413,7 @@ impl TeamDaemon {
         self.record_orchestrator_action(format!("blocked recovery: {reason}"));
     }
 
-    #[allow(dead_code)]
-    pub(super) fn preserve_member_worktree(
-        &mut self,
-        member_name: &str,
-        commit_message: &str,
-    ) -> bool {
-        let policy = &self.config.team_config.workflow_policy;
-        if !policy.auto_commit_on_restart {
-            return false;
-        }
-
-        let Some(member) = self
-            .config
-            .members
-            .iter()
-            .find(|member| member.name == member_name)
-        else {
-            return false;
-        };
-        if member.role_type != RoleType::Engineer || !member.use_worktrees {
-            return false;
-        }
-
-        let worktree_dir = self
-            .config
-            .project_root
-            .join(".batty")
-            .join("worktrees")
-            .join(member_name);
-        if !worktree_dir.exists() {
-            return false;
-        }
-
-        match crate::worktree::ops::preserve_with_commit(
-            &worktree_dir,
-            commit_message,
-            Duration::from_secs(policy.graceful_shutdown_timeout_secs),
-            "restart-or-shutdown preservation",
-        ) {
-            Ok(saved) => {
-                if saved {
-                    info!(
-                        member = member_name,
-                        worktree = %worktree_dir.display(),
-                        "auto-saved worktree before restart/shutdown"
-                    );
-                }
-                saved
-            }
-            Err(error) => {
-                warn!(
-                    member = member_name,
-                    worktree = %worktree_dir.display(),
-                    error = %error,
-                    "failed to auto-save worktree before restart/shutdown"
-                );
-                self.report_preserve_failure(
-                    member_name,
-                    self.active_task_id(member_name),
-                    "restart or shutdown",
-                    &error.to_string(),
-                );
-                false
-            }
-        }
-    }
-
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn watcher_mut(&mut self, name: &str) -> Result<&mut SessionWatcher> {
         self.watchers
             .get_mut(name)
@@ -1065,6 +1000,7 @@ impl TeamDaemon {
             .role_barrier_group(&member.role_name)
     }
 
+    #[cfg(test)]
     fn barrier_worktree_root(&self, barrier_group: &str) -> PathBuf {
         self.config
             .project_root
@@ -1073,7 +1009,7 @@ impl TeamDaemon {
             .join(barrier_group)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn analysis_dir(&self, member_name: &str) -> Result<PathBuf> {
         let Some(group) = self.member_barrier_group(member_name) else {
             bail!(
@@ -1113,7 +1049,7 @@ impl TeamDaemon {
         );
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn validate_member_barrier_path(
         &mut self,
         member_name: &str,
@@ -1150,7 +1086,6 @@ impl TeamDaemon {
         );
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn write_handoff_artifact(
         &mut self,
         author_role: &str,
@@ -1194,7 +1129,7 @@ impl TeamDaemon {
         Ok(artifact_path)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn write_analysis_artifact(
         &mut self,
         author_role: &str,
@@ -1238,7 +1173,7 @@ impl TeamDaemon {
         Ok(artifact_path)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn run_skoolkit_disassembly(
         &mut self,
         author_role: &str,
@@ -1279,7 +1214,7 @@ impl TeamDaemon {
         self.write_analysis_artifact(author_role, output_relative_path, &output.stdout)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn run_ghidra_disassembly(
         &mut self,
         author_role: &str,
@@ -1317,7 +1252,7 @@ impl TeamDaemon {
         self.write_analysis_artifact(author_role, output_relative_path, &output.stdout)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn run_cleanroom_disassembly(
         &mut self,
         author_role: &str,
@@ -1334,7 +1269,7 @@ impl TeamDaemon {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn read_handoff_artifact(
         &mut self,
         reader_role: &str,

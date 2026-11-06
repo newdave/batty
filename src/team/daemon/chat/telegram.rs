@@ -81,7 +81,7 @@ impl TeamDaemon {
         self.deliver_user_channel_inbox()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(in crate::team::daemon) fn execute_telegram_command(
         &mut self,
         command: TelegramCommand,
