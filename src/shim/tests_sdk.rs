@@ -617,3 +617,55 @@ fn sdk_queue_overflow_drops_oldest_with_error_then_warning() {
     })
     .ok();
 }
+
+/// A failed stdin write must not strand the shim in Working: the message is
+/// reported as failed, never as delivered, and the shim stays Idle.
+#[test]
+#[cfg_attr(not(feature = "shim-integration"), ignore)]
+fn sdk_stdin_write_failure_returns_to_idle() {
+    // Mock closes its stdin so every write from the shim fails with EPIPE.
+    let mut ch = spawn_sdk_mock("exec 0<&-; exec sleep 30");
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Ready)
+    })
+    .expect("Ready");
+    std::thread::sleep(Duration::from_millis(500));
+
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "first".into(),
+        message_id: Some("m1".into()),
+    })
+    .unwrap();
+    ch.send(&Command::GetState).unwrap();
+
+    let events = drain_events(&mut ch);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::DeliveryFailed { id, .. } if id == "m1")),
+        "expected DeliveryFailed: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::MessageDelivered { .. })),
+        "unwritten message reported as delivered: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::State {
+                state: ShimState::Idle,
+                ..
+            }
+        )),
+        "expected shim back in Idle: {events:?}"
+    );
+
+    ch.send(&Command::Shutdown {
+        timeout_secs: 2,
+        reason: crate::shim::protocol::ShutdownReason::Requested,
+    })
+    .ok();
+}
