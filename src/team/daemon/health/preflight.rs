@@ -387,6 +387,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = init_git_repo(&tmp, "startup_preflight");
         let fake_bin = setup_fake_kanban(&tmp, "startup-preflight");
+        // Pre-flight requires each member's backend on PATH; CI runners have
+        // no real claude binary.
+        let fake_claude = fake_bin.join("claude");
+        std::fs::write(&fake_claude, "#!/bin/bash\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let original_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvVarGuard::set(
             "PATH",
