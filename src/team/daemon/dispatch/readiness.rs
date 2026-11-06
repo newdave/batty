@@ -53,9 +53,10 @@ impl TeamDaemon {
         );
         tmux::send_keys(pane_id, &command, true)?;
 
-        // Retry verification up to 3 times — the pane may report the old path
-        // if checked too quickly after the cd command.
-        const CWD_VERIFY_RETRIES: u32 = 3;
+        // Retry verification for up to 3s — the pane may report the old path
+        // if checked too quickly after the cd command, and a shell that is
+        // still starting runs the cd only once its prompt is up.
+        const CWD_VERIFY_RETRIES: u32 = 15;
         const CWD_VERIFY_DELAY_MS: u64 = 200;
         let mut last_corrected_path = PathBuf::new();
 
