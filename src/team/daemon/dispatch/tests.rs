@@ -2420,3 +2420,36 @@ fn landed_merge_moves_in_progress_task_to_done_via_review() {
             .all(|entry| entry["source"] == "daemon.merge")
     );
 }
+
+#[test]
+fn render_assignment_body_keeps_restart_resume_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_open_task_file(tmp.path(), 42, "restart-task", "in-progress");
+    let daemon = TestDaemonBuilder::new(tmp.path())
+        .members(vec![engineer_member("eng-1", Some("manager"), false)])
+        .build();
+    let restart = "Continuing Task #42: restart-task\nPrevious session exhausted context; resume from the current worktree state and continue.";
+
+    let body = daemon.render_assignment_body("manager", restart, Some(42));
+
+    assert!(
+        body.starts_with(restart),
+        "restart text was dropped: {body}"
+    );
+    assert!(body.contains("Task context:"));
+    assert!(body.contains("Task #42: restart-task"));
+}
+
+#[test]
+fn render_assignment_body_renders_fresh_assignment_from_board() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_open_task_file(tmp.path(), 42, "fresh-task", "todo");
+    let daemon = TestDaemonBuilder::new(tmp.path())
+        .members(vec![engineer_member("eng-1", Some("manager"), false)])
+        .build();
+
+    let body = daemon.render_assignment_body("manager", "Task #42: fresh-task", Some(42));
+
+    assert!(!body.contains("Task context:"));
+    assert!(body.contains("Task #42: fresh-task"));
+}
