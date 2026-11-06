@@ -11,6 +11,16 @@ Rules are the same as round 1:
 
 Streams own disjoint files and run in parallel.
 
+## Status (2026-11-05)
+
+- **R1–R4: landed on `main`.** R1 `96707cd`, R2 `18f6579`, R3 `180f55a`, R4 `d0a21c9`. The R1.2 defaults (`layout.mode: auto`, `layout.keys: true`) are restored and documented. The CHANGELOG 0.12.0 section carries their lines.
+- **R5: not landed.** No commit exists. The worktree `.claude/worktrees/agent-a1e77df76af67d1b9` is gone, and its uncommitted diff went with it. Restart R5 from this plan. Do not look for a recovery patch.
+- **Settled decisions:**
+  - `auto_merge` matches upstream: bundled templates set no `auto_merge` block, and the init prompt defaults to "no".
+  - The project-rename feature is dropped.
+- **R5.1 still fails on `main`** with `--features integration`: `team::daemon::telemetry::tests::poll_watchers_emits_context_exhausted_event` panics at `src/team/daemon/telemetry.rs:1889` (`left: Some(Idle)`, `right: Some(Working)`). CI does not run the integration feature, so CI stays green.
+- **Test rules for R5:** run the integration suite only on a private tmux server: `env -u TMUX TMUX_TMPDIR=<job-local dir> cargo test --lib --features integration`. Never run a bare `tmux kill-server`.
+
 ## Stream R1: tmux layouts (N2, N11, N12)
 
 Files: `src/team/layout.rs`, `src/team/layout_ui.rs`, `src/tmux.rs`, `src/team/daemon/reconcile.rs` (member add path only), `src/team/config/types.rs` (`LayoutConfig` only), `docs/tmux-layouts.md`, the layout sections of `docs/config-reference.md`, README and getting-started.
