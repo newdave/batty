@@ -52,11 +52,83 @@ pub fn tmux_command() -> Command {
 pub(crate) fn test_tmux_dir() -> &'static std::path::Path {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
+        sweep_dead_test_tmux_dirs(std::path::Path::new("/tmp"));
         // Short path: unix socket paths are limited to ~104 bytes on macOS.
         let dir = std::path::PathBuf::from(format!("/tmp/bt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir
     })
+}
+
+/// A test that panics before killing its session leaves its private tmux
+/// server running after the test binary exits. Kill the servers and remove
+/// the socket dirs of test processes that no longer exist.
+#[cfg(test)]
+fn sweep_dead_test_tmux_dirs(parent: &std::path::Path) {
+    // Tests may put a fake `tmux` first on PATH, so use the system binary.
+    let Some(tmux) = [
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/usr/bin/tmux",
+    ]
+    .into_iter()
+    .map(std::path::Path::new)
+    .find(|path| path.is_file()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("bt-"))
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0 || test_process_alive(pid) {
+            continue;
+        }
+        let dir = entry.path();
+        let Ok(mut child) = Command::new(tmux)
+            .env_remove("TMUX")
+            .env("TMUX_TMPDIR", &dir)
+            .arg("kill-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let exited = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => break false,
+            }
+        };
+        if !exited {
+            // Leave the dir: removing it would orphan a server we could not stop.
+            let _ = child.kill();
+            let _ = child.wait();
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// True unless `pid` certainly does not exist. A pid owned by another user
+/// (EPERM) counts as alive, so its directory is left alone.
+#[cfg(test)]
+fn test_process_alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[cfg(test)]
@@ -2050,6 +2122,26 @@ bind-key -n F7 display-message old-style
             .expect("TMUX_TMPDIR must be set in test builds");
         assert_eq!(tmpdir, test_tmux_dir().as_os_str());
         assert!(test_tmux_dir().to_string_lossy().starts_with("/tmp/bt-"));
+    }
+
+    #[test]
+    fn sweep_removes_only_dead_test_process_dirs() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let dead = parent.path().join(format!("bt-{dead_pid}"));
+        let live = parent.path().join(format!("bt-{}", std::process::id()));
+        let other = parent.path().join("bt-notapid");
+        for dir in [&dead, &live, &other] {
+            std::fs::create_dir_all(dir.join("tmux-502")).unwrap();
+        }
+
+        sweep_dead_test_tmux_dirs(parent.path());
+
+        assert!(!dead.exists(), "dead test process dir should be removed");
+        assert!(live.exists(), "running process dir must be kept");
+        assert!(other.exists(), "non-pid dir must be kept");
     }
 
     #[test]
