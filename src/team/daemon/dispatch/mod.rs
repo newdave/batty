@@ -83,7 +83,7 @@ impl TeamDaemon {
             sender,
         )
         .unwrap_or_else(|_| task.to_string());
-        if is_verification_retry_assignment(task) {
+        if is_verification_retry_assignment(task) || is_restart_assignment(task) {
             format!("{}\n\nTask context:\n{}", task.trim(), rendered)
         } else {
             rendered
@@ -828,6 +828,12 @@ fn is_verification_retry_assignment(task: &str) -> bool {
     task.contains("Fix attempt")
         || task.contains("requires another verification pass")
         || task.contains("verification_retry_required")
+}
+
+/// Restart relaunches carry resume instructions, handoff and checkpoint
+/// context that a fresh board rendering would drop.
+fn is_restart_assignment(task: &str) -> bool {
+    task.contains("Continuing Task #")
 }
 
 pub(super) fn summarize_assignment(task: &str) -> String {
