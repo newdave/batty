@@ -148,6 +148,15 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
 - Pane cwd correction waits up to 3s for a slow-starting shell, so a successful
   correction is recorded instead of being logged as failed.
 - CI runs the live tmux integration tests on a job-local tmux server.
+- A Claude or Kiro shim whose agent stdin was closed stayed Working forever after
+  a failed message write; it now reports the failure and returns to Idle.
+- Codex Shutdown and Kill preserve the worktree before stopping the agent, and
+  Shutdown honours its timeout.
+- A Kiro prompt that failed with an error no longer strands queued messages.
+- Codex context-pressure estimates no longer count each item's output several
+  times.
+- `batty verify` no longer fails when a baseline or candidate command exits
+  without reading its input.
 
 ### Removed
 
