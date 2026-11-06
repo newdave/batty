@@ -582,21 +582,29 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
                         let user_msg = SdkUserMessage::new(&session_id, &text);
                         let ndjson = user_msg.to_ndjson();
 
-                        if let Ok(mut writer) = stdin_writer.lock() {
-                            if let Err(e) = writeln!(writer, "{ndjson}") {
-                                if let Some(id) = delivery_id {
-                                    cmd_channel.send(&Event::DeliveryFailed {
-                                        id,
-                                        reason: format!("stdin write failed: {e}"),
-                                    })?;
-                                }
-                                cmd_channel.send(&Event::Error {
-                                    command: "SendMessage".into(),
+                        if let Err(e) = write_ndjson_line(&stdin_writer, &ndjson) {
+                            // Working was never announced, so return to Idle
+                            // quietly; the next message can then be sent.
+                            let mut st = state_cmd.lock().unwrap();
+                            if st.state == ShimState::Working {
+                                st.state = ShimState::Idle;
+                                st.state_changed_at = Instant::now();
+                                st.pending_message_id = None;
+                                st.last_sent_message_from = None;
+                                st.last_sent_message_preview = None;
+                            }
+                            drop(st);
+                            if let Some(id) = delivery_id {
+                                cmd_channel.send(&Event::DeliveryFailed {
+                                    id,
                                     reason: format!("stdin write failed: {e}"),
                                 })?;
-                                continue;
                             }
-                            let _ = writer.flush();
+                            cmd_channel.send(&Event::Error {
+                                command: "SendMessage".into(),
+                                reason: format!("stdin write failed: {e}"),
+                            })?;
+                            continue;
                         }
 
                         if let Some(id) = delivery_id {
@@ -691,6 +699,17 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
 
     stdout_handle.join().ok();
     Ok(())
+}
+
+/// Write one NDJSON line to the agent's stdin and flush it. A poisoned lock
+/// counts as a failed write so a message is never reported as delivered
+/// without having been written.
+fn write_ndjson_line<W: IoWrite>(writer: &Mutex<W>, line: &str) -> std::io::Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| std::io::Error::other("stdin lock poisoned"))?;
+    writeln!(writer, "{line}")?;
+    writer.flush()
 }
 
 fn maybe_send_keepalive<W: IoWrite>(
@@ -1025,6 +1044,26 @@ mod tests {
         assert_eq!(json["session_id"], "sess-abc");
         assert_eq!(json["message"]["role"], "user");
         assert_eq!(json["message"]["content"], "Fix the bug");
+    }
+
+    #[test]
+    fn write_ndjson_line_reports_poisoned_lock_as_failure() {
+        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let poisoner = Arc::clone(&writer);
+        let _ = thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the stdin lock");
+        })
+        .join();
+        assert!(writer.is_poisoned());
+        assert!(write_ndjson_line(&writer, "{}").is_err());
+    }
+
+    #[test]
+    fn write_ndjson_line_writes_one_line() {
+        let writer = Mutex::new(Vec::<u8>::new());
+        write_ndjson_line(&writer, "{\"a\":1}").unwrap();
+        assert_eq!(writer.into_inner().unwrap(), b"{\"a\":1}\n");
     }
 
     /// Verify that the protocol socketpair still works for our Event types.

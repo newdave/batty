@@ -631,6 +631,18 @@ pub fn run_kiro_acp(args: ShimArgs, channel: Channel) -> Result<()> {
                         let ndjson = prompt_req.to_ndjson();
 
                         if !write_stdin(&stdin_writer, &ndjson) {
+                            // Working was never announced, so return to Idle
+                            // quietly; the next message can then be sent.
+                            let mut st = state_cmd.lock().unwrap();
+                            if st.state == ShimState::Working
+                                && st.pending_prompt_request_id == Some(req_id)
+                            {
+                                st.pending_prompt_request_id = None;
+                                st.pending_message_id = None;
+                                st.state = ShimState::Idle;
+                                st.state_changed_at = Instant::now();
+                            }
+                            drop(st);
                             if let Some(id) = delivery_id {
                                 cmd_channel.send(&Event::DeliveryFailed {
                                     id,
