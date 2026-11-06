@@ -219,25 +219,6 @@ impl TeamDaemon {
         }
     }
 
-    #[allow(dead_code)]
-    pub(in super::super) fn restart_dead_members(&mut self) -> Result<()> {
-        let member_names: Vec<String> = self.config.pane_map.keys().cloned().collect();
-        for name in member_names {
-            let Some(pane_id) = self.config.pane_map.get(&name) else {
-                continue;
-            };
-            if !tmux::pane_exists(pane_id) {
-                continue;
-            }
-            if !tmux::pane_dead(pane_id).unwrap_or(false) {
-                continue;
-            }
-            self.restart_member(&name)?;
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
     pub(in super::super) fn restart_member(&mut self, member_name: &str) -> Result<()> {
         let Some(member) = self
             .config

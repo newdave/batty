@@ -776,80 +776,6 @@ impl TeamDaemon {
         ));
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn record_task_claim_created(
-        &mut self,
-        engineer: &str,
-        task_id: u32,
-        ttl_secs: u64,
-        expires_at: &str,
-    ) {
-        self.emit_event(TeamEvent::task_claim_created(
-            engineer,
-            &task_id.to_string(),
-            ttl_secs,
-            expires_at,
-        ));
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_task_claim_progress(
-        &mut self,
-        engineer: &str,
-        task_id: u32,
-        progress_type: &str,
-    ) {
-        self.emit_event(TeamEvent::task_claim_progress(
-            engineer,
-            &task_id.to_string(),
-            progress_type,
-        ));
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_task_claim_warning(
-        &mut self,
-        engineer: &str,
-        task_id: u32,
-        expires_in_secs: u64,
-    ) {
-        self.emit_event(TeamEvent::task_claim_warning(
-            engineer,
-            &task_id.to_string(),
-            expires_in_secs,
-        ));
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_task_claim_expired(
-        &mut self,
-        engineer: &str,
-        task_id: u32,
-        reclaimed: bool,
-        time_held_secs: Option<u64>,
-    ) {
-        self.emit_event(TeamEvent::task_claim_expired(
-            engineer,
-            &task_id.to_string(),
-            reclaimed,
-            time_held_secs,
-        ));
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_task_claim_extended(
-        &mut self,
-        engineer: &str,
-        task_id: u32,
-        new_expires_at: &str,
-    ) {
-        self.emit_event(TeamEvent::task_claim_extended(
-            engineer,
-            &task_id.to_string(),
-            new_expires_at,
-        ));
-    }
-
     pub(super) fn record_tact_cycle_triggered(
         &mut self,
         architect: &str,
@@ -947,7 +873,6 @@ impl TeamDaemon {
         ));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn record_barrier_artifact_created(
         &mut self,
         role: &str,
@@ -961,7 +886,7 @@ impl TeamDaemon {
         ));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn record_barrier_artifact_read(
         &mut self,
         role: &str,
@@ -975,7 +900,6 @@ impl TeamDaemon {
         ));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn record_barrier_violation_attempt(
         &mut self,
         role: &str,

@@ -2692,12 +2692,11 @@ impl TeamDaemon {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) fn maybe_trigger_planning_cycle(&mut self) -> Result<()> {
         self.tact_check()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn handle_planning_response(&mut self, response: &str) -> Result<usize> {
         let architect = self
             .config

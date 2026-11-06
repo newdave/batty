@@ -27,6 +27,7 @@ pub(super) mod disk_hygiene;
 pub mod narration;
 mod ping_pong;
 mod poll_shim;
+#[cfg(test)]
 mod poll_watchers;
 mod preflight;
 mod restart;
@@ -50,7 +51,7 @@ fn format_checkpoint_section(cp_content: &str) -> String {
 }
 
 impl TeamDaemon {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn handle_pane_death(&mut self, member_name: &str) -> Result<()> {
         self.restart_member(member_name)
     }

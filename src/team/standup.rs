@@ -21,7 +21,6 @@ const REVIEW_POLICY_MAX_CHARS: usize = 2_000;
 
 /// Generate a standup report for a specific recipient, showing only their
 /// direct reports.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn generate_standup_for(
     recipient: &MemberInstance,
     members: &[MemberInstance],
@@ -208,8 +207,6 @@ pub(crate) struct StandupGenerationContext<'a> {
     pub(crate) members: &'a [MemberInstance],
     pub(crate) watchers: &'a HashMap<String, SessionWatcher>,
     pub(crate) states: &'a HashMap<String, MemberState>,
-    #[allow(dead_code)]
-    pub(crate) pane_map: &'a HashMap<String, String>,
     pub(crate) telegram_bot: Option<&'a TelegramBot>,
     pub(crate) paused_standups: &'a HashSet<String>,
     pub(crate) last_standup: &'a mut HashMap<String, Instant>,
@@ -223,7 +220,6 @@ pub(crate) fn maybe_generate_standup(context: StandupGenerationContext<'_>) -> R
         members,
         watchers,
         states,
-        pane_map: _,
         telegram_bot,
         paused_standups,
         last_standup,
@@ -1031,7 +1027,6 @@ mod tests {
             members: &members,
             watchers: &HashMap::new(),
             states: &HashMap::new(),
-            pane_map: &HashMap::new(),
             telegram_bot: None,
             paused_standups: &HashSet::new(),
             last_standup: &mut last_standup,
@@ -1120,7 +1115,6 @@ mod tests {
             members: &members,
             watchers: &HashMap::new(),
             states: &states,
-            pane_map: &HashMap::new(),
             telegram_bot: None,
             paused_standups: &HashSet::new(),
             last_standup: &mut last_standup,
@@ -1747,7 +1741,6 @@ last_verified: 2026-04-05
             members: &members,
             watchers: &HashMap::new(),
             states: &HashMap::new(),
-            pane_map: &HashMap::new(),
             telegram_bot: None,
             paused_standups: &HashSet::new(),
             last_standup: &mut last_standup,
@@ -1819,7 +1812,6 @@ last_verified: 2026-04-05
             members: &members,
             watchers: &HashMap::new(),
             states: &HashMap::new(),
-            pane_map: &HashMap::new(),
             telegram_bot: None,
             paused_standups: &paused,
             last_standup: &mut last_standup,
@@ -1887,7 +1879,6 @@ last_verified: 2026-04-05
             members: &members,
             watchers: &HashMap::new(),
             states: &HashMap::new(),
-            pane_map: &HashMap::new(),
             telegram_bot: None,
             paused_standups: &HashSet::new(),
             last_standup: &mut last_standup,

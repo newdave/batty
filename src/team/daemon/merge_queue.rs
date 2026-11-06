@@ -94,7 +94,6 @@ pub(crate) enum MergeOrigin {
     Chat,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MergeQueueOutcome {
     Success,

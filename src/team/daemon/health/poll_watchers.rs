@@ -7,7 +7,6 @@ use super::super::*;
 
 impl TeamDaemon {
     /// Poll all watchers and handle state transitions.
-    #[allow(dead_code)]
     pub(in super::super) fn poll_watchers(&mut self) -> Result<()> {
         let member_names: Vec<String> = self.watchers.keys().cloned().collect();
 

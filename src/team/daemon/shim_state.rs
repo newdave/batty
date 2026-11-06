@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use super::*;
 
@@ -68,74 +68,10 @@ impl TeamDaemon {
         );
         Ok(())
     }
-
-    /// Load saved shim state and respawn shim handles.
-    /// Returns the number of handles restored.
-    #[allow(dead_code)] // Called from start flow when shim mode is fully wired
-    pub(in crate::team) fn restore_shim_state(&mut self) -> Result<usize> {
-        let path = shim_state_path(&self.config.project_root);
-        if !path.exists() {
-            return Ok(0);
-        }
-
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read shim state from {}", path.display()))?;
-        let state: ShimStateFile =
-            serde_json::from_str(&content).with_context(|| "failed to parse shim state file")?;
-
-        let mut restored = 0;
-        for (name, persisted) in &state.handles {
-            info!(
-                member = name.as_str(),
-                agent_type = persisted.agent_type.as_str(),
-                work_dir = %persisted.work_dir.display(),
-                "restoring shim from saved state"
-            );
-            let sdk_mode = super::launcher::agent_supports_sdk_mode(&persisted.agent_type)
-                && self.config.team_config.use_sdk_mode;
-            match super::shim_spawn::spawn_shim(
-                &persisted.id,
-                &persisted.agent_type,
-                &persisted.agent_cmd,
-                &self.config.project_root,
-                &persisted.work_dir,
-                None,
-                self.config
-                    .team_config
-                    .workflow_policy
-                    .graceful_shutdown_timeout_secs,
-                self.config
-                    .team_config
-                    .workflow_policy
-                    .auto_commit_on_restart,
-                sdk_mode,
-            ) {
-                Ok(handle) => {
-                    self.shim_handles.insert(name.clone(), handle);
-                    restored += 1;
-                }
-                Err(error) => {
-                    warn!(
-                        member = name.as_str(),
-                        error = %error,
-                        "failed to restore shim handle"
-                    );
-                }
-            }
-        }
-
-        // Clear the state file after successful restore
-        if let Err(error) = std::fs::remove_file(&path) {
-            warn!(error = %error, "failed to clean up shim state file");
-        }
-
-        info!(restored, total = state.handles.len(), "shim state restored");
-        Ok(restored)
-    }
 }
 
 /// Load saved shim state without spawning (for inspection/testing).
-#[allow(dead_code)] // Used by tests and future status/inspection commands
+#[cfg(test)]
 pub fn load_shim_state(project_root: &Path) -> Result<ShimStateFile> {
     let path = shim_state_path(project_root);
     if !path.exists() {

@@ -1,20 +1,23 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::FailedDelivery;
+#[cfg(test)]
 use super::{
     DELIVERY_VERIFICATION_CAPTURE_LINES, DELIVERY_VERIFICATION_CAPTURE_LINES_RECENTLY_READY,
-    FailedDelivery, capture_contains_message_marker, is_agent_ready, message_delivery_marker,
+    capture_contains_message_marker, is_agent_ready,
 };
 use crate::team::config::RoleType;
 use crate::team::daemon::TeamDaemon;
 use crate::team::inbox;
+#[cfg(test)]
 use crate::tmux;
 
-#[allow(dead_code)]
 impl TeamDaemon {
+    #[cfg(test)]
     pub(in crate::team) fn verify_message_content_in_pane(
         &self,
         pane_id: &str,
@@ -27,6 +30,7 @@ impl TeamDaemon {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::team) fn verify_message_content_in_pane_lines(
         &self,
         pane_id: &str,
@@ -46,6 +50,7 @@ impl TeamDaemon {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::team) fn record_failed_delivery(
         &mut self,
         recipient: &str,
@@ -226,138 +231,6 @@ impl TeamDaemon {
         Ok(())
     }
 
-    pub(in crate::team) fn verify_message_delivered(
-        &mut self,
-        from: &str,
-        recipient: &str,
-        body: &str,
-        max_attempts: u32,
-        record_failure: bool,
-    ) -> bool {
-        let Some(pane_id) = self.config.pane_map.get(recipient).cloned() else {
-            return true;
-        };
-        let message_marker = message_delivery_marker(from);
-
-        for attempt in 1..=max_attempts {
-            std::thread::sleep(Duration::from_secs(2));
-
-            if self.verify_message_content_in_pane(&pane_id, &message_marker) {
-                self.delivery.clear_failed(recipient, from, body);
-                debug!(
-                    recipient,
-                    attempt,
-                    marker = %message_marker,
-                    "message delivery verified: marker found in pane"
-                );
-                return true;
-            }
-
-            // If the agent is no longer at its ready prompt, it started working —
-            // the marker was consumed and scrolled off the capture window.
-            if self.agent_went_active_after_injection(&pane_id, recipient) {
-                self.delivery.clear_failed(recipient, from, body);
-                info!(
-                    recipient,
-                    attempt,
-                    marker = %message_marker,
-                    "message delivery inferred: agent active after injection (marker scrolloff)"
-                );
-                return true;
-            }
-
-            warn!(
-                recipient,
-                attempt,
-                marker = %message_marker,
-                "message marker missing after injection; resending Enter"
-            );
-            if let Err(error) = tmux::send_keys(&pane_id, "", true) {
-                warn!(recipient, error = %error, "failed to resend Enter");
-            }
-        }
-
-        if record_failure {
-            self.record_failed_delivery(recipient, from, body);
-            warn!(
-                recipient,
-                max_attempts,
-                marker = %message_marker,
-                "message delivery failed after retries; queued for daemon retry"
-            );
-        }
-
-        false
-    }
-
-    #[allow(dead_code)]
-    pub(in crate::team) fn verify_message_delivered_with_lines(
-        &mut self,
-        from: &str,
-        recipient: &str,
-        body: &str,
-        max_attempts: u32,
-        record_failure: bool,
-        capture_lines: u32,
-    ) -> bool {
-        let Some(pane_id) = self.config.pane_map.get(recipient).cloned() else {
-            return true;
-        };
-        let message_marker = message_delivery_marker(from);
-
-        for attempt in 1..=max_attempts {
-            std::thread::sleep(Duration::from_secs(2));
-
-            if self.verify_message_content_in_pane_lines(&pane_id, &message_marker, capture_lines) {
-                self.delivery.clear_failed(recipient, from, body);
-                debug!(
-                    recipient,
-                    attempt,
-                    capture_lines,
-                    marker = %message_marker,
-                    "message delivery verified: marker found in pane"
-                );
-                return true;
-            }
-
-            // If the agent is no longer at its ready prompt, it started working —
-            // the marker was consumed and scrolled off the capture window.
-            if self.agent_went_active_after_injection(&pane_id, recipient) {
-                self.delivery.clear_failed(recipient, from, body);
-                info!(
-                    recipient,
-                    attempt,
-                    capture_lines,
-                    marker = %message_marker,
-                    "message delivery inferred: agent active after injection (marker scrolloff)"
-                );
-                return true;
-            }
-
-            warn!(
-                recipient,
-                attempt,
-                marker = %message_marker,
-                "message marker missing after injection; resending Enter"
-            );
-            if let Err(error) = tmux::send_keys(&pane_id, "", true) {
-                warn!(recipient, error = %error, "failed to resend Enter");
-            }
-        }
-
-        if record_failure {
-            self.record_failed_delivery(recipient, from, body);
-            warn!(
-                recipient,
-                max_attempts,
-                marker = %message_marker,
-                "message delivery failed after retries; queued for daemon retry"
-            );
-        }
-
-        false
-    }
-
     /// Check whether the agent is ready for message delivery.
     ///
     /// Uses the watcher's cached readiness state first (fast path). If the
@@ -368,7 +241,7 @@ impl TeamDaemon {
     /// be stalled waiting for an agent to start. If the agent isn't ready,
     /// the message is deferred to inbox and will be picked up by
     /// `deliver_inbox_messages` once the watcher confirms readiness.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(in crate::team) fn check_agent_ready(&mut self, recipient: &str, pane_id: &str) -> bool {
         // Fast path: watcher already confirmed readiness (prompt seen during poll).
         if self
@@ -398,7 +271,7 @@ impl TeamDaemon {
     /// Returns the appropriate capture line count for delivery verification.
     /// Agents that recently became ready get a larger window to account for
     /// startup output pushing the delivery marker further up the scrollback.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(in crate::team) fn delivery_capture_lines_for(&self, recipient: &str) -> u32 {
         let recently_ready = self
             .watchers
@@ -416,6 +289,7 @@ impl TeamDaemon {
     /// the delivery marker likely scrolled off the capture window — the agent
     /// consumed the message. This prevents false-negative delivery failures when
     /// fast-processing agents push the marker past the capture window.
+    #[cfg(test)]
     pub(in crate::team) fn agent_went_active_after_injection(
         &self,
         pane_id: &str,

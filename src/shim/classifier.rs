@@ -361,22 +361,6 @@ fn detect_context_exhausted(content: &str) -> bool {
 // Claude Code classifier
 // ---------------------------------------------------------------------------
 
-/// Claude Code prompt characters.
-// Claude prompt and spinner chars retained for use in tests and other classifiers.
-#[allow(dead_code)]
-const CLAUDE_PROMPT_CHARS: &[char] = &['\u{276F}']; // ❯
-
-/// Claude spinner prefixes.
-#[allow(dead_code)]
-const CLAUDE_SPINNER_CHARS: &[char] = &[
-    '\u{00B7}', // ·
-    '\u{2722}', // ✢
-    '\u{2733}', // ✳
-    '\u{2736}', // ✶
-    '\u{273B}', // ✻
-    '\u{273D}', // ✽
-];
-
 fn classify_claude(content: &str) -> Classification {
     // Claude Code classification based on the status bar and tool execution indicators.
     //
@@ -453,17 +437,6 @@ pub fn detect_startup_dialog(content: &str) -> bool {
 /// Legacy alias for backward compatibility in tests.
 pub fn detect_claude_dialog(content: &str) -> bool {
     detect_startup_dialog(content)
-}
-
-#[allow(dead_code)]
-fn looks_like_claude_spinner(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let first = trimmed.chars().next().unwrap();
-    CLAUDE_SPINNER_CHARS.contains(&first)
-        && (trimmed.contains('\u{2026}') || trimmed.contains("(thinking"))
 }
 
 // ---------------------------------------------------------------------------

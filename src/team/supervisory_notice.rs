@@ -261,6 +261,7 @@ pub(crate) fn extract_task_id(body: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn actionable_supervisory_pressure_count_from_bodies<'a, I>(bodies: I) -> usize
 where
     I: IntoIterator<Item = &'a str>,

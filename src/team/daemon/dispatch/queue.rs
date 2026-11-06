@@ -796,7 +796,7 @@ impl TeamDaemon {
             .collect()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn next_dispatch_task(
         &self,
         tasks: &[crate::task::Task],

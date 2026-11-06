@@ -36,7 +36,7 @@ pub(super) struct MainSmokeJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ChatReplyTarget {
     /// Only log the reply (direct callers such as tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     None,
     Telegram {
         chat_id: i64,

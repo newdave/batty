@@ -122,7 +122,7 @@ impl AgentHandle {
     }
 
     /// Whether the agent is currently working.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_working(&self) -> bool {
         self.state == ShimState::Working
     }
@@ -332,7 +332,6 @@ impl AgentHandle {
     }
 
     /// Seconds since last state change.
-    #[allow(dead_code)]
     pub fn secs_since_state_change(&self) -> u64 {
         self.state_changed_at.elapsed().as_secs()
     }

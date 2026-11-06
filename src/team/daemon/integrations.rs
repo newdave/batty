@@ -1,7 +1,9 @@
 //! Chat integrations polled by the daemon (Discord and Telegram bots) and the
 //! health and cursor state that goes with them.
 
-use tracing::{info, warn};
+#[cfg(test)]
+use tracing::info;
+use tracing::warn;
 
 use super::background_tests::ChatReplyTarget;
 use crate::team::discord::DiscordBot;
@@ -36,6 +38,7 @@ impl Integrations {
     /// Send the result of a background chat command back to where it came from.
     pub(in crate::team) fn send_chat_reply(&self, target: &ChatReplyTarget, reply: &str) {
         match target {
+            #[cfg(test)]
             ChatReplyTarget::None => {
                 info!(reply = %reply, "background chat command finished");
             }

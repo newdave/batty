@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::Result;
 
@@ -80,8 +80,6 @@ struct BoardSnapshot {
     fingerprint: Option<Fingerprint>,
     /// `write_generation(tasks_dir)` observed before the parse started.
     generation: u64,
-    #[allow(dead_code)]
-    loaded_at: Instant,
 }
 
 /// The daemon's cached board parse; empty until the first `board_tasks` call.
@@ -121,7 +119,6 @@ impl BoardSnapshotCache {
             tasks_dir,
             tasks: Arc::clone(&tasks),
             generation,
-            loaded_at: Instant::now(),
         });
         Ok(tasks)
     }

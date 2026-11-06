@@ -7,7 +7,6 @@ use chrono::{DateTime, Utc};
 
 use crate::task::{Task, load_tasks_from_dir};
 
-pub(crate) const DEFAULT_BOARD_RECONCILIATION_INTERVAL_SECS: u64 = 300;
 pub(crate) const DEFAULT_STUCK_TASK_THRESHOLD_SECS: u64 = 7200;
 pub(crate) const DEFAULT_DONE_TASK_ARCHIVE_AFTER_SECS: u64 = 86400;
 
@@ -545,56 +544,6 @@ pub(crate) fn render_report(report: &ReconciliationReport) -> String {
         "Summary: orphaned={}, stuck={}, auto-fixable={}\n",
         report.summary.orphan_count, report.summary.stuck_count, report.summary.auto_fixable_count
     ));
-    out
-}
-
-pub(crate) fn render_apply_report(report: &ApplyReport) -> String {
-    let mut out = String::new();
-    if report.fixes.is_empty() {
-        out.push_str("No safe board reconciliation fixes were applied.\n");
-        return out;
-    }
-
-    out.push_str("Applied board reconciliation fixes:\n");
-    for fix in &report.fixes {
-        match fix {
-            AppliedFix::Unblocked { task_id, title } => {
-                out.push_str(&format!("  - unblocked task #{task_id} ({title})\n"));
-            }
-            AppliedFix::RequeuedOrphaned {
-                task_id,
-                title,
-                owner,
-            } => {
-                out.push_str(&format!(
-                    "  - requeued orphaned task #{task_id} ({title}) from {}\n",
-                    owner.as_deref().unwrap_or("unclaimed state")
-                ));
-            }
-            AppliedFix::ArchivedDone { task_id, title } => {
-                out.push_str(&format!("  - archived task #{task_id} ({title})\n"));
-            }
-            AppliedFix::CompletedMergedReview {
-                task_id,
-                title,
-                reason,
-            } => {
-                out.push_str(&format!(
-                    "  - completed merged review task #{task_id} ({title}): {reason}\n"
-                ));
-            }
-            AppliedFix::RequeuedReview {
-                task_id,
-                title,
-                reasons,
-            } => {
-                out.push_str(&format!(
-                    "  - requeued review task #{task_id} ({title}): {}\n",
-                    reasons.join("; ")
-                ));
-            }
-        }
-    }
     out
 }
 

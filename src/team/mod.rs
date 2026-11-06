@@ -13,7 +13,7 @@ pub mod backend_probe;
 mod behavioral_tests;
 pub mod bench;
 pub mod board;
-#[allow(dead_code)]
+#[cfg(test)]
 pub mod board_reconciliation;
 pub(crate) mod board_write;
 pub mod outcomes;
@@ -166,13 +166,11 @@ pub(crate) fn orchestrator_ansi_log_path(project_root: &Path) -> PathBuf {
 }
 
 /// Directory containing per-agent PTY log files written by the shim.
-#[allow(dead_code)] // Public API for future shim-mode daemon integration
 pub(crate) fn shim_logs_dir(project_root: &Path) -> PathBuf {
     project_root.join(".batty").join("shim-logs")
 }
 
 /// Path to an individual agent's PTY log file.
-#[allow(dead_code)] // Public API for future shim-mode daemon integration
 pub(crate) fn shim_log_path(project_root: &Path, agent_id: &str) -> PathBuf {
     shim_logs_dir(project_root).join(format!("{agent_id}.pty.log"))
 }
