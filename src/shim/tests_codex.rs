@@ -222,3 +222,51 @@ fn codex_sdk_shutdown() {
     // Either error or the channel is dead — both OK
     drop(result);
 }
+
+/// Characterization: an Idle SendMessage reports the Idle -> Working
+/// StateChanged before MessageDelivered (the reverse of the sdk/kiro order).
+///
+/// There is no fake `codex` binary hook (the program name is fixed), so the
+/// queue-overflow path cannot be held in Working deterministically here; it
+/// is covered by the `common::enqueue_or_reject` unit tests instead.
+#[test]
+#[cfg_attr(not(feature = "shim-integration"), ignore)]
+fn codex_sdk_idle_send_message_emits_state_changed_then_delivered() {
+    let mut ch = spawn_codex_mock();
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Ready)
+    })
+    .expect("Ready");
+
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "first".into(),
+        message_id: Some("m1".into()),
+    })
+    .unwrap();
+
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        match ch.recv::<Event>() {
+            Ok(Some(evt)) => events.push(evt),
+            other => panic!("expected event, got {other:?}"),
+        }
+    }
+    assert!(
+        matches!(&events[..], [
+            Event::StateChanged {
+                from: ShimState::Idle,
+                to: ShimState::Working,
+                ..
+            },
+            Event::MessageDelivered { id },
+        ] if id == "m1"),
+        "unexpected events: {events:?}"
+    );
+
+    ch.send(&Command::Shutdown {
+        timeout_secs: 1,
+        reason: crate::shim::protocol::ShutdownReason::Requested,
+    })
+    .ok();
+}
