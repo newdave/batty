@@ -539,6 +539,9 @@ roles:
 
     #[test]
     fn run_fix_yes_cleans_orphans_and_stale_state() {
+        // `doctor --fix` kills every batty-test-* session on the shared test
+        // tmux server; hold the lock so no live-tmux test runs meanwhile.
+        let _env_lock = crate::team::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let team_name = format!("doctor-run-fix-{}", std::process::id());
         init_git_repo(tmp.path());
@@ -581,6 +584,7 @@ roles:
     #[test]
     #[cfg_attr(not(feature = "integration"), ignore)]
     fn doctor_detects_orphaned_test_sessions() {
+        let _env_lock = crate::team::test_support::env_lock();
         let session1 = format!("batty-test-doctor-orphan-{}-a", std::process::id());
         let session2 = format!("batty-test-doctor-orphan-{}-b", std::process::id());
         let _ = crate::tmux::kill_session(&session1);
