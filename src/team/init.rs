@@ -416,7 +416,7 @@ pub fn init_team_with_overrides(
                 include_str!("templates/python_engineer.md"),
             ),
         ],
-        "simple" | "mixed" => &[
+        "mixed" => &[
             ("architect.md", include_str!("templates/architect.md")),
             ("manager.md", include_str!("templates/manager.md")),
             ("engineer.md", include_str!("templates/engineer.md")),

@@ -7,10 +7,6 @@ orchestrator_position: left
 board:
   rotation_threshold: 20
   auto_dispatch: true
-  tag_roles:
-    research: research-specialist
-    documentation: documentation-specialist
-    quality: quality-specialist
 standup:
   interval_secs: 1800
   output_lines: 12
@@ -26,15 +22,12 @@ automation:
 automation_sender: human
 layout:
   zones:
-    - name: planning
+    - name: architect
       width_pct: 33
-      members: [architect, research-specialist]
-    - name: coordination
+    - name: managers
       width_pct: 33
-      members: [manager, documentation-specialist]
-    - name: delivery
+    - name: engineers
       width_pct: 34
-      members: [engineer, quality-specialist]
 roles:
   - name: human
     role_type: user
@@ -46,7 +39,7 @@ roles:
     effort: medium
     instances: 1
     prompt: architect.md
-    talks_to: [human, manager, research-specialist]
+    talks_to: [human, manager]
     nudge_interval_secs: 3600
   - name: manager
     role_type: manager
@@ -55,44 +48,14 @@ roles:
     effort: medium
     instances: 1
     prompt: manager.md
-    talks_to: [architect, engineer, research-specialist, documentation-specialist, quality-specialist]
+    talks_to: [architect, engineer]
   - name: engineer
     role_type: engineer
     agent: claude
     model: sonnet
     effort: medium
-    instances: 2
+    instances: 3
     prompt: engineer.md
-    talks_to: [manager]
-    use_worktrees: true
-  - name: research-specialist
-    role_type: engineer
-    agent: claude
-    model: sonnet
-    effort: medium
-    instances: 1
-    prompt: research_specialist.md
-    on_demand: true
-    talks_to: [manager, architect]
-    use_worktrees: true
-  - name: documentation-specialist
-    role_type: engineer
-    agent: claude
-    model: haiku
-    instances: 1
-    prompt: documentation_specialist.md
-    on_demand: true
-    docs_only_evidence: true
-    talks_to: [manager]
-    use_worktrees: true
-  - name: quality-specialist
-    role_type: engineer
-    agent: claude
-    model: sonnet
-    effort: medium
-    instances: 1
-    prompt: quality_specialist.md
-    on_demand: true
     talks_to: [manager]
     use_worktrees: true
 workflow_policy:

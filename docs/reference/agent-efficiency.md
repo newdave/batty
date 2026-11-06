@@ -35,14 +35,15 @@ committed documentation-only changes (`docs/`, Markdown and other non-code
 paths). Without it, a completion needs a changed code file, so work from a
 documentation role would be rejected as narration-only.
 
-The default simple team contains an architect, a manager, two general engineers,
-and research, documentation and quality specialists. Its standup interval is
-30 minutes with 12 output lines; the architect nudge interval is one hour. Idle
+The default simple team contains one architect, one manager and three engineers.
+Its standup interval is 30 minutes with 12 output lines; the architect nudge
+interval is one hour. Idle
 inference and architect utilisation interventions are disabled, stall detection
 waits 15 minutes, restart attempts are capped at one, and automatic crash respawn
 is disabled. Verification remains enabled with two iterations and evidence.
-Routine Claude roles select the Sonnet alias with medium effort; the documentation
-specialist selects Haiku without an effort override. These are template choices,
+Every role selects the Sonnet alias with medium effort. The mixed template adds
+the on-demand specialists; its documentation specialist selects Haiku without an
+effort override. These are template choices,
 not forced defaults for other configurations. Existing explicit configuration values take precedence. These defaults also
 change omitted settings in existing teams; review `batty config` before starting.
 

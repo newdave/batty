@@ -133,7 +133,7 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
 
 - Routine template roles use Sonnet/medium and documentation uses Haiku. Shorter
   role prompts bound scope, status exchanges, retries and completion packets.
-- The simple team uses two general engineers and three on-demand specialists,
+- The simple team keeps one architect, one manager and three engineers, with
   longer standup and nudge intervals, and bounded verification and recovery.
 - Idle inference, architect utilisation interventions and automatic crash
   respawn are disabled by default. Explicit configuration remains authoritative.

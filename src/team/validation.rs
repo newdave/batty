@@ -204,7 +204,7 @@ mod tests {
                 users: 1,
                 architects: 1,
                 managers: 1,
-                engineers: 5,
+                engineers: 3,
                 role_capabilities: vec![
                     (
                         "architect",
@@ -226,7 +226,7 @@ mod tests {
                 .iter()
                 .filter(|member| member.role_name == "engineer")
                 .count(),
-            2
+            3
         );
     }
 

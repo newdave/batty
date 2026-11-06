@@ -885,7 +885,7 @@ pub enum InitTemplate {
     Solo,
     /// Architect + 1 engineer pair (2 panes)
     Pair,
-    /// Architect, manager, two engineers and three on-demand specialists
+    /// 1 architect + 1 manager + 3 engineers (5 panes)
     Simple,
     /// Claude coordination and research; Codex engineering and QA; Haiku documentation
     Mixed,
