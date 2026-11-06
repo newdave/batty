@@ -4,12 +4,12 @@ use anyhow::Result;
 use tracing::warn;
 
 use crate::team::daemon::TeamDaemon;
-use crate::team::daemon::verification::{VerificationRecovery, VerificationRunResult};
+use crate::team::daemon::completion_checks::{VerificationRecovery, VerificationRunResult};
 use crate::team::test_results::TestResults;
-use crate::team::verification::VerificationState;
+use crate::team::verification_state::VerificationState;
 
 use super::gates::{DiffEvidence, Rejection};
-use super::verification::verification_retry_budget;
+use super::verify_job::verification_retry_budget;
 
 pub(super) fn verification_fix_message(
     state: &VerificationState,

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use super::MainSmokeState;
 use super::background_tests::BackgroundTests;
-use crate::team::verification::VerificationState;
+use crate::team::verification_state::VerificationState;
 
 pub(in crate::team) struct VerificationTracking {
     /// Per-engineer completion verification loop state.

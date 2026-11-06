@@ -1,6 +1,6 @@
+mod recovery;
 mod routing;
 mod telegram;
-mod verification;
 
 #[cfg(test)]
 use crate::tmux;

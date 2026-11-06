@@ -88,8 +88,9 @@ pub(crate) fn append_task_completion_learning(
 }
 
 fn assignment_packet(task: &Task, ack_recipient: &str) -> String {
-    let allowed_files = crate::team::daemon::verification::parse_scope_fence(&task.description);
-    let ack_token = crate::team::daemon::verification::scope_ack_token(task.id);
+    let allowed_files =
+        crate::team::daemon::completion_checks::parse_scope_fence(&task.description);
+    let ack_token = crate::team::daemon::completion_checks::scope_ack_token(task.id);
     let ack_required = !allowed_files.is_empty();
     let mut packet = String::from("Assignment Packet:\n```yaml\n");
     packet.push_str(&format!("task_id: {}\n", task.id));

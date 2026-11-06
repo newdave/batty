@@ -10,13 +10,13 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
+use crate::team::parity_verify::{self, VerifyStatus};
 use crate::team::task_loop::{
     ADDITIVE_CONFLICT_AUTO_RESOLVE_FENCE, branch_is_merged_into,
     checkout_worktree_branch_from_trunk, current_worktree_branch, delete_branch,
     engineer_base_branch_name, is_worktree_safe_to_mutate, merge_additive_only_text,
     worktree_has_user_changes,
 };
-use crate::team::verification::{self, VerifyStatus};
 
 use super::git_ops::{
     abort_failed_merge, describe_git_failure, force_clean_worktree, run_git_with_context,
@@ -220,7 +220,7 @@ pub(crate) fn merge_engineer_branch_into_trunk(
     }
 
     let verification =
-        verification::verify_project(&worktree_dir, project_root).with_context(|| {
+        parity_verify::verify_project(&worktree_dir, project_root).with_context(|| {
             format!("run verification before merging branch '{branch}' for '{engineer_name}'")
         })?;
     if verification.status == VerifyStatus::Failed {

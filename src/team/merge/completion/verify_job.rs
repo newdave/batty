@@ -11,13 +11,13 @@ use tracing::{info, warn};
 use crate::team::artifact::track_artifact;
 use crate::team::config::VerificationPolicy;
 use crate::team::daemon::TeamDaemon;
-use crate::team::daemon::verification::{
+use crate::team::daemon::completion_checks::{
     VerificationRecovery, VerificationRunResult, run_automatic_verification_tracked,
 };
 use crate::team::telemetry_db;
 use crate::team::test_job::TestJob;
 use crate::team::test_results::{TestFailure, TestResults};
-use crate::team::verification::{EvidenceKind, VerificationPhase, VerificationState};
+use crate::team::verification_state::{EvidenceKind, VerificationPhase, VerificationState};
 
 use super::super::git_ops::{branch_head, head_commit};
 use super::messaging::verification_recovery_message;

@@ -142,7 +142,8 @@ Batty exposes its state through several layers:
 | `src/team/daemon/` | Poll loop, health checks, interventions, merge queue |
 | `src/team/daemon/dispatch/` | Readiness checks, queueing, WIP and stabilization |
 | `src/team/merge/` | Merge operations and locking |
-| `src/team/verification.rs` | Completion verification policy |
+| `src/team/verification_state.rs` | Completion verification state (phase, iterations, evidence) |
+| `src/team/parity_verify.rs` | `batty verify`: clean-room parity checks driven by `PARITY.md` |
 | `src/team/telemetry_db.rs` | SQLite telemetry persistence |
 | `src/shim/` | Agent subprocess runtime and protocol bridges |
 | `src/worktree.rs` | Worktree lifecycle and hygiene |

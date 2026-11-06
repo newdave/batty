@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::task::{Task, load_tasks_from_dir};
 
 use super::board::{WorkflowMetadata, read_workflow_metadata, write_workflow_metadata};
-use super::daemon::verification;
+use super::daemon::completion_checks;
 use super::team_config_dir;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,8 +215,8 @@ fn scope_review_blockers(
     }
 
     let trunk_branch = crate::team::config::configured_trunk_branch(project_root);
-    let changed_files = verification::changed_files_from_trunk(&worktree_dir, &trunk_branch)?;
-    let scope = verification::validate_declared_scope(task_text, &changed_files);
+    let changed_files = completion_checks::changed_files_from_trunk(&worktree_dir, &trunk_branch)?;
+    let scope = completion_checks::validate_declared_scope(task_text, &changed_files);
     if scope.declared_scope.is_empty() || scope.out_of_scope_files.is_empty() {
         return Ok(Vec::new());
     }

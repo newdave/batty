@@ -32,7 +32,7 @@ pub(crate) fn multi_repo_changed_paths(
             continue;
         }
         let files =
-            crate::team::daemon::verification::changed_files_from_trunk(&sub_wt, trunk_branch)
+            crate::team::daemon::completion_checks::changed_files_from_trunk(&sub_wt, trunk_branch)
                 .with_context(|| format!("list changed files in sub-repo {repo_name}"))?;
         paths.extend(files.into_iter().map(|file| format!("{repo_name}/{file}")));
     }
