@@ -356,10 +356,10 @@ Board state changes (tasks added, completed, unblocked)
 
 ### Configuration
 
-| Field                          | Location     | Default             | Description                                            |
-| ------------------------------ | ------------ | ------------------- | ------------------------------------------------------ |
-| `intervention_idle_grace_secs` | `automation` | `60`                | Grace period before firing                             |
-| `intervention_cooldown_secs`   | `automation` | `120`               | Cooldown between fires                                 |
+| Field                          | Location     | Default | Description                |
+| ------------------------------ | ------------ | ------- | -------------------------- |
+| `intervention_idle_grace_secs` | `automation` | `60`    | Grace period before firing |
+| `intervention_cooldown_secs`   | `automation` | `120`   | Cooldown between fires     |
 
 ### Cooldown / Dedup
 
@@ -373,17 +373,17 @@ All intervention settings live in `team.yaml` under the `automation` and `workfl
 
 ### `automation` section
 
-| Field                                 | Type        | Default             | Description                                                      |
-| ------------------------------------- | ----------- | ------------------- | ---------------------------------------------------------------- |
-| `timeout_nudges`                      | bool        | `true`              | Enable idle timeout nudges                                       |
-| `triage_interventions`                | bool        | `true`              | Enable triage backlog interventions                              |
-| `review_interventions`                | bool        | `true`              | Enable review queue interventions                                |
-| `owned_task_interventions`            | bool        | `true`              | Enable owned-task interventions                                  |
-| `manager_dispatch_interventions`      | bool        | `true`              | Enable dispatch-gap interventions                                |
-| `architect_utilization_interventions` | bool        | `true`              | Enable utilization interventions                                 |
-| `intervention_idle_grace_secs`        | int         | `60`                | Seconds a member must be idle before any intervention fires      |
-| `intervention_cooldown_secs`          | int         | `120`               | Seconds between repeated fires of the same intervention key      |
-| `utilization_recovery_interval_secs`  | int         | `1200`              | Seconds between utilization intervention fires (longer cooldown) |
+| Field                                 | Type | Default | Description                                                      |
+| ------------------------------------- | ---- | ------- | ---------------------------------------------------------------- |
+| `timeout_nudges`                      | bool | `true`  | Enable idle timeout nudges                                       |
+| `triage_interventions`                | bool | `true`  | Enable triage backlog interventions                              |
+| `review_interventions`                | bool | `true`  | Enable review queue interventions                                |
+| `owned_task_interventions`            | bool | `true`  | Enable owned-task interventions                                  |
+| `manager_dispatch_interventions`      | bool | `true`  | Enable dispatch-gap interventions                                |
+| `architect_utilization_interventions` | bool | `true`  | Enable utilization interventions                                 |
+| `intervention_idle_grace_secs`        | int  | `60`    | Seconds a member must be idle before any intervention fires      |
+| `intervention_cooldown_secs`          | int  | `120`   | Seconds between repeated fires of the same intervention key      |
+| `utilization_recovery_interval_secs`  | int  | `1200`  | Seconds between utilization intervention fires (longer cooldown) |
 
 ### `workflow_policy` section
 

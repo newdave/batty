@@ -157,18 +157,18 @@ roles:
 
 ## Top-Level Fields
 
-| Key                                               | Purpose                                                    |
-| ------------------------------------------------- | ---------------------------------------------------------- |
-| `name`                                            | Team/session name                                          |
-| `agent`                                           | Team-wide default backend when a role does not override it |
+| Key                                               | Purpose                                                              |
+| ------------------------------------------------- | -------------------------------------------------------------------- |
+| `name`                                            | Team/session name                                                    |
+| `agent`                                           | Team-wide default backend when a role does not override it           |
 | `trunk_branch`                                    | Branch that worktrees start from and merges land on (default `main`) |
-| `workflow_mode`                                   | `legacy`, `hybrid`, or `workflow_first`                    |
-| `use_shim`                                        | Run members through the managed shim runtime               |
-| `use_sdk_mode`                                    | Prefer structured protocols over PTY parsing               |
-| `orchestrator_pane` / `orchestrator_position`     | Show the orchestration surface in tmux                     |
-| `external_senders`                                | Allow non-team sources to message roles                    |
-| `shim_*` and `pending_queue_max_age_secs`         | Runtime health and delivery tuning                         |
-| `event_log_max_bytes` / `retro_min_duration_secs` | Log and retrospective limits                               |
+| `workflow_mode`                                   | `legacy`, `hybrid`, or `workflow_first`                              |
+| `use_shim`                                        | Run members through the managed shim runtime                         |
+| `use_sdk_mode`                                    | Prefer structured protocols over PTY parsing                         |
+| `orchestrator_pane` / `orchestrator_position`     | Show the orchestration surface in tmux                               |
+| `external_senders`                                | Allow non-team sources to message roles                              |
+| `shim_*` and `pending_queue_max_age_secs`         | Runtime health and delivery tuning                                   |
+| `event_log_max_bytes` / `retro_min_duration_secs` | Log and retrospective limits                                         |
 
 ### Merging To An Integration Branch
 
@@ -197,10 +197,13 @@ layout:
 - `auto` (default): tiled panes when at most 4 agent panes fit at 50x12 or
   larger each in the terminal running `batty start`; otherwise `windows`. If
   `zones` is set and `mode` is omitted, panes are kept.
+
 - `panes`: every member tiled in one window (automatic zones unless `zones`
   is set).
+
 - `windows`: window 1 is a live status dashboard, then one window per member
   in hierarchy order, with a clickable tab bar and F-key jumps.
+
 - `focus`: one big pane plus a narrow column; F2-F10 swap a member in, F11 cycles.
 
 - `keys` (default `true`, tmux 3.2+): Batty installs F1 (help), F2-F10
@@ -315,10 +318,10 @@ Every `git` command Batty runs has a timeout. Commands are split into two classe
 - **Long** (default 600s): network and object-store commands (`fetch`, `push`, `pull`, `clone`, `gc`, ...), commands that run hooks (`commit`, `merge`, `rebase`, ...), and commands that walk or rewrite the index or working tree (`checkout`, `switch`, `worktree`, `reset`, `stash`, `add`, `status`, `clean`, `diff`, `merge-tree`).
 - **Short** (default 120s): everything else, mainly read-only plumbing such as `rev-parse`, `rev-list`, `for-each-ref` and `config`.
 
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `BATTY_GIT_TIMEOUT_SECS` | `120` | Timeout in seconds for short-class git commands. |
-| `BATTY_GIT_LONG_TIMEOUT_SECS` | `600` | Timeout in seconds for long-class git commands. |
+| Variable                      | Default | Effect                                           |
+| ----------------------------- | ------- | ------------------------------------------------ |
+| `BATTY_GIT_TIMEOUT_SECS`      | `120`   | Timeout in seconds for short-class git commands. |
+| `BATTY_GIT_LONG_TIMEOUT_SECS` | `600`   | Timeout in seconds for long-class git commands.  |
 
 Values must be positive integers; anything else falls back to the default.
 

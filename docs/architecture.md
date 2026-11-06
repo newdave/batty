@@ -116,36 +116,36 @@ PID is stored at `.batty/daemon.pid`. Logs go to `.batty/daemon.log`.
 
 ## Module Map
 
-| Module              | Responsibility                                                         |
-| ------------------- | ---------------------------------------------------------------------- |
-| `main.rs`           | CLI entrypoint, command dispatch                                       |
-| `cli.rs`            | clap command/option definitions                                        |
-| `team/mod.rs`       | Team lifecycle: init, start, stop, attach, status, send, assign, merge |
-| `team/config.rs`    | TeamConfig, RoleDef, LayoutConfig parsed from YAML                     |
-| `team/hierarchy.rs` | Instance resolution: naming, manager-engineer partitioning             |
-| `team/layout.rs`    | tmux layout builder (zones to panes)                                   |
-| `team/daemon.rs`    | Core daemon: shim spawning, polling loop, message delivery             |
-| `team/inbox.rs`     | Maildir-based inbox: deliver, pending, mark_delivered, all_messages    |
-| `team/legacy_command_queue.rs` | Legacy `commands.jsonl` queue (atomic drain, failures retained) |
-| `team/comms.rs`     | Channel abstraction (tmux pane, Telegram, etc.)                        |
-| `team/telegram.rs`  | Telegram bot integration and setup wizard                              |
-| `team/standup.rs`   | Standup report generation from agent output                            |
-| `team/watcher.rs`   | SessionWatcher: tmux output capture and state tracking                 |
-| `shim/`             | PTY-owning shim runtime, protocol, classifier, chat frontend           |
-| `team/board.rs`     | Kanban board rotation and task management                              |
-| `team/events.rs`    | Structured event sink (JSONL)                                          |
-| `team/templates/`   | Built-in team.yaml templates and prompt .md files                      |
-| `tmux.rs`           | tmux command wrapper (session, window, pane, split, send-keys)         |
-| `agent/mod.rs`      | AgentAdapter trait + registry                                          |
-| `agent/codex.rs`    | Codex adapter                                                          |
-| `worktree.rs`       | Git worktree create/cleanup                                            |
-| `log/mod.rs`        | JSONL execution logs                                                   |
-| `paths.rs`          | `.batty/` path resolution                                              |
-| `config.rs`         | Legacy config loading                                                  |
-| `prompt/`           | Prompt template utilities                                              |
-| `task/`             | kanban-md task parsing                                                 |
-| `events.rs`         | Event types                                                            |
-| `bin/docsgen.rs`    | Documentation generator                                                |
+| Module                         | Responsibility                                                         |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| `main.rs`                      | CLI entrypoint, command dispatch                                       |
+| `cli.rs`                       | clap command/option definitions                                        |
+| `team/mod.rs`                  | Team lifecycle: init, start, stop, attach, status, send, assign, merge |
+| `team/config.rs`               | TeamConfig, RoleDef, LayoutConfig parsed from YAML                     |
+| `team/hierarchy.rs`            | Instance resolution: naming, manager-engineer partitioning             |
+| `team/layout.rs`               | tmux layout builder (zones to panes)                                   |
+| `team/daemon.rs`               | Core daemon: shim spawning, polling loop, message delivery             |
+| `team/inbox.rs`                | Maildir-based inbox: deliver, pending, mark_delivered, all_messages    |
+| `team/legacy_command_queue.rs` | Legacy `commands.jsonl` queue (atomic drain, failures retained)        |
+| `team/comms.rs`                | Channel abstraction (tmux pane, Telegram, etc.)                        |
+| `team/telegram.rs`             | Telegram bot integration and setup wizard                              |
+| `team/standup.rs`              | Standup report generation from agent output                            |
+| `team/watcher.rs`              | SessionWatcher: tmux output capture and state tracking                 |
+| `shim/`                        | PTY-owning shim runtime, protocol, classifier, chat frontend           |
+| `team/board.rs`                | Kanban board rotation and task management                              |
+| `team/events.rs`               | Structured event sink (JSONL)                                          |
+| `team/templates/`              | Built-in team.yaml templates and prompt .md files                      |
+| `tmux.rs`                      | tmux command wrapper (session, window, pane, split, send-keys)         |
+| `agent/mod.rs`                 | AgentAdapter trait + registry                                          |
+| `agent/codex.rs`               | Codex adapter                                                          |
+| `worktree.rs`                  | Git worktree create/cleanup                                            |
+| `log/mod.rs`                   | JSONL execution logs                                                   |
+| `paths.rs`                     | `.batty/` path resolution                                              |
+| `config.rs`                    | Legacy config loading                                                  |
+| `prompt/`                      | Prompt template utilities                                              |
+| `task/`                        | kanban-md task parsing                                                 |
+| `events.rs`                    | Event types                                                            |
+| `bin/docsgen.rs`               | Documentation generator                                                |
 
 ## File Layout
 
