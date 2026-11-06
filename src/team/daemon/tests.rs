@@ -1140,6 +1140,8 @@ fn daemon_lifecycle_happy_path_exercises_decomposed_modules() {
         pane_map: HashMap::from([(member_name.to_string(), pane_id)]),
     })
     .unwrap();
+    daemon.config.team_config.roles =
+        crate::team::test_support::test_role_defs(&daemon.config.members);
     daemon.spawn_all_agents(false).unwrap();
     let spawn_log = wait_for_log_contains(&fake_log, "PWD:");
     assert!(spawn_log.contains("PWD:"));
@@ -1177,6 +1179,17 @@ fn daemon_lifecycle_happy_path_exercises_decomposed_modules() {
     append_codex_task_complete(&session_file);
 
     daemon.run_loop_step("poll_watchers", |daemon| daemon.poll_watchers());
+    // Completion verification and the merge run off the poll loop; step the
+    // loop until both have finished, as the daemon would.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while daemon.active_task_id(member_name).is_some() {
+        assert!(Instant::now() < deadline, "completion never finished");
+        daemon.run_loop_step("poll_background_tests", |daemon| {
+            daemon.poll_background_tests()
+        });
+        daemon.run_loop_step("process_merge_queue", |daemon| daemon.process_merge_queue());
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     assert_eq!(daemon.active_task_id(member_name), None);
     assert_eq!(daemon.states.get(member_name), Some(&MemberState::Idle));
@@ -1461,68 +1474,55 @@ fn report_preserve_failure_deduplicates_identical_lane_level_alerts() {
 
 #[test]
 #[cfg_attr(not(feature = "integration"), ignore)]
-fn maybe_fire_nudges_marks_member_working_after_live_delivery() {
+fn maybe_fire_nudges_diverts_idle_nudge_from_live_pane() {
     let _env_lock = env_lock();
     let session = "batty-test-nudge-live-delivery";
-    let mut delivered_live = false;
+    let _ = crate::tmux::kill_session(session);
 
-    // A freshly created tmux pane can occasionally reject the first live
-    // injection under heavy suite load. Retry the full setup a few times so
-    // this test only fails on a real regression in the live-delivery path.
-    for _attempt in 0..5 {
-        let _ = crate::tmux::kill_session(session);
+    crate::tmux::create_session(session, "cat", &[], "/tmp").unwrap();
+    let pane_id = crate::tmux::pane_id(session).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
 
-        crate::tmux::create_session(session, "cat", &[], "/tmp").unwrap();
-        let pane_id = crate::tmux::pane_id(session).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+    let tmp = tempfile::tempdir().unwrap();
+    let mut watchers = HashMap::new();
+    let mut scientist_watcher = SessionWatcher::new(&pane_id, "scientist", 300, None);
+    scientist_watcher.confirm_ready();
+    watchers.insert("scientist".to_string(), scientist_watcher);
+    let mut daemon = TestDaemonBuilder::new(tmp.path())
+        .session(session)
+        .members(vec![architect_member("scientist")])
+        .pane_map(HashMap::from([("scientist".to_string(), pane_id.clone())]))
+        .watchers(watchers)
+        .states(HashMap::from([(
+            "scientist".to_string(),
+            MemberState::Idle,
+        )]))
+        .nudges(HashMap::from([(
+            "scientist".to_string(),
+            NudgeSchedule {
+                text: "Please make progress.".to_string(),
+                interval: Duration::from_secs(1),
+                idle_since: Some(Instant::now() - Duration::from_secs(5)),
+                fired_this_idle: false,
+                paused: false,
+            },
+        )]))
+        .build();
 
-        let tmp = tempfile::tempdir().unwrap();
-        let mut watchers = HashMap::new();
-        let mut scientist_watcher = SessionWatcher::new(&pane_id, "scientist", 300, None);
-        scientist_watcher.confirm_ready();
-        watchers.insert("scientist".to_string(), scientist_watcher);
-        let mut daemon = TestDaemonBuilder::new(tmp.path())
-            .session(session)
-            .members(vec![architect_member("scientist")])
-            .pane_map(HashMap::from([("scientist".to_string(), pane_id.clone())]))
-            .watchers(watchers)
-            .states(HashMap::from([(
-                "scientist".to_string(),
-                MemberState::Idle,
-            )]))
-            .nudges(HashMap::from([(
-                "scientist".to_string(),
-                NudgeSchedule {
-                    text: "Please make progress.".to_string(),
-                    interval: Duration::from_secs(1),
-                    idle_since: Some(Instant::now() - Duration::from_secs(5)),
-                    fired_this_idle: false,
-                    paused: false,
-                },
-            )]))
-            .build();
+    backdate_idle_grace(&mut daemon, "scientist");
+    daemon.maybe_fire_nudges().unwrap();
 
-        backdate_idle_grace(&mut daemon, "scientist");
-        daemon.maybe_fire_nudges().unwrap();
+    // Idle nudges for PTY members go to the orchestrator log, not the pane,
+    // so the member stays idle and the nudge counts as fired.
+    assert_eq!(daemon.states.get("scientist"), Some(&MemberState::Idle));
+    let schedule = daemon.interventions.nudges.get("scientist").unwrap();
+    assert!(schedule.fired_this_idle);
+    assert!(!schedule.paused);
+    std::thread::sleep(Duration::from_millis(200));
+    let screen = crate::tmux::capture_pane(&pane_id).unwrap_or_default();
+    assert!(!screen.contains("Please make progress."), "{screen}");
 
-        if daemon.states.get("scientist") == Some(&MemberState::Working) {
-            let schedule = daemon.interventions.nudges.get("scientist").unwrap();
-            assert!(schedule.paused);
-            assert!(schedule.idle_since.is_none());
-            assert!(!schedule.fired_this_idle);
-            delivered_live = true;
-            crate::tmux::kill_session(session).unwrap();
-            break;
-        }
-
-        crate::tmux::kill_session(session).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    assert!(
-        delivered_live,
-        "expected at least one successful live nudge delivery"
-    );
+    crate::tmux::kill_session(session).unwrap();
 }
 
 #[test]

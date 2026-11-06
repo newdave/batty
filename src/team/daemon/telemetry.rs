@@ -1883,6 +1883,7 @@ mod tests {
             .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
             .build();
         daemon.event_sink = EventSink::new(&events_path).unwrap();
+        daemon.active_tasks.insert("eng-1".to_string(), 42);
 
         daemon.poll_watchers().unwrap();
 

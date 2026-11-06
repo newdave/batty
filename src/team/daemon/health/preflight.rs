@@ -418,13 +418,9 @@ mod tests {
             .output()
             .unwrap();
         crate::tmux::send_keys(&engineer_pane, "exit", true).unwrap();
-        for _ in 0..20 {
-            if crate::tmux::pane_dead(&engineer_pane).unwrap_or(false) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(crate::tmux::pane_dead(&engineer_pane).unwrap());
+        assert!(crate::team::test_support::wait_for_pane_dead(
+            &engineer_pane
+        ));
 
         let members = vec![
             architect_member("architect"),
@@ -517,13 +513,9 @@ mod tests {
             .output()
             .unwrap();
         crate::tmux::send_keys(&engineer_pane, "exit", true).unwrap();
-        for _ in 0..20 {
-            if crate::tmux::pane_dead(&engineer_pane).unwrap_or(false) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(crate::tmux::pane_dead(&engineer_pane).unwrap());
+        assert!(crate::team::test_support::wait_for_pane_dead(
+            &engineer_pane
+        ));
         assert!(!crate::tmux::pane_dead(&architect_pane).unwrap_or(true));
         assert!(!crate::tmux::pane_dead(&manager_pane).unwrap_or(true));
 
@@ -594,6 +586,8 @@ mod tests {
             ]),
         })
         .unwrap();
+        daemon.config.team_config.roles =
+            crate::team::test_support::test_role_defs(&daemon.config.members);
 
         daemon.run_startup_preflight().unwrap();
         assert!(!crate::tmux::pane_dead(&architect_pane).unwrap_or(true));
@@ -660,6 +654,7 @@ mod tests {
         crate::tmux::create_session(&session, "bash", &[], wrong_dir.to_string_lossy().as_ref())
             .unwrap();
         let pane_id = crate::tmux::pane_id(&session).unwrap();
+        crate::team::test_support::wait_for_shell_ready(&pane_id);
 
         let member = MemberInstance {
             name: member_name.to_string(),
@@ -679,6 +674,8 @@ mod tests {
             pane_map: HashMap::from([(member_name.to_string(), pane_id.clone())]),
         })
         .unwrap();
+        daemon.config.team_config.roles =
+            crate::team::test_support::test_role_defs(&daemon.config.members);
 
         daemon.validate_member_panes_on_startup();
 
@@ -755,6 +752,7 @@ mod tests {
         crate::tmux::create_session(&session, "bash", &[], wrong_dir.to_string_lossy().as_ref())
             .unwrap();
         let pane_id = crate::tmux::pane_id(&session).unwrap();
+        crate::team::test_support::wait_for_shell_ready(&pane_id);
         std::thread::sleep(Duration::from_millis(200));
 
         let engineer = MemberInstance {
@@ -805,6 +803,8 @@ mod tests {
             pane_map: HashMap::from([("eng-1".to_string(), pane_id.clone())]),
         })
         .unwrap();
+        daemon.config.team_config.roles =
+            crate::team::test_support::test_role_defs(&daemon.config.members);
 
         daemon
             .ensure_member_pane_cwd("eng-1", &pane_id, &expected_dir)
