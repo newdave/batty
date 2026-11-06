@@ -16,8 +16,9 @@ use anyhow::{Context, Result};
 use super::child::{spawn_piped_agent, spawn_stderr_logger};
 use super::common::shim_eprintln;
 use super::common::{
-    self, QueuedMessage, SESSION_STATS_INTERVAL_SECS, drain_queue_errors, enqueue_or_reject,
-    format_injected_message, last_n_lines_of, screen_capture_event, state_event,
+    self, GROUP_TERM_GRACE_SECS, PROCESS_EXIT_POLL_MS, QueuedMessage, SESSION_STATS_INTERVAL_SECS,
+    drain_queue_errors, enqueue_or_reject, format_injected_message, last_n_lines_of, open_pty_log,
+    screen_capture_event, state_event,
 };
 use super::protocol::{Channel, Command as ShimCommand, Event, ShimState};
 use super::pty_log::PtyLogWriter;
@@ -28,8 +29,6 @@ use super::sdk_types::{self, SdkControlResponse, SdkOutput, SdkUserMessage};
 // Configuration
 // ---------------------------------------------------------------------------
 
-const PROCESS_EXIT_POLL_MS: u64 = 100;
-const GROUP_TERM_GRACE_SECS: u64 = 2;
 const WORKING_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const STALLED_MID_TURN_MARKER: &str = "stalled mid-turn";
 const MESSAGE_PREVIEW_LIMIT: usize = 160;
@@ -134,12 +133,7 @@ pub fn run_sdk(args: ShimArgs, channel: Channel) -> Result<()> {
     let stdin_writer = Arc::new(Mutex::new(child_stdin));
 
     // -- PTY log writer (optional — writes readable text, not raw NDJSON) --
-    let pty_log: Option<Arc<Mutex<PtyLogWriter>>> = args
-        .pty_log_path
-        .as_deref()
-        .map(|p| PtyLogWriter::new(p).context("failed to create PTY log"))
-        .transpose()?
-        .map(|w| Arc::new(Mutex::new(w)));
+    let pty_log: Option<Arc<Mutex<PtyLogWriter>>> = open_pty_log(args.pty_log_path.as_deref())?;
 
     // -- Channel clones for threads --
     let mut cmd_channel = channel;

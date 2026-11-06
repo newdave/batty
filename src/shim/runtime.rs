@@ -49,11 +49,9 @@ const KIRO_IDLE_SETTLE_MS: u64 = 1200;
 
 /// Max time to wait for agent to show its first prompt (secs).
 const READY_TIMEOUT_SECS: u64 = 120;
-use common::SESSION_STATS_INTERVAL_SECS;
+use common::{GROUP_TERM_GRACE_SECS, PROCESS_EXIT_POLL_MS, SESSION_STATS_INTERVAL_SECS};
 
-const PROCESS_EXIT_POLL_MS: u64 = 100;
 const PARENT_DEATH_POLL_SECS: u64 = 1;
-const GROUP_TERM_GRACE_SECS: u64 = 2;
 pub(crate) const HANDOFF_FILE_NAME: &str = ".batty-handoff.md";
 const AUTO_COMMIT_MESSAGE: &str = "wip: auto-save before restart [batty]";
 const AUTO_COMMIT_TIMEOUT_SECS: u64 = 5;
