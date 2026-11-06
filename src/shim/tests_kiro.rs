@@ -433,6 +433,87 @@ done
     .ok();
 }
 
+/// A prompt that fails with a JSON-RPC error still delivers the next queued
+/// message, as a normal completion does.
+#[test]
+#[cfg_attr(not(feature = "shim-integration"), ignore)]
+fn kiro_acp_error_completion_delivers_queued_message() {
+    let mock = write_mock_script(
+        r#"
+read line
+req_id=$(extract_id "$line")
+sleep 0.5
+echo '{"jsonrpc":"2.0","id":'$req_id',"error":{"code":-32000,"message":"boom"}}'
+read line
+req_id=$(extract_id "$line")
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-mock-123","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second ok"}}}}'
+echo '{"jsonrpc":"2.0","id":'$req_id',"result":{"stopReason":"end_turn"}}'
+sleep 30
+"#,
+    );
+    let mut ch = spawn_kiro_mock(&mock);
+    wait_for_event(&mut ch, Duration::from_secs(10), |e| {
+        matches!(e, Event::Ready)
+    })
+    .expect("Ready");
+
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "first".into(),
+        message_id: Some("m1".into()),
+    })
+    .unwrap();
+    wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(
+            e,
+            Event::StateChanged {
+                to: ShimState::Working,
+                ..
+            }
+        )
+    })
+    .expect("Working after first message");
+    ch.send(&Command::SendMessage {
+        from: "user".into(),
+        body: "second".into(),
+        message_id: Some("m2".into()),
+    })
+    .unwrap();
+
+    match wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Completion { .. })
+    }) {
+        Some(Event::Completion {
+            message_id,
+            response,
+            ..
+        }) => {
+            assert_eq!(message_id.as_deref(), Some("m1"));
+            assert_eq!(response, "[error] boom");
+        }
+        other => panic!("expected error Completion, got {other:?}"),
+    }
+    match wait_for_event(&mut ch, Duration::from_secs(5), |e| {
+        matches!(e, Event::Completion { .. })
+    }) {
+        Some(Event::Completion {
+            message_id,
+            response,
+            ..
+        }) => {
+            assert_eq!(message_id.as_deref(), Some("m2"));
+            assert_eq!(response, "second ok");
+        }
+        other => panic!("queued message was not delivered, got {other:?}"),
+    }
+
+    ch.send(&Command::Shutdown {
+        timeout_secs: 2,
+        reason: crate::shim::protocol::ShutdownReason::Requested,
+    })
+    .ok();
+}
+
 /// Context exhaustion detected from high usage metadata notification.
 #[test]
 #[cfg_attr(not(feature = "shim-integration"), ignore)]
