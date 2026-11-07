@@ -123,6 +123,14 @@ approves and merges `review` tasks that pass the bar, recorded as approved by
 benches written by earlier versions, are never unbenched automatically. To keep
 the previous behaviour, set `workflow_policy.bench_recovery.enabled: false`.
 
+### Jev decisions (opt-in)
+
+`workflow_policy.decisions` adds optional TypeSafe AI Jev decisions for completion checks,
+review rubrics, and the manager's and architect's inbox triage, screen state and stall
+reasons. It is off by default (`provider: heuristic`) and nothing changes unless you set
+`provider: jev` and export the Gateway key named by `api_key_env`. See the config reference
+for what is sent and how it is redacted.
+
 ### Removed config keys
 
 These keys still load but have no effect, and `batty validate` warns about them:

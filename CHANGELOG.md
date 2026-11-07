@@ -59,6 +59,11 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
   engineer is benched, `review` tasks that pass the bar are approved and merged.
   The daemon warns one strike before parking and rescues commits made on the
   wrong branch. `batty status` shows which benches the daemon applied.
+- Optional TypeSafe AI Jev decisions (`workflow_policy.decisions`, off by default):
+  a completion veto, an advisory review rubric, and triage, screen state and stall
+  reasons for the manager and architect, through the Vercel AI Gateway. Secrets are
+  redacted before sending; a daily spend cap, timeouts and a heuristic fallback bound
+  cost and failures.
 
 ### Changed
 
