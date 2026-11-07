@@ -458,6 +458,15 @@ impl TeamEvent {
         }
     }
 
+    pub fn task_auto_approved(role: &str, task: &str, reason: &str) -> Self {
+        Self {
+            role: Some(role.into()),
+            task: Some(task.into()),
+            reason: Some(reason.into()),
+            ..Self::base("task_auto_approved")
+        }
+    }
+
     pub fn task_stale(role: &str, task: &str, reason: &str) -> Self {
         Self {
             role: Some(role.into()),
@@ -1956,6 +1965,19 @@ mod tests {
         .unwrap();
         assert!(capped.contains("\"event\":\"task_bench_reset_capped\""));
         assert!(capped.contains("\"role\":\"eng-1\""));
+    }
+
+    #[test]
+    fn task_auto_approved_serializes_role_task_and_reason() {
+        let json = serde_json::to_string(&TeamEvent::task_auto_approved(
+            "eng-1",
+            "7",
+            "all engineers benched",
+        ))
+        .unwrap();
+        assert!(json.contains("\"event\":\"task_auto_approved\""));
+        assert!(json.contains("\"task\":\"7\""));
+        assert!(json.contains("\"reason\":\"all engineers benched\""));
     }
 
     #[test]

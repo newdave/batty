@@ -362,6 +362,7 @@ impl TeamDaemon {
             engineer,
             test_run.results,
             test_duration_ms,
+            crate::team::daemon::MergeOrigin::Chat,
         )?;
         Ok(format!(
             "Queued Task #{task_id} from {engineer} for merge. Tests: {test_summary}"

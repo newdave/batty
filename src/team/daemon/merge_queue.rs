@@ -92,7 +92,13 @@ pub(crate) enum MergeOrigin {
     DirectCompletion,
     /// A chat (Telegram/Discord) `merge` command approved a review task.
     Chat,
+    /// Bench recovery approved the task (every engineer benched, or a parked
+    /// engineer's work met the bar).
+    BenchRecovery,
 }
+
+/// Reviewer recorded when bench recovery approves a merge.
+pub(crate) const BENCH_RECOVERY_REVIEWER: &str = "daemon (all engineers benched)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MergeQueueOutcome {
@@ -1473,6 +1479,9 @@ impl TeamDaemon {
 
         let board_update_ok = match request.origin {
             MergeOrigin::Chat => approve_chat_merge(self, &board_dir, &board_dir_str, request),
+            MergeOrigin::BenchRecovery => {
+                approve_bench_recovery_merge(self, &board_dir, &board_dir_str, request)
+            }
             MergeOrigin::AutoMerge | MergeOrigin::DirectCompletion => move_task_to_done(
                 self,
                 &board_dir,
@@ -1513,7 +1522,9 @@ impl TeamDaemon {
                     &request.engineer,
                 );
             }
-            MergeOrigin::Chat => self.record_task_manual_merged(request.task_id, mode),
+            MergeOrigin::Chat | MergeOrigin::BenchRecovery => {
+                self.record_task_manual_merged(request.task_id, mode)
+            }
         }
         self.check_binary_freshness_after_merge();
 
@@ -2674,6 +2685,59 @@ fn approve_chat_merge(
             )
         }
     }
+}
+
+/// Record the daemon's approval of a bench recovery merge. A parked task can
+/// still be in progress, so it steps through review first.
+fn approve_bench_recovery_merge(
+    daemon: &mut TeamDaemon,
+    board_dir: &std::path::Path,
+    board_dir_str: &str,
+    request: &MergeRequest,
+) -> bool {
+    let attribution =
+        || crate::team::task_cmd::StatusTransitionAttribution::daemon("daemon.bench_recovery");
+    let in_progress = crate::team::task_cmd::find_task_path(board_dir, request.task_id)
+        .and_then(|path| crate::task::Task::from_file(&path))
+        .is_ok_and(|task| task.status == "in-progress");
+    let approved = (!in_progress
+        || crate::team::task_cmd::transition_task_with_attribution(
+            board_dir,
+            request.task_id,
+            "review",
+            attribution(),
+        )
+        .is_ok())
+        && match crate::team::task_cmd::cmd_review_structured_with_attribution(
+            board_dir,
+            request.task_id,
+            "approve",
+            None,
+            BENCH_RECOVERY_REVIEWER,
+            attribution(),
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    task_id = request.task_id,
+                    error = %error,
+                    "failed to record bench recovery approval; moving task to done directly"
+                );
+                false
+            }
+        };
+    if approved {
+        persist_completed_profile(daemon, board_dir, request.task_id);
+        return true;
+    }
+    let manager_name = daemon.manager_name(&request.engineer);
+    move_task_to_done(
+        daemon,
+        board_dir,
+        board_dir_str,
+        request,
+        manager_name.as_deref(),
+    )
 }
 
 fn move_task_to_done(
