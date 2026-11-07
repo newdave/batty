@@ -1070,6 +1070,41 @@ fn zero_diff_completion_recovery_escalates_after_threshold() {
 }
 
 #[test]
+fn zero_diff_completion_park_records_auto_park_bench_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(&tmp, "batty-zero-diff-park");
+    write_owned_task_file(&repo, 7, "zero-diff-task", "in-progress", "eng-1");
+    let team_dir = repo.join(".batty").join("team_config");
+    std::fs::create_dir_all(&team_dir).unwrap();
+    std::fs::write(
+        team_dir.join("team.yaml"),
+        "name: test\nagent: codex\nroles:\n  - name: eng\n    role_type: engineer\n    instances: 2\n",
+    )
+    .unwrap();
+
+    let mut daemon = TestDaemonBuilder::new(&repo)
+        .members(vec![
+            manager_member("manager", None),
+            engineer_member("eng-1", Some("manager"), true),
+        ])
+        .workflow_policy(WorkflowPolicy {
+            zero_diff_recovery: crate::team::config::ZeroDiffRecovery::Park,
+            ..WorkflowPolicy::default()
+        })
+        .build();
+    daemon.set_active_task_for_test("eng-1", 7);
+
+    daemon
+        .maybe_recover_zero_diff_completion_loop("eng-1", 7, 2)
+        .unwrap();
+
+    let entries = crate::team::bench::bench_entries(&repo).unwrap();
+    let entry = entries.get("eng-1").expect("eng-1 should be benched");
+    assert_eq!(entry.source, crate::team::bench::BenchSource::AutoPark);
+    assert_eq!(entry.task_id, Some(7));
+}
+
+#[test]
 #[cfg_attr(not(feature = "integration"), ignore)]
 fn daemon_lifecycle_happy_path_exercises_decomposed_modules() {
     let _env_lock = env_lock();
