@@ -440,6 +440,24 @@ impl TeamEvent {
         }
     }
 
+    pub fn task_bench_reset(role: &str, task: &str, reason: &str) -> Self {
+        Self {
+            role: Some(role.into()),
+            task: Some(task.into()),
+            reason: Some(reason.into()),
+            ..Self::base("task_bench_reset")
+        }
+    }
+
+    pub fn task_bench_reset_capped(role: &str, task: &str, reason: &str) -> Self {
+        Self {
+            role: Some(role.into()),
+            task: Some(task.into()),
+            reason: Some(reason.into()),
+            ..Self::base("task_bench_reset_capped")
+        }
+    }
+
     pub fn task_stale(role: &str, task: &str, reason: &str) -> Self {
         Self {
             role: Some(role.into()),
@@ -1921,6 +1939,23 @@ mod tests {
         assert!(json.contains("\"role\":\"eng-1\""));
         assert!(json.contains("\"task\":\"7\""));
         assert!(json.contains("\"reason\":\"strike 1/2\""));
+    }
+
+    #[test]
+    fn task_bench_reset_events_serialize_role_task_and_reason() {
+        let reset =
+            serde_json::to_string(&TeamEvent::task_bench_reset("eng-1", "7", "reset 1/2")).unwrap();
+        assert!(reset.contains("\"event\":\"task_bench_reset\""));
+        assert!(reset.contains("\"task\":\"7\""));
+        assert!(reset.contains("\"reason\":\"reset 1/2\""));
+        let capped = serde_json::to_string(&TeamEvent::task_bench_reset_capped(
+            "eng-1",
+            "7",
+            "reset cap reached",
+        ))
+        .unwrap();
+        assert!(capped.contains("\"event\":\"task_bench_reset_capped\""));
+        assert!(capped.contains("\"role\":\"eng-1\""));
     }
 
     #[test]

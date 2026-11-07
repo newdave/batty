@@ -70,6 +70,7 @@ const STALLED_MID_TURN_MAX_ATTEMPTS: u32 = 5;
 pub(super) mod agent_handle;
 mod automation;
 mod background_tests;
+mod bench_recovery;
 pub(crate) mod board_snapshot;
 #[cfg(test)]
 mod board_snapshot_tests;

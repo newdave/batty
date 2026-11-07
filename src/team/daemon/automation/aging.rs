@@ -359,6 +359,12 @@ impl TeamDaemon {
                     .iter()
                     .all(|dependency| done_task_ids.contains(dependency))
             })
+            // A task blocked at the bench-recovery reset cap waits for a
+            // human; finished dependencies must not send it back to todo.
+            .filter(|task| {
+                !crate::team::bench_recovery::read_bench_recovery(&task.source_path)
+                    .bench_reset_capped
+            })
             .filter(|task| match task.status.as_str() {
                 "blocked" => true,
                 "todo" | "backlog" | "runnable" => {
