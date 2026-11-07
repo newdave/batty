@@ -12,6 +12,7 @@ pub mod backend_probe;
 #[cfg(test)]
 mod behavioral_tests;
 pub mod bench;
+pub mod bench_recovery;
 pub mod board;
 #[cfg(test)]
 pub mod board_reconciliation;
