@@ -1280,6 +1280,9 @@ impl TeamDaemon {
                     debug!(engineer, "legacy assign routed to inbox");
                     Ok(())
                 }
+                legacy_command_queue::QueuedCommand::Restart { member, reason, .. } => {
+                    self.restart_requested_member(member, reason)
+                }
             })?;
         for dropped in dropped {
             self.emit_event(TeamEvent::command_dropped(
@@ -2097,6 +2100,22 @@ mod tests {
             sent.lock().unwrap().as_slice(),
             ["Event sink can fail without breaking delivery."]
         );
+    }
+
+    #[test]
+    fn drain_legacy_command_queue_consumes_restart_for_unknown_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue_path = message::command_queue_path(tmp.path());
+        message::enqueue_command(
+            &queue_path,
+            &message::QueuedCommand::restart("ghost", "pane dead"),
+        )
+        .unwrap();
+
+        let mut daemon = empty_legacy_daemon(&tmp);
+        daemon.drain_legacy_command_queue().unwrap();
+
+        assert!(message::read_command_queue(&queue_path).unwrap().is_empty());
     }
 
     #[test]
