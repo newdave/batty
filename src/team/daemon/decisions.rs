@@ -10,6 +10,7 @@
 //! fixed labels, never content or the API key.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -18,7 +19,7 @@ use tracing::debug;
 use super::TeamDaemon;
 use crate::team::config::{DecisionPath, DecisionProvider};
 use crate::team::decide::gate::{self, BoundedCache, ChangeGate};
-use crate::team::decide::paths::{self, CompletionOutcome, TriageOutcome};
+use crate::team::decide::paths::{self, CompletionOutcome, StallOutcome, TriageOutcome};
 use crate::team::decide::{
     Answer, DecisionOutcome, DecisionResponse, Fallback, Question, budget, client, redact,
 };
@@ -58,6 +59,9 @@ pub(crate) struct DecisionsState {
     pending_response: HashMap<String, String>,
     /// Manager to tell about each rubric in flight, keyed by task id.
     rubric_recipients: BoundedCache<String, String>,
+    /// Supervisory stalls held back while their stall call runs, with the
+    /// time each was first held.
+    stall_deferred: BoundedCache<String, Instant>,
     no_key_reported: bool,
     budget_reported_on: Option<String>,
     /// Spend since startup as `(UTC date, USD)`, a floor when the telemetry
@@ -75,6 +79,7 @@ impl Default for DecisionsState {
             triage_deferred: BoundedCache::new(gate::TRIAGE_CACHE_CAPACITY),
             pending_response: HashMap::new(),
             rubric_recipients: BoundedCache::new(gate::GATE_CAPACITY),
+            stall_deferred: BoundedCache::new(gate::GATE_CAPACITY),
             no_key_reported: false,
             budget_reported_on: None,
             session_spend: None,
@@ -114,6 +119,29 @@ fn triage_input_of(body: &str) -> String {
 /// [`TeamDaemon::spawn_decision`] derives from [`triage_input_of`].
 pub(crate) fn triage_body_hash(body: &str) -> u64 {
     gate::text_hash(&redact::redact(&triage_input_of(body)))
+}
+
+/// Bytes read from the end of a member's PTY log for the stall decision.
+const STALL_OUTPUT_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The tail of a PTY log as plain text (ANSI stripped), or empty when the
+/// log is missing.
+fn pty_log_tail(path: &std::path::Path) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(STALL_OUTPUT_TAIL_BYTES)))
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    crate::prompt::strip_ansi(&String::from_utf8_lossy(&bytes))
 }
 
 /// The follow-up manager message for a rubric outcome.
@@ -383,6 +411,101 @@ impl TeamDaemon {
         if let Err(error) = self.queue_message("daemon", &manager, &message) {
             debug!(task = task_key, error = %error, "failed to queue rubric message");
         }
+    }
+
+    /// The member's latest output for the stall decision: the tail of its
+    /// PTY log. Redacted by the caller before use.
+    fn latest_member_output(&self, member: &str) -> String {
+        pty_log_tail(&crate::team::shim_log_path(
+            &self.config.project_root,
+            member,
+        ))
+    }
+
+    /// Supervisory stall with no heuristic signal: true when the stall
+    /// report should wait this tick for a Jev reason. Starts the call on a
+    /// miss. Never holds a stall once a current answer exists, no call is
+    /// running (disabled, no key, budget, recent failure, no output) or the
+    /// stall timeout has passed since it was first held. A Jev "not stalled"
+    /// answer never suppresses the stall; it only adds no reason.
+    pub fn defer_stall_for_jev(&mut self, member: &str) -> bool {
+        if !self.decision_path_configured(DecisionPath::Stall) {
+            return false;
+        }
+        let output = redact::redact(&self.latest_member_output(member));
+        if output.trim().is_empty() {
+            return false;
+        }
+        let input = paths::stall_input(&output);
+        let questions = paths::stall_questions();
+        let hash = gate::input_hash(&redact::redact(&input), &questions);
+        let key = member.to_string();
+        if self
+            .decisions
+            .outcomes
+            .unchanged(DecisionPath::Stall, member, hash)
+        {
+            self.decisions.stall_deferred.remove(&key);
+            return false;
+        }
+        // An answer about older output must not explain this stall.
+        self.decisions.outcomes.forget(DecisionPath::Stall, member);
+        self.start_decision(DecisionPath::Stall, member, &input, questions);
+        if !self
+            .decisions
+            .jobs
+            .contains_key(&(DecisionPath::Stall, key.clone()))
+        {
+            self.decisions.stall_deferred.remove(&key);
+            return false;
+        }
+        let timeout = Duration::from_millis(
+            self.config
+                .team_config
+                .workflow_policy
+                .decisions
+                .timeouts_ms
+                .for_path(DecisionPath::Stall),
+        );
+        let since = match self.decisions.stall_deferred.peek(&key) {
+            Some(since) => *since,
+            None => {
+                let now = Instant::now();
+                self.decisions.stall_deferred.insert(key.clone(), now);
+                now
+            }
+        };
+        if since.elapsed() < timeout {
+            return true;
+        }
+        self.decisions.stall_deferred.remove(&key);
+        false
+    }
+
+    /// The cached Jev stall reason for `member`, only when Jev judged it
+    /// stuck. Read-only.
+    pub fn jev_stall_reason(&self, member: &str) -> Option<&str> {
+        if !self.decision_path_configured(DecisionPath::Stall) {
+            return None;
+        }
+        match self.cached_decision(DecisionPath::Stall, member) {
+            Some(DecisionOutcome::Stall(StallOutcome {
+                stuck: true,
+                reason,
+            })) => Some(reason.as_deref().unwrap_or("other")),
+            _ => None,
+        }
+    }
+
+    /// Test hook: store a stall outcome as if a call had answered.
+    #[cfg(test)]
+    pub(crate) fn seed_stall_outcome(&mut self, member: &str, outcome: StallOutcome) {
+        self.decisions.outcomes.record(
+            DecisionPath::Stall,
+            member,
+            0,
+            DecisionOutcome::Stall(outcome),
+        );
     }
 
     /// Test hook: store a completion outcome as if a call had answered.

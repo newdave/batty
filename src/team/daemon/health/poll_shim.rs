@@ -1222,6 +1222,20 @@ impl TeamDaemon {
             );
             return Ok(());
         }
+        // No heuristic signal: give Jev up to the stall timeout to name a
+        // reason. This only delays the report; it never suppresses it.
+        if self.decision_path_configured(crate::team::config::DecisionPath::Stall)
+            && matches!(
+                self.supervisory_progress_signal(
+                    name,
+                    self.config.team_config.shim_working_state_timeout_secs,
+                ),
+                super::stall::SupervisoryProgress::None
+            )
+            && self.defer_stall_for_jev(name)
+        {
+            return Ok(());
+        }
 
         let stall_secs = self
             .shim_handles
