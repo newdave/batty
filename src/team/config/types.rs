@@ -708,7 +708,7 @@ fn default_effort_ladder_claude() -> Vec<String> {
 }
 
 fn default_effort_ladder_codex() -> Vec<String> {
-    ["minimal", "low", "medium", "high", "xhigh"]
+    ["minimal", "low", "medium", "high", "xhigh", "max"]
         .map(String::from)
         .to_vec()
 }

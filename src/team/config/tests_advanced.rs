@@ -546,7 +546,7 @@ fn parse_bench_recovery_defaults() {
     );
     assert_eq!(
         b.effort_ladder.codex,
-        ["minimal", "low", "medium", "high", "xhigh"]
+        ["minimal", "low", "medium", "high", "xhigh", "max"]
     );
 }
 
