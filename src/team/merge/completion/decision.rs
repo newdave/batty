@@ -129,6 +129,28 @@ pub(super) fn decide_merge_route(
     }
 }
 
+/// Ask Jev to score the task's acceptance criteria for the manager. Advisory
+/// only: the result arrives later as a follow-up message and never feeds
+/// the merge route or the bench bar. No-op without criteria.
+fn start_review_rubric(daemon: &mut TeamDaemon, verified: &VerifiedCompletion<'_>, manager: &str) {
+    if !daemon.decision_path_configured(crate::team::config::DecisionPath::Rubric) {
+        return;
+    }
+    let ctx = verified.ctx;
+    let task_text = ctx.task_text();
+    let criteria = crate::team::decide::criteria::parse_acceptance_criteria(&task_text);
+    if criteria.is_empty() {
+        return;
+    }
+    daemon.start_review_rubric_decision(
+        ctx.task_id,
+        manager,
+        &task_text,
+        &ctx.diff_summary(),
+        &criteria,
+    );
+}
+
 /// Per-task override disabled auto-merge: move to review and tell the
 /// manager. No completion packet is written for this route.
 pub(super) fn route_override_to_review(
@@ -158,6 +180,7 @@ pub(super) fn route_override_to_review(
         );
         daemon.queue_message(engineer, manager_name, &msg)?;
         daemon.mark_member_working(manager_name);
+        start_review_rubric(daemon, verified, manager_name);
     }
     daemon.clear_active_task(engineer);
     daemon.record_task_completed(engineer, Some(task_id));
@@ -194,6 +217,7 @@ pub(super) fn route_to_manual_review(
         );
         daemon.queue_message(engineer, manager_name, &msg)?;
         daemon.mark_member_working(manager_name);
+        start_review_rubric(daemon, verified, manager_name);
     }
     daemon.clear_active_task(engineer);
     daemon.record_task_completed(engineer, Some(task_id));

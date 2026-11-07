@@ -160,19 +160,29 @@ fn start_completion_veto(daemon: &mut TeamDaemon, engineer: &str, ctx: &Completi
     if !daemon.decision_path_configured(crate::team::config::DecisionPath::Completion) {
         return;
     }
-    let task_text = crate::team::task_cmd::find_task_path(&ctx.board_dir, ctx.task_id)
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .unwrap_or_default();
-    let diff = &ctx.diff;
-    let diff_summary = format!(
-        "commits: {}, files changed: {}, code files changed: {}\n{}",
-        diff.total_commits,
-        diff.files_changed,
-        diff.code_files_changed,
-        diff.diff_stat_or_empty()
-    );
-    daemon.start_completion_decision(engineer, ctx.task_id, &task_text, &diff_summary);
+    daemon.start_completion_decision(engineer, ctx.task_id, &ctx.task_text(), &ctx.diff_summary());
+}
+
+impl CompletionContext {
+    /// The raw task file, for decision input; empty when unreadable.
+    fn task_text(&self) -> String {
+        crate::team::task_cmd::find_task_path(&self.board_dir, self.task_id)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    }
+
+    /// Diff counts plus the diff stat, never the full diff.
+    fn diff_summary(&self) -> String {
+        let diff = &self.diff;
+        format!(
+            "commits: {}, files changed: {}, code files changed: {}\n{}",
+            diff.total_commits,
+            diff.files_changed,
+            diff.code_files_changed,
+            diff.diff_stat_or_empty()
+        )
+    }
 }
 
 /// Finish a verified completion, or park it while its Jev veto is still

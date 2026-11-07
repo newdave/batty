@@ -5,6 +5,7 @@ mod decision;
 mod execute;
 mod gates;
 mod multi_repo;
+mod rubric;
 mod verify_job;
 mod veto;
 
