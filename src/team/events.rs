@@ -467,6 +467,22 @@ impl TeamEvent {
         }
     }
 
+    pub fn bench_auto_unbenched(role: &str, task: Option<&str>, reason: &str) -> Self {
+        Self {
+            role: Some(role.into()),
+            task: task.map(Into::into),
+            reason: Some(reason.into()),
+            ..Self::base("bench_auto_unbenched")
+        }
+    }
+
+    pub fn team_fully_benched(reason: &str) -> Self {
+        Self {
+            reason: Some(reason.into()),
+            ..Self::base("team_fully_benched")
+        }
+    }
+
     pub fn task_stale(role: &str, task: &str, reason: &str) -> Self {
         Self {
             role: Some(role.into()),
@@ -1965,6 +1981,22 @@ mod tests {
         .unwrap();
         assert!(capped.contains("\"event\":\"task_bench_reset_capped\""));
         assert!(capped.contains("\"role\":\"eng-1\""));
+    }
+
+    #[test]
+    fn bench_recovery_unbench_and_full_bench_events_serialize() {
+        let unbenched = serde_json::to_string(&TeamEvent::bench_auto_unbenched(
+            "eng-1",
+            None,
+            "no parked task",
+        ))
+        .unwrap();
+        assert!(unbenched.contains("\"event\":\"bench_auto_unbenched\""));
+        assert!(unbenched.contains("\"role\":\"eng-1\""));
+        assert!(!unbenched.contains("\"task\""));
+        let full = serde_json::to_string(&TeamEvent::team_fully_benched("eng-1, eng-2")).unwrap();
+        assert!(full.contains("\"event\":\"team_fully_benched\""));
+        assert!(full.contains("\"reason\":\"eng-1, eng-2\""));
     }
 
     #[test]

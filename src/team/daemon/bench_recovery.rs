@@ -8,15 +8,17 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 use super::TeamDaemon;
 use super::background_tests::{BenchApprovalJob, BenchApprovalKind};
 use super::completion_checks::{VerificationRunResult, run_automatic_verification_tracked};
 use super::merge_queue::MergeOrigin;
-use crate::team::bench::BenchEntry;
+use crate::team::bench::{BenchEntry, BenchSource};
 use crate::team::bench_recovery::{
     BarEvidence, BenchRecoveryFrontmatter, attributed_commit_count, bar_commits_met,
     effort_ladder_for_backend, next_effort, read_bench_recovery, verification_meets_bar,
@@ -256,7 +258,7 @@ impl TeamDaemon {
     /// Start verifying a review task for approval while every engineer is
     /// benched. Returns false when nothing was started (auto-merge disabled,
     /// already queued or already being verified).
-    pub fn start_bench_review_approval(&mut self, task_id: u32) -> Result<bool> {
+    pub(super) fn start_bench_review_approval(&mut self, task_id: u32) -> Result<bool> {
         let task = self.bench_task(task_id)?;
         let engineer = task
             .claimed_by
@@ -267,7 +269,11 @@ impl TeamDaemon {
 
     /// Start verifying a parked engineer's task: it is handed on to merge if
     /// it meets the bar and reset otherwise.
-    pub fn start_parked_task_recovery(&mut self, engineer: &str, task_id: u32) -> Result<bool> {
+    pub(super) fn start_parked_task_recovery(
+        &mut self,
+        engineer: &str,
+        task_id: u32,
+    ) -> Result<bool> {
         self.start_bench_approval_job(task_id, engineer, BenchApprovalKind::RecoverParked)
     }
 
@@ -558,6 +564,173 @@ fn kind_label(kind: BenchApprovalKind) -> &'static str {
     match kind {
         BenchApprovalKind::ApproveReview => "review approval",
         BenchApprovalKind::RecoverParked => "parked task",
+    }
+}
+
+/// How often the bench recovery step runs.
+const BENCH_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+/// Minimum gap between "team fully benched by hand" alerts.
+const FULL_BENCH_ALERT_INTERVAL: Duration = Duration::from_secs(3600);
+
+impl TeamDaemon {
+    /// The bench recovery poll step. Daemon-parked (`auto_park`) engineers
+    /// are recovered once their cool-off has passed, or at once when every
+    /// dispatchable engineer is benched; review tasks are auto-approved while
+    /// the whole team is benched; a team benched entirely by hand alerts the
+    /// humans at most hourly. Manual bench entries are never changed. Only
+    /// the alert runs outside single-repo git projects.
+    pub(super) fn maybe_run_bench_recovery(&mut self) -> Result<()> {
+        let policy = self
+            .config
+            .team_config
+            .workflow_policy
+            .bench_recovery
+            .clone();
+        if !policy.enabled {
+            return Ok(());
+        }
+        if self
+            .scheduler
+            .last_bench_recovery
+            .is_some_and(|ran_at| ran_at.elapsed() < BENCH_RECOVERY_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.scheduler.last_bench_recovery = Some(Instant::now());
+        self.poll_bench_approval_jobs();
+
+        // One read; the bench lock is released before any work below.
+        let entries = crate::team::bench::bench_entries(self.project_root())?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let all_benched = self.all_engineers_benched(&entries);
+        if all_benched
+            && entries
+                .values()
+                .all(|entry| entry.source == BenchSource::Manual)
+        {
+            self.maybe_alert_team_fully_benched(&entries);
+        }
+        if !self.is_git_repo || self.is_multi_repo {
+            return Ok(());
+        }
+
+        let now = Utc::now();
+        for (engineer, entry) in &entries {
+            if entry.source != BenchSource::AutoPark
+                || !(all_benched || bench_cooloff_elapsed(entry, now, policy.cooloff_secs))
+            {
+                continue;
+            }
+            if let Err(error) = self.recover_auto_parked(engineer, entry) {
+                warn!(engineer = %engineer, error = %error, "bench recovery could not recover parked engineer");
+                self.record_orchestrator_action(format!(
+                    "recovery: could not recover parked {engineer}: {error}"
+                ));
+            }
+        }
+
+        if all_benched
+            && policy.auto_approve_when_all_benched
+            && self.config.team_config.workflow_policy.auto_merge.enabled
+        {
+            let engineers: Vec<String> = self
+                .config
+                .members
+                .iter()
+                .filter(|member| member.role_type == RoleType::Engineer)
+                .map(|member| member.name.clone())
+                .collect();
+            let review_tasks: Vec<u32> = self
+                .board_tasks()?
+                .iter()
+                .filter(|task| task.status == "review")
+                .filter(|task| {
+                    task.claimed_by
+                        .as_deref()
+                        .is_some_and(|owner| engineers.iter().any(|name| name == owner))
+                })
+                .map(|task| task.id)
+                .collect();
+            for task_id in review_tasks {
+                if let Err(error) = self.start_bench_review_approval(task_id) {
+                    warn!(task_id, error = %error, "bench recovery could not start review approval");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recover one `auto_park` entry: verify its task, or unbench at once
+    /// when the entry has no task or the task is no longer the engineer's.
+    fn recover_auto_parked(&mut self, engineer: &str, entry: &BenchEntry) -> Result<()> {
+        let active_task = entry.task_id.filter(|task_id| {
+            self.bench_task(*task_id).is_ok_and(|task| {
+                task.claimed_by.as_deref() == Some(engineer)
+                    && matches!(task.status.as_str(), "in-progress" | "review")
+            })
+        });
+        let Some(task_id) = active_task else {
+            crate::team::bench::unbench_engineer(self.project_root(), engineer)?;
+            let task = entry.task_id.map(|task_id| task_id.to_string());
+            self.emit_event(TeamEvent::bench_auto_unbenched(
+                engineer,
+                task.as_deref(),
+                "parked task no longer active",
+            ));
+            self.record_orchestrator_action(format!(
+                "recovery: unbenched {engineer}; its parked task is no longer active"
+            ));
+            return Ok(());
+        };
+        if self
+            .verification
+            .background_tests
+            .bench_approvals
+            .contains_key(&task_id)
+        {
+            return Ok(());
+        }
+        self.start_parked_task_recovery(engineer, task_id)?;
+        Ok(())
+    }
+
+    /// Tell the humans, at most hourly, that every engineer is benched by
+    /// hand and nothing can be dispatched.
+    fn maybe_alert_team_fully_benched(&mut self, entries: &BTreeMap<String, BenchEntry>) {
+        if self
+            .scheduler
+            .last_full_bench_alert
+            .is_some_and(|fired_at| fired_at.elapsed() < FULL_BENCH_ALERT_INTERVAL)
+        {
+            return;
+        }
+        self.scheduler.last_full_bench_alert = Some(Instant::now());
+        let names = entries.keys().cloned().collect::<Vec<_>>().join(", ");
+        let body = format!(
+            "Every engineer is benched by hand ({names}). No work can be dispatched until someone runs `batty unbench <engineer>`."
+        );
+        for human in self.human_role_names() {
+            let _ = self.queue_daemon_message(&human, &body);
+        }
+        self.emit_event(TeamEvent::team_fully_benched(&names));
+        self.record_orchestrator_action(format!(
+            "recovery: every engineer is benched by hand ({names}); alerted the human"
+        ));
+    }
+}
+
+/// Whether a bench entry is older than the cool-off. An unreadable timestamp
+/// counts as elapsed: the entry was written by the daemon and must not stay
+/// parked forever.
+fn bench_cooloff_elapsed(entry: &BenchEntry, now: DateTime<Utc>, cooloff_secs: u64) -> bool {
+    match DateTime::parse_from_rfc3339(&entry.timestamp) {
+        Ok(benched_at) => {
+            now.signed_duration_since(benched_at.with_timezone(&Utc))
+                >= chrono::Duration::seconds(cooloff_secs as i64)
+        }
+        Err(_) => true,
     }
 }
 
@@ -1020,5 +1193,260 @@ mod tests {
             .members(vec![manager_member("manager", None)])
             .build();
         assert!(!daemon.all_engineers_benched(&BTreeMap::new()));
+    }
+
+    fn set_bench_entry(
+        repo: &Path,
+        engineer: &str,
+        source: BenchSource,
+        task_id: Option<u32>,
+        age_secs: i64,
+    ) {
+        let mut state = crate::team::bench::load_bench_state(repo).unwrap();
+        state.benched.insert(
+            engineer.to_string(),
+            BenchEntry {
+                timestamp: (Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339(),
+                reason: None,
+                source,
+                task_id,
+            },
+        );
+        std::fs::write(
+            crate::team::bench::bench_file_path(repo),
+            serde_yaml::to_string(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn approval_kind(daemon: &TeamDaemon, task_id: u32) -> Option<BenchApprovalKind> {
+        daemon
+            .verification
+            .background_tests
+            .bench_approvals
+            .get(&task_id)
+            .map(|job| job.kind)
+    }
+
+    #[test]
+    fn manual_bench_is_never_auto_unbenched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = parked_daemon(&tmp);
+        set_bench_entry(&repo, "eng-1", BenchSource::Manual, Some(7), 7200);
+
+        daemon.maybe_run_bench_recovery().unwrap();
+
+        assert!(bench_entries(&repo).unwrap().contains_key("eng-1"));
+        assert!(
+            daemon
+                .verification
+                .background_tests
+                .bench_approvals
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn auto_park_entry_waits_for_the_cooloff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = parked_daemon(&tmp);
+        daemon.config.team_config.workflow_policy.test_command = Some("true".to_string());
+        set_bench_entry(&repo, "eng-1", BenchSource::AutoPark, Some(7), 600);
+
+        daemon.maybe_run_bench_recovery().unwrap();
+        assert_eq!(approval_kind(&daemon, 7), None);
+        assert!(bench_entries(&repo).unwrap().contains_key("eng-1"));
+
+        set_bench_entry(&repo, "eng-1", BenchSource::AutoPark, Some(7), 31 * 60);
+        daemon.scheduler.last_bench_recovery = None;
+        daemon.maybe_run_bench_recovery().unwrap();
+        assert_eq!(
+            approval_kind(&daemon, 7),
+            Some(BenchApprovalKind::RecoverParked)
+        );
+        wait_for_bench_jobs(&mut daemon);
+    }
+
+    #[test]
+    fn auto_park_entry_without_task_is_unbenched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = parked_daemon(&tmp);
+        set_bench_entry(&repo, "eng-1", BenchSource::AutoPark, None, 7200);
+
+        daemon.maybe_run_bench_recovery().unwrap();
+
+        assert!(!bench_entries(&repo).unwrap().contains_key("eng-1"));
+        assert!(
+            event_names(&repo)
+                .iter()
+                .any(|e| e == "bench_auto_unbenched")
+        );
+        assert_eq!(orchestrator_lines(&repo, "unbenched eng-1"), 1);
+    }
+
+    #[test]
+    fn auto_park_entry_whose_task_moved_on_is_unbenched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, task_path, mut daemon) = parked_daemon(&tmp);
+        task_cmd::update_task_frontmatter(&task_path, |mapping| {
+            task_cmd::set_optional_string(mapping, "status", Some("done"));
+        })
+        .unwrap();
+        set_bench_entry(&repo, "eng-1", BenchSource::AutoPark, Some(7), 7200);
+
+        daemon.maybe_run_bench_recovery().unwrap();
+
+        assert!(!bench_entries(&repo).unwrap().contains_key("eng-1"));
+        assert_eq!(approval_kind(&daemon, 7), None);
+    }
+
+    #[test]
+    fn all_benched_ignores_on_demand_engineers_and_skips_the_cooloff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = parked_daemon(&tmp);
+        daemon.config.team_config.workflow_policy.test_command = Some("true".to_string());
+        let mut helper = engineer_member("eng-3", Some("manager"), false);
+        helper.role_name = "helper".to_string();
+        daemon.config.members.push(helper);
+        let mut helper_role = RoleDef::test("helper".to_string(), RoleType::Engineer);
+        helper_role.on_demand = true;
+        daemon.config.team_config.roles.push(helper_role);
+        set_bench_entry(&repo, "eng-1", BenchSource::AutoPark, Some(7), 0);
+        set_bench_entry(&repo, "eng-2", BenchSource::Manual, None, 0);
+
+        assert!(daemon.all_engineers_benched(&bench_entries(&repo).unwrap()));
+        daemon.maybe_run_bench_recovery().unwrap();
+
+        assert_eq!(
+            approval_kind(&daemon, 7),
+            Some(BenchApprovalKind::RecoverParked)
+        );
+        wait_for_bench_jobs(&mut daemon);
+    }
+
+    #[test]
+    fn fully_manual_bench_alerts_the_human_once_an_hour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = parked_daemon(&tmp);
+        set_bench_entry(&repo, "eng-1", BenchSource::Manual, None, 0);
+        set_bench_entry(&repo, "eng-2", BenchSource::Manual, None, 0);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        daemon.delivery.channels.insert(
+            "human".to_string(),
+            Box::new(RecordingChannel {
+                messages: Arc::clone(&sent),
+            }),
+        );
+
+        daemon.maybe_run_bench_recovery().unwrap();
+        daemon.scheduler.last_bench_recovery = None;
+        daemon.maybe_run_bench_recovery().unwrap();
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("benched by hand"), "{}", sent[0]);
+        let alerts = event_names(&repo)
+            .into_iter()
+            .filter(|e| e == "team_fully_benched")
+            .count();
+        assert_eq!(alerts, 1);
+        assert!(bench_entries(&repo).unwrap().contains_key("eng-1"));
+    }
+
+    #[test]
+    fn bench_recovery_is_a_no_op_outside_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_team_yaml(root);
+        let task_path = write_parked_task(root, 7, "in-progress", "eng-1");
+        set_bench_entry(root, "eng-1", BenchSource::AutoPark, Some(7), 7200);
+        let mut daemon = TestDaemonBuilder::new(root)
+            .members(vec![
+                engineer_member("eng-1", None, true),
+                engineer_member("eng-2", None, true),
+            ])
+            .workflow_policy(enabled_policy())
+            .build();
+        assert!(!daemon.is_git_repo);
+
+        daemon.maybe_run_bench_recovery().unwrap();
+
+        assert!(bench_entries(root).unwrap().contains_key("eng-1"));
+        assert_eq!(approval_kind(&daemon, 7), None);
+        let task = crate::task::Task::from_file(&task_path).unwrap();
+        assert_eq!(task.status, "in-progress");
+        assert_eq!(read_bench_recovery(&task_path).bench_reset_count, 0);
+    }
+
+    #[test]
+    fn bench_recovery_is_throttled_without_reading_the_bench_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = parked_daemon(&tmp);
+        std::fs::write(crate::team::bench::bench_file_path(&repo), "benched: [").unwrap();
+
+        daemon.scheduler.last_bench_recovery = Some(Instant::now());
+        daemon.maybe_run_bench_recovery().unwrap();
+
+        daemon.scheduler.last_bench_recovery = None;
+        assert!(daemon.maybe_run_bench_recovery().is_err());
+    }
+
+    #[test]
+    fn bench_recovery_does_nothing_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = parked_daemon(&tmp);
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .bench_recovery
+            .enabled = false;
+        set_bench_entry(&repo, "eng-1", BenchSource::AutoPark, None, 7200);
+
+        daemon.maybe_run_bench_recovery().unwrap();
+
+        assert!(bench_entries(&repo).unwrap().contains_key("eng-1"));
+        assert!(daemon.scheduler.last_bench_recovery.is_none());
+    }
+
+    #[test]
+    fn all_benched_review_task_is_approved_by_the_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = review_daemon(&tmp, "true");
+        set_bench_entry(&repo, "eng-1", BenchSource::Manual, None, 0);
+
+        daemon.maybe_run_bench_recovery().unwrap();
+        assert_eq!(
+            approval_kind(&daemon, 7),
+            Some(BenchApprovalKind::ApproveReview)
+        );
+        wait_for_bench_jobs(&mut daemon);
+
+        assert_eq!(
+            queued_origins(&daemon),
+            vec![(7, MergeOrigin::BenchRecovery)]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "integration"), ignore)]
+    fn tick_runs_bench_recovery_step_with_a_parked_engineer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _task_path, mut daemon) = parked_daemon(&tmp);
+        daemon.config.team_config.workflow_policy.test_command = Some("true".to_string());
+        set_bench_entry(&repo, "eng-1", BenchSource::AutoPark, Some(7), 7200);
+
+        let report = daemon.tick();
+
+        assert!(
+            !report
+                .subsystem_errors
+                .iter()
+                .any(|(step, _)| step == "bench_recovery"),
+            "{:?}",
+            report.subsystem_errors
+        );
+        assert!(daemon.scheduler.last_bench_recovery.is_some());
+        wait_for_bench_jobs(&mut daemon);
     }
 }
