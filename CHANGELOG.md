@@ -25,6 +25,10 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
 
 ### Added
 
+- `batty repair [MEMBER] [--dry-run] [--yes]` unbenches engineers, clears backend
+  configuration errors, asks the daemon to restart stuck members and clears a stale
+  in-flight merge when no daemon runs. The daemon's command queue gains a restart
+  request for this.
 - `batty status` leads with a summary and a plain-language "Needs attention"
   list with suggested commands, and fits the members table to the terminal.
   New flags: `--wide` (all columns), `--watch [SECS]` (live refresh) and

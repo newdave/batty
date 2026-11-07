@@ -25,6 +25,7 @@ Commands:
   daemon-restart-if-stale  Safely rebuild and restart the daemon only when its binary is stale
   bench                    Prevent an engineer from receiving new auto-dispatch work
   unbench                  Remove an engineer from the durable bench list
+  repair                   Unbench engineers, clear backend errors and restart stuck members
   openclaw                 OpenClaw supervisor integration helpers for Batty
   send                     Send a message to an agent role (human → agent injection)
   assign                   Assign a task to an engineer (used by manager agent)
@@ -1749,6 +1750,33 @@ Trigger an explicit topology reload for the running daemon
 Usage: batty reload [OPTIONS]
 
 Options:
+  -v, --verbose...
+          Verbosity level (-v, -vv, -vvv)
+
+  -h, --help
+          Print help
+```
+
+## `batty repair`
+
+Unbench engineers, clear backend errors and restart stuck members
+
+```text
+Unbench engineers, clear backend errors and restart stuck members
+
+Usage: batty repair [OPTIONS] [MEMBER]
+
+Arguments:
+  [MEMBER]
+          Repair only this member (e.g., "eng-1-1"); default is the whole team
+
+Options:
+      --dry-run
+          Print the repair plan without changing anything
+
+      --yes
+          Skip the confirmation prompt (required when stdin is not a terminal)
+
   -v, --verbose...
           Verbosity level (-v, -vv, -vvv)
 
