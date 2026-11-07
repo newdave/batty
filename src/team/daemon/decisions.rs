@@ -17,13 +17,18 @@ use anyhow::Result;
 use tracing::debug;
 
 use super::TeamDaemon;
+use crate::shim::protocol::ShimState;
+use crate::team::config::RoleType;
 use crate::team::config::{DecisionPath, DecisionProvider};
 use crate::team::decide::gate::{self, BoundedCache, ChangeGate};
-use crate::team::decide::paths::{self, CompletionOutcome, StallOutcome, TriageOutcome};
+use crate::team::decide::paths::{
+    self, CompletionOutcome, ScreenOutcome, StallOutcome, TriageOutcome,
+};
 use crate::team::decide::{
     Answer, DecisionOutcome, DecisionResponse, Fallback, Question, budget, client, redact,
 };
 use crate::team::events::TeamEvent;
+use crate::team::standup::MemberState;
 use crate::team::test_job::{TestJob, TestTimedOut};
 
 /// A failed decision is not retried for the same input until this passes, so
@@ -62,6 +67,8 @@ pub(crate) struct DecisionsState {
     /// Supervisory stalls held back while their stall call runs, with the
     /// time each was first held.
     stall_deferred: BoundedCache<String, Instant>,
+    /// Latest redacted screen capture per supervisor.
+    latest_screen: HashMap<String, String>,
     no_key_reported: bool,
     budget_reported_on: Option<String>,
     /// Spend since startup as `(UTC date, USD)`, a floor when the telemetry
@@ -80,6 +87,7 @@ impl Default for DecisionsState {
             pending_response: HashMap::new(),
             rubric_recipients: BoundedCache::new(gate::GATE_CAPACITY),
             stall_deferred: BoundedCache::new(gate::GATE_CAPACITY),
+            latest_screen: HashMap::new(),
             no_key_reported: false,
             budget_reported_on: None,
             session_spend: None,
@@ -413,13 +421,125 @@ impl TeamDaemon {
         }
     }
 
-    /// The member's latest output for the stall decision: the tail of its
-    /// PTY log. Redacted by the caller before use.
+    /// The member's latest output for the stall decision: its latest screen
+    /// capture, else the tail of its PTY log. Redacted by the caller.
     fn latest_member_output(&self, member: &str) -> String {
+        if let Some(screen) = self.decisions.latest_screen.get(member) {
+            return screen.clone();
+        }
         pty_log_tail(&crate::team::shim_log_path(
             &self.config.project_root,
             member,
         ))
+    }
+
+    fn is_supervisor(&self, member: &str) -> bool {
+        self.config
+            .members
+            .iter()
+            .find(|m| m.name == member)
+            .is_some_and(|m| matches!(m.role_type, RoleType::Architect | RoleType::Manager))
+    }
+
+    /// True when screen state may be classified for `member`: a manager or
+    /// architect whose live handle runs on the PTY runtime.
+    fn screen_state_applies(&self, member: &str) -> bool {
+        self.is_supervisor(member)
+            && self
+                .shim_handles
+                .get(member)
+                .is_some_and(|handle| handle.pty_runtime && !handle.is_terminal())
+    }
+
+    /// Poll step: ask each PTY supervisor for its screen, at most once per
+    /// poll interval. No-op unless screen state is enabled.
+    pub(crate) fn request_supervisor_screens(&mut self) {
+        if !self.decision_path_configured(DecisionPath::ScreenState)
+            || !self.decisions_enabled(DecisionPath::ScreenState)
+        {
+            return;
+        }
+        let interval = self.poll_interval;
+        let due: Vec<String> = self
+            .shim_handles
+            .iter()
+            .filter(|(_, handle)| {
+                handle
+                    .last_screen_capture_at
+                    .is_none_or(|at| at.elapsed() >= interval)
+            })
+            .map(|(name, _)| name.clone())
+            .filter(|name| self.screen_state_applies(name))
+            .collect();
+        for name in due {
+            if let Some(handle) = self.shim_handles.get_mut(&name)
+                && let Err(error) = handle.request_screen_capture(paths::SCREEN_TAIL_LINES)
+            {
+                debug!(member = %name, error = %error, "screen capture request failed");
+            }
+        }
+    }
+
+    /// A screen capture arrived: redact it, keep it as the member's latest
+    /// output, and classify it. The content is never logged.
+    pub(crate) fn on_screen_capture(&mut self, member: &str, content: &str) {
+        if !self.decision_path_configured(DecisionPath::ScreenState)
+            || !self.screen_state_applies(member)
+        {
+            return;
+        }
+        let screen = paths::screen_input(&redact::redact(content));
+        self.decisions
+            .latest_screen
+            .insert(member.to_string(), screen.clone());
+        self.start_decision(
+            DecisionPath::ScreenState,
+            member,
+            &screen,
+            paths::screen_questions(),
+        );
+    }
+
+    /// Apply a fresh screen verdict to the daemon's view of `member` (the
+    /// handle state and `MemberState`), the way a shim state change maps.
+    /// The shim's own state machine is untouched. Only idle and working are
+    /// applied: a context-exhausted or unknown verdict is left to the shim's
+    /// classifier, since a terminal state would stop delivery on a guess.
+    fn apply_screen_outcome(&mut self, member: &str) {
+        if !self.screen_state_applies(member) {
+            return;
+        }
+        let Some(DecisionOutcome::Screen(outcome)) = self
+            .cached_decision(DecisionPath::ScreenState, member)
+            .cloned()
+        else {
+            return;
+        };
+        let (to, member_state) = match outcome {
+            ScreenOutcome::Idle => (ShimState::Idle, MemberState::Idle),
+            ScreenOutcome::Working => (ShimState::Working, MemberState::Working),
+            ScreenOutcome::ContextExhausted | ScreenOutcome::Unknown => return,
+        };
+        let Some(handle) = self.shim_handles.get_mut(member) else {
+            return;
+        };
+        if handle.state == to {
+            return;
+        }
+        debug!(member, from = %handle.state, to = %to, "applying Jev screen state");
+        handle.apply_state_change(to);
+        if self.states.get(member).copied() != Some(member_state) {
+            self.states.insert(member.to_string(), member_state);
+            self.update_automation_timers_for_state(member, member_state);
+            if member_state == MemberState::Working {
+                self.health
+                    .working_since
+                    .entry(member.to_string())
+                    .or_insert_with(Instant::now);
+            } else {
+                self.health.working_since.remove(member);
+            }
+        }
     }
 
     /// Supervisory stall with no heuristic signal: true when the stall
@@ -759,6 +879,9 @@ impl TeamDaemon {
                 ));
                 if *path == DecisionPath::Rubric {
                     self.deliver_rubric(key);
+                }
+                if *path == DecisionPath::ScreenState {
+                    self.apply_screen_outcome(key);
                 }
             }
             Err(fallback) => {

@@ -238,6 +238,7 @@ impl TeamDaemon {
                 self.handle_shim_event(name, event)?;
             }
         }
+        self.request_supervisor_screens();
 
         Ok(())
     }
@@ -303,7 +304,12 @@ impl TeamDaemon {
             Event::DeliveryFailed { id, reason } => {
                 self.on_delivery_failed(member_name, id, reason)
             }
-            Event::ScreenCapture { .. } | Event::State { .. } => {
+            // Never log a capture: it is raw screen content.
+            Event::ScreenCapture { content, .. } => {
+                self.on_screen_capture(member_name, &content);
+                Ok(())
+            }
+            Event::State { .. } => {
                 debug!(member = member_name, event = ?event, "shim event (unhandled in poll)");
                 Ok(())
             }
@@ -1446,6 +1452,196 @@ mod tests {
         let mut daemon = TestDaemonBuilder::new(tmp.path()).build();
         assert!(daemon.shim_handles.is_empty());
         daemon.poll_shim_handles().unwrap();
+    }
+
+    const SCREEN_KEY: &str = "gateway-key-for-screen-tests-0123456789";
+
+    fn screen_daemon(
+        tmp: &tempfile::TempDir,
+        endpoint: &str,
+        key_env: &str,
+        provider: crate::team::config::DecisionProvider,
+    ) -> TeamDaemon {
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![
+                architect_member("architect"),
+                manager_member("manager", Some("architect")),
+                engineer_member("eng-1", Some("manager"), false),
+            ])
+            .build();
+        daemon.config.team_config.workflow_policy.decisions =
+            crate::team::config::DecisionsConfig {
+                provider,
+                endpoint: endpoint.to_string(),
+                api_key_env: key_env.to_string(),
+                paths: vec![crate::team::config::DecisionPath::ScreenState],
+                ..crate::team::config::DecisionsConfig::default()
+            };
+        daemon
+    }
+
+    fn quiet(mut child: crate::shim::protocol::Channel) -> crate::shim::protocol::Channel {
+        child
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        child
+    }
+
+    fn got_capture(child: &mut crate::shim::protocol::Channel) -> bool {
+        matches!(
+            child.recv::<crate::shim::protocol::Command>(),
+            Ok(Some(crate::shim::protocol::Command::CaptureScreen {
+                last_n_lines: Some(100)
+            }))
+        )
+    }
+
+    fn drain_screen_decisions(daemon: &mut TeamDaemon) {
+        for _ in 0..500 {
+            daemon.poll_decisions().unwrap();
+            if daemon.decision_jobs_in_flight() == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("screen job did not finish");
+    }
+
+    #[test]
+    fn screen_capture_is_requested_only_from_pty_supervisors() {
+        let _key = EnvVarGuard::set("BATTY_TEST_SCREEN_REQUEST", SCREEN_KEY);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = screen_daemon(
+            &tmp,
+            "http://127.0.0.1:1/v1/decisions",
+            "BATTY_TEST_SCREEN_REQUEST",
+            crate::team::config::DecisionProvider::Jev,
+        );
+        let mut manager = quiet(insert_mock_handle(&mut daemon, "manager"));
+        let mut architect = quiet(insert_mock_handle(&mut daemon, "architect"));
+        let mut engineer = quiet(insert_mock_handle(&mut daemon, "eng-1"));
+        daemon.shim_handles.get_mut("manager").unwrap().pty_runtime = true;
+        // The architect runs in SDK mode; the engineer is out of scope.
+        daemon.shim_handles.get_mut("eng-1").unwrap().pty_runtime = true;
+
+        daemon.poll_shim_handles().unwrap();
+        assert!(got_capture(&mut manager));
+        assert!(!got_capture(&mut architect));
+        assert!(!got_capture(&mut engineer));
+
+        // At most once per poll interval.
+        daemon.poll_shim_handles().unwrap();
+        assert!(!got_capture(&mut manager));
+    }
+
+    #[test]
+    fn heuristic_provider_never_requests_or_classifies_screens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = screen_daemon(
+            &tmp,
+            "http://127.0.0.1:1/v1/decisions",
+            "BATTY_TEST_SCREEN_HEURISTIC",
+            crate::team::config::DecisionProvider::Heuristic,
+        );
+        let mut manager = quiet(insert_mock_handle(&mut daemon, "manager"));
+        daemon.shim_handles.get_mut("manager").unwrap().pty_runtime = true;
+        daemon.poll_shim_handles().unwrap();
+        assert!(!got_capture(&mut manager));
+        daemon
+            .handle_shim_event(
+                "manager",
+                Event::ScreenCapture {
+                    content: "$ ".into(),
+                    cursor_row: 0,
+                    cursor_col: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(daemon.decision_jobs_in_flight(), 0);
+    }
+
+    #[test]
+    fn screen_verdict_updates_the_daemon_view_and_content_is_never_logged() {
+        let _key = EnvVarGuard::set("BATTY_TEST_SCREEN_VERDICT", SCREEN_KEY);
+        let reply = serde_json::json!({
+            "answers": [{"type": "choice", "name": "state", "choice": "idle", "confidence": 0.9}],
+            "provider_metadata": {"gateway": {"cost": "0.00001"}}
+        })
+        .to_string();
+        let (endpoint, rx, server) = crate::team::decide::test_server::serve_once(
+            "HTTP/1.1 200 OK",
+            reply,
+            std::time::Duration::ZERO,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = screen_daemon(
+            &tmp,
+            &endpoint,
+            "BATTY_TEST_SCREEN_VERDICT",
+            crate::team::config::DecisionProvider::Jev,
+        );
+        let _manager = insert_mock_handle(&mut daemon, "manager");
+        {
+            let handle = daemon.shim_handles.get_mut("manager").unwrap();
+            handle.pty_runtime = true;
+            handle.apply_state_change(ShimState::Working);
+        }
+        daemon
+            .states
+            .insert("manager".to_string(), MemberState::Working);
+        let planted = format!("{}{}", "sk-", "ant-api03-PlantedScreenSecret0123456789");
+
+        daemon
+            .handle_shim_event(
+                "manager",
+                Event::ScreenCapture {
+                    content: format!("export KEY={planted}\n> "),
+                    cursor_row: 1,
+                    cursor_col: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(daemon.decision_jobs_in_flight(), 1);
+        drain_screen_decisions(&mut daemon);
+        server.join().unwrap();
+
+        assert_eq!(daemon.shim_handles["manager"].state, ShimState::Idle);
+        assert_eq!(daemon.states.get("manager"), Some(&MemberState::Idle));
+
+        let request = rx.recv().unwrap();
+        assert!(!request.contains("PlantedScreenSecret"));
+        for path in [
+            crate::team::shim_events_log_path(tmp.path(), "manager"),
+            crate::team::team_events_path(tmp.path()),
+        ] {
+            let log = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(!log.contains("PlantedScreenSecret"), "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn engineer_screen_capture_is_ignored() {
+        let _key = EnvVarGuard::set("BATTY_TEST_SCREEN_ENGINEER", SCREEN_KEY);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = screen_daemon(
+            &tmp,
+            "http://127.0.0.1:1/v1/decisions",
+            "BATTY_TEST_SCREEN_ENGINEER",
+            crate::team::config::DecisionProvider::Jev,
+        );
+        let _engineer = insert_mock_handle(&mut daemon, "eng-1");
+        daemon.shim_handles.get_mut("eng-1").unwrap().pty_runtime = true;
+        daemon
+            .handle_shim_event(
+                "eng-1",
+                Event::ScreenCapture {
+                    content: "$ ".into(),
+                    cursor_row: 0,
+                    cursor_col: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(daemon.decision_jobs_in_flight(), 0);
     }
 
     #[test]
