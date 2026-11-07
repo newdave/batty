@@ -117,10 +117,12 @@ pub(crate) fn apply_task_effort_override(root: &Path, options: &mut AgentOptions
     }
 }
 
-/// The effort a member must be relaunched with for its active task, or
-/// `None` when no relaunch is needed: bench recovery is off, the task has no
-/// usable override, the override equals the configured effort, no launch has
-/// been recorded, or the recorded launch already used the effective effort.
+/// The effort a member must be relaunched with for its active task (shown as
+/// "default" when the member has none configured), or `None` when no relaunch
+/// is needed: bench recovery is off, no launch has been recorded, or the
+/// recorded launch already used the effective effort. The effective effort is
+/// the task's override when it has one and the configured effort otherwise,
+/// so a member raised for an earlier reset task drops back on its next task.
 pub(crate) fn task_effort_relaunch_needed(root: &Path, member: &str) -> Option<String> {
     let config = TeamConfig::load(&team_config_path(root)).ok()?;
     if !config.workflow_policy.bench_recovery.enabled {
@@ -130,11 +132,8 @@ pub(crate) fn task_effort_relaunch_needed(root: &Path, member: &str) -> Option<S
         .ok()?
         .into_iter()
         .find(|o| o.member == member)?;
-    let mut effective = configured.clone();
+    let mut effective = configured;
     apply_task_effort_override(root, &mut effective);
-    if effective.effort == configured.effort {
-        return None;
-    }
     let record: AgentOptions = std::fs::read(
         root.join(".batty/launch-options")
             .join(format!("{member}.json")),
@@ -144,7 +143,7 @@ pub(crate) fn task_effort_relaunch_needed(root: &Path, member: &str) -> Option<S
     if record.effort == effective.effort {
         return None;
     }
-    effective.effort
+    Some(effective.effort.unwrap_or_else(|| "default".to_string()))
 }
 
 pub fn resolve(root: &Path, member: &str) -> Result<AgentOptions> {
@@ -287,6 +286,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(task_effort_relaunch_needed(tmp.path(), "worker"), None);
+    }
+
+    #[test]
+    fn relaunch_drops_back_to_configured_effort_after_an_override_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_override_project(tmp.path(), "claude", true);
+        // Launched at the raised effort for the reset task, which then ended.
+        record_launch(tmp.path(), "worker", "high");
+        std::fs::remove_file(
+            tmp.path()
+                .join(".batty/team_config/board/tasks/007-task.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            task_effort_relaunch_needed(tmp.path(), "worker").as_deref(),
+            Some("medium")
+        );
     }
 
     #[test]

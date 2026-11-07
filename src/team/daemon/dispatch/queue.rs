@@ -1713,7 +1713,8 @@ impl TeamDaemon {
 
     /// Bench recovery raises a retried task's effort. The launch settings
     /// are fixed when an agent starts, so cold-respawn the receiving member
-    /// when the effort it was launched with differs from the task's.
+    /// when the effort it was launched with differs from the task's, including
+    /// dropping back to the configured effort after an override task.
     fn relaunch_for_task_effort_override(&mut self, engineer: &str, task_id: u32) {
         let Some(effort) =
             crate::team::agent_options::task_effort_relaunch_needed(self.project_root(), engineer)
