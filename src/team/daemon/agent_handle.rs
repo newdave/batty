@@ -57,6 +57,11 @@ pub(in crate::team) struct AgentHandle {
     /// Set when a write hit EPIPE/ECONNRESET: the shim end of the socketpair
     /// is gone. The poll loop turns this into the normal died/respawn path.
     pub channel_broken: bool,
+    /// True when the agent runs on the PTY runtime (not SDK mode), so a
+    /// screen capture shows what the agent is doing. Set at spawn.
+    pub pty_runtime: bool,
+    /// When a screen capture was last requested.
+    pub last_screen_capture_at: Option<Instant>,
 }
 
 /// Whether an `anyhow` error wraps a transient non-blocking/timed-out write.
@@ -106,6 +111,8 @@ impl AgentHandle {
             last_activity_at: None,
             in_flight_messages: VecDeque::new(),
             channel_broken: false,
+            pty_runtime: false,
+            last_screen_capture_at: None,
         }
     }
 
@@ -215,6 +222,14 @@ impl AgentHandle {
     /// Send a kill command to the shim.
     pub fn send_kill(&mut self) -> anyhow::Result<()> {
         self.channel.send(&Command::Kill)
+    }
+
+    /// Ask the shim for the last `last_n_lines` lines of the agent screen.
+    pub fn request_screen_capture(&mut self, last_n_lines: usize) -> anyhow::Result<()> {
+        self.last_screen_capture_at = Some(Instant::now());
+        self.channel.send(&Command::CaptureScreen {
+            last_n_lines: Some(last_n_lines),
+        })
     }
 
     /// Send a ping to the shim for health monitoring.
@@ -511,6 +526,21 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         handle.apply_state_change(ShimState::Idle);
         assert!(handle.state_changed_at > first);
+    }
+
+    #[test]
+    fn request_screen_capture_sends_command_and_records_time() {
+        let (mut handle, mut child) = make_test_handle();
+        assert!(!handle.pty_runtime);
+        handle.request_screen_capture(100).unwrap();
+        assert!(handle.last_screen_capture_at.is_some());
+        let cmd: Command = child.recv().unwrap().unwrap();
+        assert!(matches!(
+            cmd,
+            Command::CaptureScreen {
+                last_n_lines: Some(100)
+            }
+        ));
     }
 
     #[test]

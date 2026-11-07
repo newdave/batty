@@ -241,7 +241,7 @@ pub(in crate::team) fn spawn_shim(
     parent_channel
         .set_write_timeout(Some(std::time::Duration::from_secs(2)))
         .context("failed to set shim parent channel write timeout")?;
-    let handle = AgentHandle::new(
+    let mut handle = AgentHandle::new(
         member_name.to_string(),
         parent_channel,
         child_pid,
@@ -249,6 +249,8 @@ pub(in crate::team) fn spawn_shim(
         agent_cmd.to_string(),
         work_dir.to_path_buf(),
     );
+    // Callers pass agent_supports_sdk_mode(agent) && use_sdk_mode.
+    handle.pty_runtime = !sdk_mode;
 
     debug!(
         member = member_name,
