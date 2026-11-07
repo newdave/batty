@@ -710,10 +710,12 @@ impl TeamDaemon {
                 .iter()
                 .any(|m| m.name == member_name && m.role_type == RoleType::Engineer)
             {
-                crate::team::bench::bench_engineer(
+                crate::team::bench::bench_engineer_with(
                     self.project_root(),
                     member_name,
                     Some("completion attribution requires operator review"),
+                    crate::team::bench::BenchSource::AutoPark,
+                    Some(task_id),
                 )?;
             }
             self.record_task_escalated(
