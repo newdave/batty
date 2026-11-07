@@ -1638,6 +1638,7 @@ impl TeamDaemon {
                 ) {
                     Ok(_) => {
                         self.active_tasks.insert(entry.engineer.clone(), task.id);
+                        self.relaunch_for_task_effort_override(&entry.engineer, task.id);
                         self.retry_counts.remove(&entry.engineer);
                         self.dispatch
                             .recent_dispatches
@@ -1688,6 +1689,31 @@ impl TeamDaemon {
         }
         self.dispatch.queue = retained;
         result
+    }
+
+    /// Bench recovery raises a retried task's effort. The launch settings
+    /// are fixed when an agent starts, so cold-respawn the receiving member
+    /// when the effort it was launched with differs from the task's.
+    fn relaunch_for_task_effort_override(&mut self, engineer: &str, task_id: u32) {
+        let Some(effort) =
+            crate::team::agent_options::task_effort_relaunch_needed(self.project_root(), engineer)
+        else {
+            return;
+        };
+        if !self.shim_handles.contains_key(engineer) {
+            return;
+        }
+        self.record_orchestrator_action(format!(
+            "dispatch: relaunching {engineer} at effort {effort} for task #{task_id} (bench recovery)"
+        ));
+        if let Err(error) = self.handle_shim_cold_respawn(engineer, "bench_recovery_effort") {
+            warn!(
+                engineer,
+                task_id,
+                error = %error,
+                "failed to relaunch member for task effort override"
+            );
+        }
     }
 
     /// Whether `name` may take `task` under `board.tag_roles`, body owner

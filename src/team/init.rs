@@ -16,7 +16,7 @@ fn canonical_backend(agent: &str) -> String {
         .unwrap_or_else(|| agent.into())
 }
 
-fn backend_supports_effort(agent: &str) -> bool {
+pub(crate) fn backend_supports_effort(agent: &str) -> bool {
     matches!(
         canonical_backend(agent).as_str(),
         "claude-code" | "codex-cli"

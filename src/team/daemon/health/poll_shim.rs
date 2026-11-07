@@ -878,7 +878,7 @@ impl TeamDaemon {
         Ok(())
     }
 
-    pub(super) fn handle_shim_cold_respawn(
+    pub(in super::super) fn handle_shim_cold_respawn(
         &mut self,
         member_name: &str,
         reason: &str,
