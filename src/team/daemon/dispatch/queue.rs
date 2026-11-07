@@ -1098,6 +1098,26 @@ impl TeamDaemon {
                     ranked_engineers.insert(0, owner);
                 }
             }
+            if self
+                .config
+                .team_config
+                .workflow_policy
+                .bench_recovery
+                .enabled
+            {
+                // Bench recovery retries go to someone else first. Avoided
+                // engineers move to the back but stay eligible, so the task
+                // still runs when they are the only idle engineer.
+                let avoided = crate::team::bench_recovery::read_bench_recovery(&task.source_path)
+                    .avoid_engineers;
+                if !avoided.is_empty() {
+                    let (preferred, deferred): (Vec<_>, Vec<_>) = ranked_engineers
+                        .into_iter()
+                        .partition(|engineer_name| !avoided.contains(engineer_name));
+                    ranked_engineers = preferred;
+                    ranked_engineers.extend(deferred);
+                }
+            }
             let Some(engineer_name) = ranked_engineers.into_iter().find(|engineer_name| {
                 !self
                     .dispatch.recent_dispatches
@@ -4190,6 +4210,106 @@ mod tests {
         daemon.enqueue_dispatch_candidates().unwrap();
         assert_eq!(daemon.dispatch.queue.len(), 1);
         assert_eq!(daemon.dispatch.queue[0].task_id, 52);
+    }
+
+    fn bench_recovery_dispatch_daemon(
+        root: &Path,
+        enabled: bool,
+        idle: &[&str],
+    ) -> crate::team::daemon::TeamDaemon {
+        let members: Vec<_> = ["eng-1", "eng-2"]
+            .iter()
+            .map(|name| engineer_member(name, None, false))
+            .collect();
+        let states: HashMap<String, MemberState> = ["eng-1", "eng-2"]
+            .iter()
+            .map(|name| {
+                let state = if idle.contains(name) {
+                    MemberState::Idle
+                } else {
+                    MemberState::Working
+                };
+                (name.to_string(), state)
+            })
+            .collect();
+        let mut daemon = TestDaemonBuilder::new(root)
+            .members(members)
+            .states(states)
+            .workflow_policy(crate::team::config::WorkflowPolicy {
+                bench_recovery: crate::team::config::BenchRecoveryConfig {
+                    enabled,
+                    ..Default::default()
+                },
+                ..crate::team::config::WorkflowPolicy::default()
+            })
+            .build();
+        for name in ["eng-1", "eng-2"] {
+            if !idle.contains(&name) {
+                daemon.active_tasks.insert(name.to_string(), 99);
+            }
+        }
+        daemon
+    }
+
+    fn avoid_engineer_on_task(root: &Path, task_id: u32, engineer: &str) {
+        let tasks_dir = root.join(".batty/team_config/board/tasks");
+        let path = std::fs::read_dir(&tasks_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("{task_id:03}-"))
+            })
+            .unwrap();
+        crate::team::bench_recovery::write_bench_recovery(
+            &path,
+            &crate::team::bench_recovery::BenchRecoveryFrontmatter {
+                avoid_engineers: vec![engineer.to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn avoided_engineer_is_ranked_behind_other_idle_engineers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_open_task_file(tmp.path(), 70, "retry", "todo");
+        avoid_engineer_on_task(tmp.path(), 70, "eng-1");
+        let mut daemon = bench_recovery_dispatch_daemon(tmp.path(), true, &["eng-1", "eng-2"]);
+
+        daemon.enqueue_dispatch_candidates().unwrap();
+
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "eng-2");
+    }
+
+    #[test]
+    fn avoided_engineer_still_gets_task_when_only_idle_engineer() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_open_task_file(tmp.path(), 70, "retry", "todo");
+        avoid_engineer_on_task(tmp.path(), 70, "eng-1");
+        let mut daemon = bench_recovery_dispatch_daemon(tmp.path(), true, &["eng-1"]);
+
+        daemon.enqueue_dispatch_candidates().unwrap();
+
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "eng-1");
+    }
+
+    #[test]
+    fn avoid_list_is_ignored_when_bench_recovery_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_open_task_file(tmp.path(), 70, "retry", "todo");
+        avoid_engineer_on_task(tmp.path(), 70, "eng-1");
+        let mut daemon = bench_recovery_dispatch_daemon(tmp.path(), false, &["eng-1", "eng-2"]);
+
+        daemon.enqueue_dispatch_candidates().unwrap();
+
+        assert_eq!(daemon.dispatch.queue.len(), 1);
+        assert_eq!(daemon.dispatch.queue[0].engineer, "eng-1");
     }
 
     #[test]
