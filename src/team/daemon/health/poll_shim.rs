@@ -664,15 +664,22 @@ impl TeamDaemon {
         let branch_exists =
             crate::team::git_cmd::show_ref_exists(self.project_root(), &expected_branch)
                 .unwrap_or(false);
-        let commits_ahead = if branch_exists {
-            let range = format!("{base_branch}..{expected_branch}");
-            crate::team::git_cmd::run_git(self.project_root(), &["rev-list", "--count", &range])
-                .ok()
-                .and_then(|output| output.stdout.trim().parse::<u32>().ok())
-                .unwrap_or(0)
+        let mut commits_ahead = if branch_exists {
+            self.zero_diff_commits_ahead(&base_branch, &expected_branch)
         } else {
             0
         };
+        if branch_exists
+            && commits_ahead == 0
+            && self.rescue_wrong_branch_commits(
+                member_name,
+                task_id,
+                &expected_branch,
+                &base_branch,
+            )
+        {
+            commits_ahead = self.zero_diff_commits_ahead(&base_branch, &expected_branch);
+        }
         if branch_exists && commits_ahead > 0 {
             self.verification.clear_zero_diff_completion(task_id);
             return Ok(None);
@@ -684,6 +691,93 @@ impl TeamDaemon {
         ));
         self.maybe_warn_before_zero_diff_recovery(member_name, task_id, count);
         Ok(Some((task_id, count)))
+    }
+
+    fn zero_diff_commits_ahead(&self, base_branch: &str, task_branch: &str) -> u32 {
+        let range = format!("{base_branch}..{task_branch}");
+        crate::team::git_cmd::run_git(self.project_root(), &["rev-list", "--count", &range])
+            .ok()
+            .and_then(|output| output.stdout.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Before a zero-diff strike counts, move the engineer's own commits that
+    /// landed on the wrong branch onto the task branch. Returns true when
+    /// commits were cherry-picked. A conflict is aborted and nothing moves.
+    fn rescue_wrong_branch_commits(
+        &mut self,
+        member_name: &str,
+        task_id: u32,
+        task_branch: &str,
+        base_branch: &str,
+    ) -> bool {
+        let policy = &self.config.team_config.workflow_policy.bench_recovery;
+        if !policy.enabled || !policy.wrong_branch_rescue {
+            return false;
+        }
+        let uses_worktree = self
+            .config
+            .members
+            .iter()
+            .any(|member| member.name == member_name && member.use_worktrees);
+        let worktree = self.worktree_dir(member_name);
+        if !uses_worktree || !worktree.is_dir() {
+            return false;
+        }
+        // Never disturb uncommitted work: the pick needs clean tracked files.
+        let clean = crate::git::cmd(&worktree)
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .run()
+            .is_ok_and(|output| output.stdout_trimmed().is_empty());
+        if !clean {
+            return false;
+        }
+        let on_task_branch = crate::git::cmd(&worktree)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .run()
+            .is_ok_and(|output| output.stdout_trimmed() == task_branch);
+        if !on_task_branch
+            && crate::git::cmd(&worktree)
+                .args(["checkout", task_branch])
+                .run()
+                .is_err()
+        {
+            return false;
+        }
+
+        let trunk = self.config.team_config.trunk_branch().to_string();
+        let commits = match crate::team::bench_recovery::find_rescuable_commits(
+            &worktree,
+            member_name,
+            task_branch,
+            base_branch,
+            &trunk,
+        ) {
+            Ok(commits) if !commits.is_empty() => commits,
+            Ok(_) => return false,
+            Err(error) => {
+                debug!(member = member_name, error = %error, "wrong-branch rescue lookup failed");
+                return false;
+            }
+        };
+        if let Err(error) = crate::team::bench_recovery::cherry_pick_commits(&worktree, &commits) {
+            crate::worktree::ops::abort_in_progress_git_operations(&worktree);
+            self.record_orchestrator_action(format!(
+                "recovery: could not rescue {} commit(s) for {member_name} onto {task_branch} for task #{task_id} ({error}); aborted",
+                commits.len()
+            ));
+            return false;
+        }
+        self.emit_event(TeamEvent::completion_branch_rescued(
+            member_name,
+            &task_id.to_string(),
+            &commits,
+        ));
+        self.record_orchestrator_action(format!(
+            "recovery: rescued {} commit(s) made by {member_name} outside {task_branch} onto it for task #{task_id}",
+            commits.len()
+        ));
+        true
     }
 
     /// One strike before the recovery threshold, tell the engineer what the

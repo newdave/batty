@@ -1193,6 +1193,154 @@ fn strike_warning_is_silent_when_disabled() {
     }
 }
 
+/// Daemon with eng-1 assigned task 42 on a prepared worktree (task branch
+/// `eng-1/42` checked out, equal to `eng-main/eng-1`).
+fn rescue_daemon(
+    tmp: &tempfile::TempDir,
+    wrong_branch_rescue: bool,
+) -> (TeamDaemon, PathBuf, PathBuf) {
+    let repo = init_git_repo(tmp, "batty-wrong-branch-rescue");
+    write_owned_task_file(&repo, 42, "rescue-task", "in-progress", "eng-1");
+    let team_config_dir = repo.join(".batty").join("team_config");
+    let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
+    crate::team::task_loop::prepare_engineer_assignment_worktree(
+        &repo,
+        &worktree_dir,
+        "eng-1",
+        "eng-1/42",
+        &team_config_dir,
+    )
+    .unwrap();
+    let mut daemon = TestDaemonBuilder::new(&repo)
+        .members(vec![
+            manager_member("manager", None),
+            engineer_member("eng-1", Some("manager"), true),
+        ])
+        .workflow_policy(WorkflowPolicy {
+            bench_recovery: crate::team::config::BenchRecoveryConfig {
+                enabled: true,
+                wrong_branch_rescue,
+                ..Default::default()
+            },
+            ..WorkflowPolicy::default()
+        })
+        .build();
+    daemon.set_active_task_for_test("eng-1", 42);
+    (daemon, repo, worktree_dir)
+}
+
+fn commit_in(dir: &Path, file: &str, content: &str, message: &str) {
+    std::fs::write(dir.join(file), content).unwrap();
+    git_ok(dir, &["add", file]);
+    git_ok(dir, &["commit", "-m", message]);
+}
+
+fn event_names(repo: &Path) -> Vec<String> {
+    crate::team::events::read_events(&repo.join(".batty").join("team_config").join("events.jsonl"))
+        .unwrap()
+        .into_iter()
+        .map(|event| event.event)
+        .collect()
+}
+
+#[test]
+fn wrong_branch_rescue_moves_commit_from_engineer_base_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut daemon, repo, worktree) = rescue_daemon(&tmp, true);
+    git_ok(&worktree, &["checkout", "eng-main/eng-1"]);
+    commit_in(&worktree, "x.txt", "x\n", "feat: x");
+    git_ok(&worktree, &["checkout", "eng-1/42"]);
+
+    assert_eq!(
+        daemon.maybe_track_zero_diff_completion("eng-1").unwrap(),
+        None,
+        "rescued work must not count as a strike"
+    );
+
+    let log = crate::git::cmd(&worktree)
+        .args(["log", "--format=%s", "eng-main/eng-1..eng-1/42"])
+        .run()
+        .unwrap()
+        .stdout_str();
+    assert!(log.contains("feat: x"), "{log}");
+    assert!(
+        event_names(&repo)
+            .iter()
+            .any(|name| name == "completion_branch_rescued")
+    );
+}
+
+#[test]
+fn wrong_branch_rescue_conflict_aborts_and_strike_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut daemon, repo, worktree) = rescue_daemon(&tmp, true);
+    git_ok(&worktree, &["checkout", "eng-main/eng-1"]);
+    commit_in(&worktree, "clash.txt", "A\n", "feat: base side");
+    git_ok(&worktree, &["branch", "-f", "eng-1/42", "eng-main/eng-1"]);
+    git_ok(
+        &worktree,
+        &["checkout", "-b", "eng-1/scratch", "eng-main/eng-1~1"],
+    );
+    commit_in(&worktree, "clash.txt", "B\n", "feat: stray side");
+    git_ok(&worktree, &["checkout", "eng-1/42"]);
+    let candidates = crate::team::bench_recovery::find_rescuable_commits(
+        &worktree,
+        "eng-1",
+        "eng-1/42",
+        "eng-main/eng-1",
+        "main",
+    )
+    .unwrap();
+    assert_eq!(candidates.len(), 1, "the stray commit must be selected");
+
+    assert_eq!(
+        daemon.maybe_track_zero_diff_completion("eng-1").unwrap(),
+        Some((42, 1))
+    );
+
+    let pick_in_progress = crate::git::cmd(&worktree)
+        .args(["rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"])
+        .allow_fail()
+        .run()
+        .unwrap()
+        .success();
+    assert!(!pick_in_progress, "cherry-pick must be aborted");
+    assert!(
+        !event_names(&repo)
+            .iter()
+            .any(|name| name == "completion_branch_rescued")
+    );
+}
+
+#[test]
+fn wrong_branch_rescue_never_touches_other_engineers_commits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut daemon, _repo, worktree) = rescue_daemon(&tmp, true);
+    git_ok(&worktree, &["checkout", "-b", "eng-2/9", "eng-main/eng-1"]);
+    commit_in(&worktree, "theirs.txt", "t\n", "feat: eng-2 work");
+    git_ok(&worktree, &["checkout", "eng-1/42"]);
+
+    assert_eq!(
+        daemon.maybe_track_zero_diff_completion("eng-1").unwrap(),
+        Some((42, 1))
+    );
+    assert!(!worktree.join("theirs.txt").exists());
+}
+
+#[test]
+fn wrong_branch_rescue_is_off_when_flag_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut daemon, _repo, worktree) = rescue_daemon(&tmp, false);
+    git_ok(&worktree, &["checkout", "eng-main/eng-1"]);
+    commit_in(&worktree, "x.txt", "x\n", "feat: x");
+    git_ok(&worktree, &["checkout", "eng-1/42"]);
+
+    assert_eq!(
+        daemon.maybe_track_zero_diff_completion("eng-1").unwrap(),
+        Some((42, 1))
+    );
+}
+
 #[test]
 #[cfg_attr(not(feature = "integration"), ignore)]
 fn daemon_lifecycle_happy_path_exercises_decomposed_modules() {

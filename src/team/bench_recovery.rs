@@ -114,6 +114,102 @@ pub fn attributed_commit_count(worktree: &Path, base: &str, task_branch: &str) -
     Ok(count as u32)
 }
 
+/// Commits an engineer made outside the task branch that may belong on it.
+///
+/// Candidates are non-merge commits on the engineer's own branches (its base
+/// branch and other `<engineer>/...` branches, never another engineer's) that
+/// are not on `task_branch` or trunk, were committed no earlier than the point
+/// where the task branch forked from the base branch, and are not daemon
+/// `[batty]` auto-saves. Returned oldest first. Batty records no assignment
+/// time, so the fork point stands in for it.
+pub fn find_rescuable_commits(
+    repo: &Path,
+    engineer: &str,
+    task_branch: &str,
+    base_branch: &str,
+    trunk: &str,
+) -> Result<Vec<String>> {
+    let fork_point = crate::git::cmd(repo)
+        .args(["merge-base", task_branch, base_branch])
+        .run()
+        .with_context(|| format!("no fork point for {task_branch} and {base_branch}"))?
+        .stdout_trimmed();
+    let fork_time: i64 = crate::git::cmd(repo)
+        .args(["log", "-1", "--format=%ct", &fork_point])
+        .run()?
+        .stdout_trimmed()
+        .parse()
+        .context("unreadable fork point commit time")?;
+
+    let trunk_exists = crate::git::cmd(repo)
+        .args(["rev-parse", "--verify", "--quiet", trunk])
+        .allow_fail()
+        .run()
+        .is_ok_and(|output| output.success());
+
+    let branches = crate::git::cmd(repo)
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        .run()?
+        .stdout_str();
+    let mut found: Vec<(i64, String)> = Vec::new();
+    for branch in branches.lines().map(str::trim) {
+        if branch == task_branch
+            || !crate::worktree::ops::branch_belongs_to_engineer(branch, engineer)
+        {
+            continue;
+        }
+        let range = format!("{task_branch}..{branch}");
+        let mut log = crate::git::cmd(repo).args([
+            "log",
+            "--reverse",
+            "--no-merges",
+            "--format=%H\t%ct\t%s",
+            &range,
+        ]);
+        if trunk_exists {
+            log = log.args(["--not", trunk]);
+        }
+        let output = log.run()?.stdout_str();
+        for line in output.lines() {
+            let mut fields = line.splitn(3, '\t');
+            let (Some(hash), Some(time), Some(subject)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Ok(time) = time.parse::<i64>() else {
+                continue;
+            };
+            if time < fork_time
+                || subject.contains("[batty]")
+                || found.iter().any(|(_, seen)| seen == hash)
+            {
+                continue;
+            }
+            found.push((time, hash.to_string()));
+        }
+    }
+    // Stable: commits from one branch keep their order when timestamps tie.
+    found.sort_by_key(|(time, _)| *time);
+    Ok(found.into_iter().map(|(_, hash)| hash).collect())
+}
+
+/// Cherry-pick `commits` (oldest first) onto the branch checked out in
+/// `worktree`. `-x` records the source commit, so each pick is a new commit
+/// even when it would otherwise be identical to a commit already on the
+/// engineer's base branch. On failure the caller must abort the operation.
+pub fn cherry_pick_commits(worktree: &Path, commits: &[String]) -> Result<()> {
+    if commits.is_empty() {
+        return Ok(());
+    }
+    crate::git::cmd(worktree)
+        .args(["cherry-pick", "-x"])
+        .args(commits)
+        .run()
+        .with_context(|| format!("cherry-pick of {} commit(s) failed", commits.len()))?;
+    Ok(())
+}
+
 /// The verification half of the bar. Only a real passing run counts: a run
 /// skipped by `auto_run_tests=false` reports `passed: true` but proves
 /// nothing, and a timed-out run is recorded as failed.
@@ -125,6 +221,7 @@ pub fn verification_meets_bar(run: &VerificationRunResult, auto_run_tests: bool)
 mod tests {
     use super::*;
     use crate::team::test_support::{git_ok, init_git_repo};
+    use std::path::PathBuf;
 
     fn ladder() -> Vec<String> {
         ["low", "medium", "high", "xhigh", "max"]
@@ -288,6 +385,112 @@ mod tests {
         assert!(content.contains("title: task"), "{content}");
         assert!(content.contains("Body text."), "{content}");
         assert!(!content.contains("bench_reset_capped"), "{content}");
+    }
+
+    fn commit_file(repo: &Path, file: &str, message: &str) {
+        std::fs::write(repo.join(file), format!("{file}\n")).unwrap();
+        git_ok(repo, &["add", file]);
+        git_ok(repo, &["commit", "-m", message]);
+    }
+
+    /// eng-main/eng-1 and task branch eng-1/42 at one commit, task branch checked out.
+    fn rescue_fixture(tmp: &tempfile::TempDir) -> PathBuf {
+        let repo = init_git_repo(tmp, "bench-recovery-rescue");
+        git_ok(&repo, &["branch", "eng-main/eng-1"]);
+        git_ok(&repo, &["checkout", "-b", "eng-1/42"]);
+        repo
+    }
+
+    fn rescuable(repo: &Path) -> Vec<String> {
+        find_rescuable_commits(repo, "eng-1", "eng-1/42", "eng-main/eng-1", "main").unwrap()
+    }
+
+    #[test]
+    fn rescuable_commits_found_on_engineer_base_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = rescue_fixture(&tmp);
+        git_ok(&repo, &["checkout", "eng-main/eng-1"]);
+        commit_file(&repo, "a.txt", "feat: a");
+        commit_file(&repo, "b.txt", "feat: b");
+        git_ok(&repo, &["checkout", "eng-1/42"]);
+
+        let commits = rescuable(&repo);
+        assert_eq!(commits.len(), 2);
+
+        cherry_pick_commits(&repo, &commits).unwrap();
+        assert_eq!(
+            attributed_commit_count(&repo, "eng-main/eng-1", "eng-1/42").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn rescuable_commits_skip_other_engineers_and_auto_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = rescue_fixture(&tmp);
+        git_ok(&repo, &["checkout", "-b", "eng-main/eng-2", "main"]);
+        commit_file(&repo, "other.txt", "feat: other engineer");
+        git_ok(&repo, &["checkout", "-b", "eng-2/7", "main"]);
+        commit_file(&repo, "other2.txt", "feat: other task");
+        git_ok(&repo, &["checkout", "eng-main/eng-1"]);
+        commit_file(&repo, "wip.txt", "wip: auto-save [batty]");
+        git_ok(&repo, &["checkout", "eng-1/42"]);
+
+        assert!(rescuable(&repo).is_empty());
+    }
+
+    #[test]
+    fn rescuable_commits_skip_commits_older_than_the_fork_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = rescue_fixture(&tmp);
+        git_ok(&repo, &["checkout", "-b", "eng-1/old", "main"]);
+        std::fs::write(repo.join("old.txt"), "old\n").unwrap();
+        git_ok(&repo, &["add", "old.txt"]);
+        crate::git::cmd(&repo)
+            .args(["commit", "-m", "feat: old work"])
+            .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+            .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
+            .run()
+            .unwrap();
+        git_ok(&repo, &["checkout", "eng-1/42"]);
+
+        assert!(rescuable(&repo).is_empty());
+    }
+
+    #[test]
+    fn rescuable_commits_include_engineers_stray_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = rescue_fixture(&tmp);
+        git_ok(&repo, &["checkout", "-b", "eng-1/scratch"]);
+        commit_file(&repo, "s.txt", "feat: stray");
+        git_ok(&repo, &["checkout", "eng-1/42"]);
+
+        assert_eq!(rescuable(&repo).len(), 1);
+    }
+
+    #[test]
+    fn cherry_pick_commits_conflict_errors_and_can_be_aborted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = rescue_fixture(&tmp);
+        commit_file(&repo, "clash.txt", "feat: task side");
+        git_ok(&repo, &["checkout", "eng-main/eng-1"]);
+        std::fs::write(repo.join("clash.txt"), "base side\n").unwrap();
+        git_ok(&repo, &["add", "clash.txt"]);
+        git_ok(&repo, &["commit", "-m", "feat: base side"]);
+        git_ok(&repo, &["checkout", "eng-1/42"]);
+
+        let commits = rescuable(&repo);
+        assert_eq!(commits.len(), 1);
+        assert!(cherry_pick_commits(&repo, &commits).is_err());
+        crate::worktree::ops::abort_in_progress_git_operations(&repo);
+        assert!(!repo.join(".git").join("CHERRY_PICK_HEAD").exists());
+    }
+
+    #[test]
+    fn cherry_pick_commits_empty_list_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = rescue_fixture(&tmp);
+        cherry_pick_commits(&repo, &[]).unwrap();
     }
 
     #[test]

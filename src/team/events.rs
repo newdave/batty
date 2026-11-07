@@ -421,6 +421,16 @@ impl TeamEvent {
         }
     }
 
+    pub fn completion_branch_rescued(role: &str, task: &str, commits: &[String]) -> Self {
+        Self {
+            role: Some(role.into()),
+            task: Some(task.into()),
+            reason: Some(format!("rescued {} commit(s)", commits.len())),
+            details: Some(commits.join(" ")),
+            ..Self::base("completion_branch_rescued")
+        }
+    }
+
     pub fn completion_attribution_warning(role: &str, task: &str, reason: &str) -> Self {
         Self {
             role: Some(role.into()),
@@ -1891,6 +1901,16 @@ mod tests {
         let task_val = parsed["task"].as_str().unwrap();
         assert!(task_val.contains("\"quotes\""));
         assert!(task_val.contains("<angles>"));
+    }
+
+    #[test]
+    fn completion_branch_rescued_serializes_commit_list() {
+        let commits = vec!["abc123".to_string(), "def456".to_string()];
+        let event = TeamEvent::completion_branch_rescued("eng-1", "7", &commits);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event\":\"completion_branch_rescued\""));
+        assert!(json.contains("\"reason\":\"rescued 2 commit(s)\""));
+        assert!(json.contains("abc123 def456"));
     }
 
     #[test]
