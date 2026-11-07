@@ -4,7 +4,9 @@
 
 pub mod budget;
 pub mod client;
+pub mod criteria;
 pub mod gate;
+pub mod paths;
 pub mod redact;
 
 use std::fmt;
