@@ -10,6 +10,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::task::Task;
 
+use super::bench_recovery::read_bench_recovery;
 use super::board::{read_workflow_metadata, write_workflow_metadata};
 use super::workflow::{ReviewDisposition, TaskState, can_transition};
 
@@ -44,6 +45,7 @@ pub(crate) fn transition_task_with_attribution(
         if target != TaskState::Blocked {
             clear_blocked(mapping);
         }
+        clear_effort_override_when_done(mapping, target);
     })?;
     record_status_transition_activity(board_dir, task_id, &from_status, to_status, &attribution)?;
     Ok(())
@@ -64,7 +66,16 @@ pub(crate) fn move_task_validated(
     let target = parse_task_state(target)?;
     can_transition(current, target).map_err(anyhow::Error::msg)?;
     super::board_cmd::move_task(board_dir, &task_id.to_string(), state_name(target), claim)
-        .map_err(|error| anyhow::anyhow!("{error}"))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if target == TaskState::Done {
+        let task_path = find_task_path(board_dir, task_id)?;
+        if read_bench_recovery(&task_path).effort_override.is_some() {
+            update_task_frontmatter(&task_path, |mapping| {
+                clear_effort_override_when_done(mapping, target);
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Move a task whose merge has already landed on trunk to `done`.
@@ -106,6 +117,7 @@ pub(crate) fn transition_task_preserving_block_with_attribution(
 
     update_task_frontmatter(&task_path, |mapping| {
         set_status(mapping, target);
+        clear_effort_override_when_done(mapping, target);
     })?;
     record_status_transition_activity(board_dir, task_id, &from_status, to_status, &attribution)?;
     Ok(())
@@ -881,6 +893,13 @@ fn set_status(mapping: &mut Mapping, state: TaskState) {
     );
 }
 
+/// A bench-recovery effort override only lasts until its task is done.
+fn clear_effort_override_when_done(mapping: &mut Mapping, target: TaskState) {
+    if target == TaskState::Done {
+        mapping.remove(yaml_key("effort_override"));
+    }
+}
+
 fn clear_blocked(mapping: &mut Mapping) {
     mapping.remove(yaml_key("blocked"));
     mapping.remove(yaml_key("block_reason"));
@@ -1056,6 +1075,28 @@ mod tests {
 
         let task = Task::from_file(&task_path).unwrap();
         assert_eq!(task.status, "in-progress");
+    }
+
+    #[test]
+    fn effort_override_survives_in_progress_and_is_cleared_on_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board_dir = tmp.path();
+        let task_path = write_task_file(board_dir, 7, "todo");
+        update_task_frontmatter(&task_path, |mapping| {
+            mapping.insert(yaml_key("effort_override"), Value::String("high".into()));
+        })
+        .unwrap();
+
+        cmd_transition(board_dir, 7, "in-progress").unwrap();
+        assert_eq!(
+            read_bench_recovery(&task_path).effort_override.as_deref(),
+            Some("high")
+        );
+
+        cmd_transition(board_dir, 7, "review").unwrap();
+        cmd_transition(board_dir, 7, "done").unwrap();
+        assert_eq!(read_bench_recovery(&task_path).effort_override, None);
+        assert_eq!(Task::from_file(&task_path).unwrap().status, "done");
     }
 
     #[test]

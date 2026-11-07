@@ -83,7 +83,14 @@ pub(crate) fn runtime_diagnostics(
         &std::fs::read(path).context("runtime identity state unavailable")?,
     )?;
     let mut seen = HashSet::new();
+    let bench_recovery_enabled = TeamConfig::load(&team_config_path(root))
+        .is_ok_and(|config| config.workflow_policy.bench_recovery.enabled);
     for member in members {
+        // A task-scoped effort override is a legitimate launch setting.
+        let mut expected_options = member.clone();
+        if bench_recovery_enabled {
+            agent_options::apply_task_effort_override(root, &mut expected_options);
+        }
         let Some(identity) = identities.get(&member.member) else {
             diagnostics.push(format!("{}: missing launch identity", member.member));
             continue;
@@ -117,7 +124,7 @@ pub(crate) fn runtime_diagnostics(
             .and_then(|b| serde_json::from_slice(&b).ok());
         if record.as_ref().is_none_or(|r| {
             r.model != member.model
-                || r.effort != member.effort
+                || r.effort != expected_options.effort
                 || r.backend != member.backend
                 || r.idle_inference_enabled != member.idle_inference_enabled
         }) {
@@ -188,6 +195,54 @@ mod tests {
                 .any(|s| s.contains("changed since launch"))
         );
     }
+    #[test]
+    fn task_effort_override_is_not_reported_as_a_launch_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let team_dir = root.join(".batty/team_config");
+        std::fs::create_dir_all(team_dir.join("board/tasks")).unwrap();
+        std::fs::create_dir_all(root.join(".batty/launch-options")).unwrap();
+        std::fs::write(
+            team_config_path(root),
+            "name: sample\nroles:\n- name: worker\n  role_type: engineer\n  agent: claude\n  effort: medium\nworkflow_policy:\n  bench_recovery:\n    enabled: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            team_dir.join("board/tasks/007-task.md"),
+            "---\nid: 7\ntitle: t\nstatus: in-progress\npriority: high\nclaimed_by: worker\neffort_override: high\n---\n\nbody\n",
+        )
+        .unwrap();
+        let members =
+            agent_options::all(&TeamConfig::load(&team_config_path(root)).unwrap()).unwrap();
+        let mut launched = members[0].clone();
+        launched.effort = Some("high".into());
+        std::fs::write(
+            root.join(".batty/launch-options/worker.json"),
+            serde_json::to_vec(&launched).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".batty/launch-state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "worker": {"agent": "claude-code", "session_id": "s1"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let diagnostics = runtime_diagnostics(root, &members).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        std::fs::remove_file(team_dir.join("board/tasks/007-task.md")).unwrap();
+        let diagnostics = runtime_diagnostics(root, &members).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|s| s.contains("changed since launch")),
+            "{diagnostics:?}"
+        );
+    }
+
     #[test]
     fn reset_is_scoped_to_a_configured_member() {
         let tmp = tempfile::tempdir().unwrap();
