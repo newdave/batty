@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use super::TeamDaemon;
 use super::background_tests::{BenchApprovalJob, BenchApprovalKind};
-use super::completion_checks::{VerificationRunResult, run_automatic_verification_tracked};
+use super::completion_checks::{VerificationRunResult, run_bench_bar_verification_tracked};
 use super::merge_queue::MergeOrigin;
 use crate::team::bench::{BenchEntry, BenchSource};
 use crate::team::bench_recovery::{
@@ -341,7 +341,7 @@ impl TeamDaemon {
             format!("bench-approval-{task_id}"),
             self.test_job_timeout(),
             move |child_pgid| {
-                run_automatic_verification_tracked(
+                run_bench_bar_verification_tracked(
                     &worktree_dir,
                     test_command.as_deref(),
                     Some(child_pgid.as_ref()),
