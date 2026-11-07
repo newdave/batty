@@ -260,6 +260,7 @@ This block controls execution quality and merge safety.
 - `narration_*`: guard rails against agents narrating instead of changing code
 - `bench_recovery`: automatic unbenching, retries and approval for engineers parked
   by zero-diff recovery
+- `decisions`: optional TypeSafe AI Jev decisions for supervisory checks
 
 `workflow_policy.main_smoke` fields:
 
@@ -299,6 +300,43 @@ a timeout does not pass, and the scope fence is not checked. A task that fails t
 bar is reset: its branch is archived, it returns to `todo` for a different
 engineer, and the effort for that task goes up one step. Bench recovery does
 nothing in non-git or multi-repo projects.
+
+`workflow_policy.decisions` fields. With `provider: jev`, batty asks TypeSafe AI's Jev
+decision model on the Vercel AI Gateway (`POST /v1/decisions`) for supervisory decisions,
+and uses today's heuristic whenever Jev is off, unreachable, slow, over budget, refuses, or
+is unsure:
+
+- `provider`: `heuristic` (default; no network calls) or `jev`
+- `model`: Gateway model id. Default: `typesafe-ai/jev-1.14.0`
+- `endpoint`: Default: `https://ai-gateway.vercel.sh/v1/decisions`
+- `api_key_env`: environment variable holding the Gateway key; the key is never read from
+  `team.yaml`. Default: `AI_GATEWAY_API_KEY`
+- `daily_spend_cap_usd`: spend per project per UTC day, taken from the cost each response
+  reports and kept in `telemetry.db`; over the cap every path uses the heuristic until the
+  next day. Default: `5.0`
+- `min_confidence`: answers below this confidence fall back. Default: `0.6`
+- `zero_data_retention`: ask the Gateway to route only to zero-data-retention providers.
+  Default: `true`
+- `timeouts_ms`: per path; `screen_state`, `triage` and `stall` default to `2000`,
+  `completion` and `rubric` to `10000`
+- `paths`: which decisions use Jev. Default: all of `completion`, `rubric`, `triage`,
+  `screen_state`, `stall`
+
+What each path does:
+
+- `completion`: can veto an engineer completion that passed every hard gate, as narration
+  only or insufficient evidence. It never accepts a completion a gate rejected.
+- `rubric`: scores a task entering review against its `## Acceptance Criteria` and sends the
+  manager a follow-up `[rubric]` message. Advisory only.
+- `triage`: classifies messages to the manager and architect; noise and status replies go
+  to the orchestrator log, escalations are delivered first.
+- `screen_state`: classifies the screen of manager and architect members on the PTY runtime.
+- `stall`: adds a reason to a supervisory stall that has no other signal.
+
+Privacy: batty sends task text, the agent's final message, a diff summary, message bodies
+and recent screen output. Before anything is hashed, sent or logged, keys, tokens, private
+keys, URL credentials and `KEY=value` secrets are replaced with `[REDACTED:<kind>]`. A call
+is made only when the redacted input changed since the last answer.
 
 ## `roles`
 
