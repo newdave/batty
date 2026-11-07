@@ -933,6 +933,63 @@ fn maybe_auto_unblock_moves_blocked_task_to_todo_and_notifies_owner() {
 }
 
 #[test]
+fn auto_unblock_leaves_bench_reset_capped_task_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engineer = MemberInstance {
+        name: "eng-1".to_string(),
+        role_name: "eng".to_string(),
+        role_type: RoleType::Engineer,
+        agent: Some("codex".to_string()),
+        prompt: None,
+        reports_to: None,
+        use_worktrees: false,
+        ..Default::default()
+    };
+    let mut daemon = make_test_daemon(tmp.path(), vec![engineer]);
+    let board_tasks_dir = tmp
+        .path()
+        .join(".batty")
+        .join("team_config")
+        .join("board")
+        .join("tasks");
+
+    write_board_task_file(tmp.path(), 11, "dep-a", "done", None, &[], None);
+    write_board_task_file(
+        tmp.path(),
+        13,
+        "capped-task",
+        "blocked",
+        Some("eng-1"),
+        &[11],
+        Some("bench recovery reset cap reached"),
+    );
+    let task_path = crate::team::task_cmd::find_task_path(
+        &tmp.path().join(".batty").join("team_config").join("board"),
+        13,
+    )
+    .unwrap();
+    crate::team::bench_recovery::write_bench_recovery(
+        &task_path,
+        &crate::team::bench_recovery::BenchRecoveryFrontmatter {
+            bench_reset_count: 2,
+            bench_reset_capped: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    daemon.maybe_auto_unblock_blocked_tasks().unwrap();
+
+    let tasks = crate::task::load_tasks_from_dir(&board_tasks_dir).unwrap();
+    let task = tasks.iter().find(|task| task.id == 13).unwrap();
+    assert_eq!(task.status, "blocked");
+    assert_eq!(
+        task.blocked_on.as_deref(),
+        Some("bench recovery reset cap reached")
+    );
+}
+
+#[test]
 fn maybe_auto_unblock_clears_stale_claim_from_todo_dependency_task() {
     let tmp = tempfile::tempdir().unwrap();
     let engineer = MemberInstance {

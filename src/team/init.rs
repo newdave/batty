@@ -10,7 +10,7 @@ use super::{
     team_config_path, team_events_path,
 };
 
-fn canonical_backend(agent: &str) -> String {
+pub(crate) fn canonical_backend(agent: &str) -> String {
     crate::agent::adapter_from_name(agent)
         .map(|adapter| adapter.name().to_string())
         .unwrap_or_else(|| agent.into())

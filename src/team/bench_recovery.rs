@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_yaml::Value;
 
+use super::config::EffortLadders;
 use super::daemon::completion_checks::VerificationRunResult;
 use super::task_cmd::{update_task_frontmatter, yaml_key};
 
@@ -217,6 +218,19 @@ pub fn verification_meets_bar(run: &VerificationRunResult, auto_run_tests: bool)
     auto_run_tests && run.passed
 }
 
+/// The effort ladder for an agent backend (`claude`/`claude-code` or
+/// `codex`/`codex-cli`). Other backends, or no backend, have no ladder.
+pub fn effort_ladder_for_backend<'a>(
+    ladders: &'a EffortLadders,
+    backend: Option<&str>,
+) -> &'a [String] {
+    match backend.map(super::init::canonical_backend).as_deref() {
+        Some("claude-code") => &ladders.claude,
+        Some("codex-cli") => &ladders.codex,
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +289,21 @@ mod tests {
         assert_eq!(next_effort(&ladder(), Some("bogus")), None);
         assert_eq!(next_effort(&[], Some("low")), None);
         assert_eq!(next_effort(&[], None), None);
+    }
+
+    #[test]
+    fn effort_ladder_for_backend_picks_by_canonical_backend() {
+        let ladders = EffortLadders::default();
+        assert_eq!(
+            effort_ladder_for_backend(&ladders, Some("claude")),
+            ladders.claude.as_slice()
+        );
+        assert_eq!(
+            effort_ladder_for_backend(&ladders, Some("codex-cli")),
+            ladders.codex.as_slice()
+        );
+        assert!(effort_ladder_for_backend(&ladders, Some("kiro")).is_empty());
+        assert!(effort_ladder_for_backend(&ladders, None).is_empty());
     }
 
     #[test]
