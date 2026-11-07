@@ -334,6 +334,8 @@ pub struct WorkflowPolicy {
     #[serde(default)]
     pub main_smoke: MainSmokePolicy,
     #[serde(default)]
+    pub bench_recovery: BenchRecoveryConfig,
+    #[serde(default)]
     pub auto_merge: AutoMergePolicy,
     /// When true, context exhaustion restarts capture a work summary and
     /// inject it into the new agent session so it can continue where the
@@ -441,6 +443,7 @@ impl Default for WorkflowPolicy {
             claim_ttl: ClaimTtlPolicy::default(),
             allocation: AllocationPolicy::default(),
             main_smoke: MainSmokePolicy::default(),
+            bench_recovery: BenchRecoveryConfig::default(),
             auto_merge: AutoMergePolicy::default(),
             context_handoff_enabled: default_context_handoff_enabled(),
             handoff_screen_history: default_handoff_screen_history(),
@@ -509,6 +512,58 @@ impl Default for MainSmokePolicy {
             command: None,
             pause_dispatch_on_failure: default_main_smoke_pause_dispatch_on_failure(),
             auto_revert: default_main_smoke_auto_revert(),
+        }
+    }
+}
+
+/// Automation around benched engineers: timed unbench, auto-approval when
+/// every engineer is benched, and effort-raising resets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchRecoveryConfig {
+    #[serde(default = "default_bench_recovery_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_bench_recovery_cooloff_secs")]
+    pub cooloff_secs: u64,
+    #[serde(default = "default_bench_recovery_max_auto_resets")]
+    pub max_auto_resets: u32,
+    #[serde(default = "default_bench_recovery_auto_approve_when_all_benched")]
+    pub auto_approve_when_all_benched: bool,
+    #[serde(default = "default_bench_recovery_wrong_branch_rescue")]
+    pub wrong_branch_rescue: bool,
+    #[serde(default = "default_bench_recovery_strike_warning")]
+    pub strike_warning: bool,
+    #[serde(default)]
+    pub effort_ladder: EffortLadders,
+}
+
+impl Default for BenchRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_bench_recovery_enabled(),
+            cooloff_secs: default_bench_recovery_cooloff_secs(),
+            max_auto_resets: default_bench_recovery_max_auto_resets(),
+            auto_approve_when_all_benched: default_bench_recovery_auto_approve_when_all_benched(),
+            wrong_branch_rescue: default_bench_recovery_wrong_branch_rescue(),
+            strike_warning: default_bench_recovery_strike_warning(),
+            effort_ladder: EffortLadders::default(),
+        }
+    }
+}
+
+/// Reasoning-effort steps per agent backend, lowest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffortLadders {
+    #[serde(default = "default_effort_ladder_claude")]
+    pub claude: Vec<String>,
+    #[serde(default = "default_effort_ladder_codex")]
+    pub codex: Vec<String>,
+}
+
+impl Default for EffortLadders {
+    fn default() -> Self {
+        Self {
+            claude: default_effort_ladder_claude(),
+            codex: default_effort_ladder_codex(),
         }
     }
 }
@@ -620,6 +675,42 @@ fn default_main_smoke_pause_dispatch_on_failure() -> bool {
 
 fn default_main_smoke_auto_revert() -> bool {
     false
+}
+
+fn default_bench_recovery_enabled() -> bool {
+    true
+}
+
+fn default_bench_recovery_cooloff_secs() -> u64 {
+    1800
+}
+
+fn default_bench_recovery_max_auto_resets() -> u32 {
+    2
+}
+
+fn default_bench_recovery_auto_approve_when_all_benched() -> bool {
+    true
+}
+
+fn default_bench_recovery_wrong_branch_rescue() -> bool {
+    true
+}
+
+fn default_bench_recovery_strike_warning() -> bool {
+    true
+}
+
+fn default_effort_ladder_claude() -> Vec<String> {
+    ["low", "medium", "high", "xhigh", "max"]
+        .map(String::from)
+        .to_vec()
+}
+
+fn default_effort_ladder_codex() -> Vec<String> {
+    ["minimal", "low", "medium", "high", "xhigh"]
+        .map(String::from)
+        .to_vec()
 }
 
 fn default_auto_commit_on_restart() -> bool {
