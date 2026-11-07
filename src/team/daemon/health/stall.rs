@@ -492,6 +492,11 @@ impl TeamDaemon {
         if let Some(next_action) = signal.next_expected_action() {
             summary.push_str(&format!("; next: {next_action}"));
         }
+        if matches!(signal, SupervisoryProgress::None)
+            && let Some(reason) = self.jev_stall_reason(member_name)
+        {
+            summary.push_str(&format!("; jev: {reason}"));
+        }
         summary
     }
 
@@ -599,6 +604,9 @@ impl TeamDaemon {
                 reason,
             ),
         };
+        if matches!(signal, SupervisoryProgress::None) && self.defer_stall_for_jev(member_name) {
+            return;
+        }
         let reason = self
             .supervisory_lane(member_name)
             .map(|lane| signal.stall_reason_for_lane(lane))
@@ -1197,6 +1205,213 @@ mod tests {
         assert_eq!(stall.task.as_deref(), Some("supervisory::architect"));
         assert_eq!(
             stall.details.as_deref(),
+            Some("architect (architect) stalled after 5m: no actionable progress")
+        );
+    }
+
+    fn jev_stall_daemon(
+        tmp: &tempfile::TempDir,
+        endpoint: &str,
+        key_env: &str,
+    ) -> crate::team::daemon::TeamDaemon {
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![architect_member("architect")])
+            .build();
+        daemon.config.team_config.workflow_policy.decisions =
+            crate::team::config::DecisionsConfig {
+                provider: crate::team::config::DecisionProvider::Jev,
+                endpoint: endpoint.to_string(),
+                api_key_env: key_env.to_string(),
+                paths: vec![crate::team::config::DecisionPath::Stall],
+                ..crate::team::config::DecisionsConfig::default()
+            };
+        let threshold = daemon
+            .config
+            .team_config
+            .workflow_policy
+            .stall_threshold_secs;
+        insert_working_shim_handle(&mut daemon, "architect", threshold + 12, threshold + 12);
+        daemon
+    }
+
+    fn stall_events(tmp: &tempfile::TempDir) -> Vec<TeamEvent> {
+        crate::team::events::read_events(&crate::team::team_events_path(tmp.path()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|event| event.event == "stall_detected")
+            .collect()
+    }
+
+    fn write_pty_log(tmp: &tempfile::TempDir, member: &str, content: &str) {
+        let path = crate::team::shim_log_path(tmp.path(), member);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn drain_decisions(daemon: &mut crate::team::daemon::TeamDaemon) {
+        for _ in 0..500 {
+            daemon.poll_decisions().unwrap();
+            if daemon.decision_jobs_in_flight() == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("stall job did not finish");
+    }
+
+    const UNUSED_ENDPOINT: &str = "http://127.0.0.1:1/v1/decisions";
+    const STALL_KEY: &str = "gateway-key-for-stall-tests-0123456789";
+
+    #[test]
+    fn cached_jev_reason_is_added_to_an_unexplained_stall() {
+        let _key = crate::team::test_support::EnvVarGuard::unset("BATTY_TEST_STALL_SEEDED");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = jev_stall_daemon(&tmp, UNUSED_ENDPOINT, "BATTY_TEST_STALL_SEEDED");
+        daemon.seed_stall_outcome(
+            "architect",
+            crate::team::decide::paths::StallOutcome {
+                stuck: true,
+                reason: Some("looping".to_string()),
+            },
+        );
+        let threshold = daemon
+            .config
+            .team_config
+            .workflow_policy
+            .stall_threshold_secs;
+
+        daemon.record_supervisory_stall_reason("architect", threshold, SupervisoryProgress::None);
+
+        let stalls = stall_events(&tmp);
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(
+            stalls[0].details.as_deref(),
+            Some("architect (architect) stalled after 5m: no actionable progress; jev: looping")
+        );
+    }
+
+    #[test]
+    fn jev_reason_never_touches_incidental_or_expected_signals() {
+        let _key = crate::team::test_support::EnvVarGuard::unset("BATTY_TEST_STALL_INCIDENTAL");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = jev_stall_daemon(&tmp, UNUSED_ENDPOINT, "BATTY_TEST_STALL_INCIDENTAL");
+        write_pty_log(&tmp, "architect", "$ waiting\n");
+        daemon.seed_stall_outcome(
+            "architect",
+            crate::team::decide::paths::StallOutcome {
+                stuck: true,
+                reason: Some("looping".to_string()),
+            },
+        );
+        for signal in [
+            SupervisoryProgress::Incidental("shim_activity"),
+            SupervisoryProgress::Expected("review_waiting"),
+        ] {
+            let summary = daemon.format_supervisory_stall_summary("architect", 300, &signal);
+            assert!(!summary.contains("jev"), "{summary}");
+        }
+        daemon.record_supervisory_stall_reason(
+            "architect",
+            300,
+            SupervisoryProgress::Incidental("shim_activity"),
+        );
+        assert_eq!(daemon.decision_jobs_in_flight(), 0);
+        assert!(
+            !stall_events(&tmp)[0]
+                .details
+                .as_deref()
+                .unwrap()
+                .contains("jev")
+        );
+    }
+
+    #[test]
+    fn not_stuck_answer_adds_no_reason_and_keeps_the_stall() {
+        let _key = crate::team::test_support::EnvVarGuard::unset("BATTY_TEST_STALL_NOTSTUCK");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = jev_stall_daemon(&tmp, UNUSED_ENDPOINT, "BATTY_TEST_STALL_NOTSTUCK");
+        daemon.seed_stall_outcome(
+            "architect",
+            crate::team::decide::paths::StallOutcome {
+                stuck: false,
+                reason: None,
+            },
+        );
+        daemon.record_supervisory_stall_reason("architect", 300, SupervisoryProgress::None);
+        let stalls = stall_events(&tmp);
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(
+            stalls[0].details.as_deref(),
+            Some("architect (architect) stalled after 5m: no actionable progress")
+        );
+    }
+
+    #[test]
+    fn unexplained_stall_waits_for_the_jev_answer() {
+        let _key = crate::team::test_support::EnvVarGuard::set("BATTY_TEST_STALL_LIVE", STALL_KEY);
+        let reply = serde_json::json!({
+            "answers": [
+                {"type": "predicate", "name": "stuck", "probability": 0.9},
+                {"type": "choice", "name": "reason", "choice": "waiting_on_input", "confidence": 0.8}
+            ],
+            "provider_metadata": {"gateway": {"cost": "0.00001"}}
+        })
+        .to_string();
+        let (endpoint, rx, server) =
+            crate::team::decide::test_server::serve_once("HTTP/1.1 200 OK", reply, Duration::ZERO);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = jev_stall_daemon(&tmp, &endpoint, "BATTY_TEST_STALL_LIVE");
+        let planted = format!("{}{}", "sk-", "ant-api03-PlantedStallSecret0123456789");
+        write_pty_log(
+            &tmp,
+            "architect",
+            &format!("\u{1b}[32mDo you approve? (y/n)\u{1b}[0m token {planted}\n"),
+        );
+
+        daemon.record_supervisory_stall_reason("architect", 300, SupervisoryProgress::None);
+        assert!(stall_events(&tmp).is_empty());
+        assert_eq!(daemon.decision_jobs_in_flight(), 1);
+
+        drain_decisions(&mut daemon);
+        server.join().unwrap();
+        daemon.record_supervisory_stall_reason("architect", 300, SupervisoryProgress::None);
+        let stalls = stall_events(&tmp);
+        assert_eq!(stalls.len(), 1);
+        assert!(
+            stalls[0]
+                .details
+                .as_deref()
+                .unwrap()
+                .ends_with("; jev: waiting_on_input")
+        );
+        let request = rx.recv().unwrap();
+        assert!(request.contains("Do you approve?"));
+        assert!(!request.contains("PlantedStallSecret"));
+        assert!(!request.contains("[32m"));
+    }
+
+    #[test]
+    fn stall_fallback_reports_as_today() {
+        let _key =
+            crate::team::test_support::EnvVarGuard::set("BATTY_TEST_STALL_FALLBACK", STALL_KEY);
+        let (endpoint, _rx, server) = crate::team::decide::test_server::serve_once(
+            "HTTP/1.1 503 Service Unavailable",
+            "{}".to_string(),
+            Duration::ZERO,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = jev_stall_daemon(&tmp, &endpoint, "BATTY_TEST_STALL_FALLBACK");
+        write_pty_log(&tmp, "architect", "$ idle prompt\n");
+
+        daemon.record_supervisory_stall_reason("architect", 300, SupervisoryProgress::None);
+        drain_decisions(&mut daemon);
+        server.join().unwrap();
+        daemon.record_supervisory_stall_reason("architect", 300, SupervisoryProgress::None);
+
+        let stalls = stall_events(&tmp);
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(
+            stalls[0].details.as_deref(),
             Some("architect (architect) stalled after 5m: no actionable progress")
         );
     }
