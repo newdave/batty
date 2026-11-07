@@ -18,7 +18,7 @@ use tracing::debug;
 use super::TeamDaemon;
 use crate::team::config::{DecisionPath, DecisionProvider};
 use crate::team::decide::gate::{self, BoundedCache, ChangeGate};
-use crate::team::decide::paths::{self, TriageOutcome};
+use crate::team::decide::paths::{self, CompletionOutcome, TriageOutcome};
 use crate::team::decide::{
     Answer, DecisionOutcome, DecisionResponse, Fallback, Question, budget, client, redact,
 };
@@ -54,6 +54,8 @@ pub(crate) struct DecisionsState {
     /// Inbox message ids held back while their triage call runs, with the
     /// time each was first held.
     triage_deferred: BoundedCache<String, Instant>,
+    /// Redacted last response per engineer, kept for the completion veto.
+    pending_response: HashMap<String, String>,
     no_key_reported: bool,
     budget_reported_on: Option<String>,
     /// Spend since startup as `(UTC date, USD)`, a floor when the telemetry
@@ -69,6 +71,7 @@ impl Default for DecisionsState {
             triage: BoundedCache::new(gate::TRIAGE_CACHE_CAPACITY),
             failed: BoundedCache::new(gate::GATE_CAPACITY),
             triage_deferred: BoundedCache::new(gate::TRIAGE_CACHE_CAPACITY),
+            pending_response: HashMap::new(),
             no_key_reported: false,
             budget_reported_on: None,
             session_spend: None,
@@ -241,6 +244,87 @@ impl TeamDaemon {
         self.decisions
             .triage
             .insert(triage_body_hash(body), verdict);
+    }
+
+    /// Keep the engineer's final response (redacted, capped) for the
+    /// completion veto. No-op unless the completion path is configured.
+    pub fn stash_completion_response(&mut self, engineer: &str, response: &str) {
+        if !self.decision_path_configured(DecisionPath::Completion) {
+            return;
+        }
+        let redacted = paths::cap_input(&redact::redact(response), paths::Keep::Tail);
+        self.decisions
+            .pending_response
+            .insert(engineer.to_string(), redacted);
+    }
+
+    /// Start the completion veto decision for `task_id` from the task text,
+    /// the engineer's stashed response and a diff summary. A cached outcome
+    /// for different input is dropped first, so a cached outcome always
+    /// describes the current completion.
+    pub fn start_completion_decision(
+        &mut self,
+        engineer: &str,
+        task_id: u32,
+        task_text: &str,
+        diff_summary: &str,
+    ) {
+        let response = self
+            .decisions
+            .pending_response
+            .remove(engineer)
+            .unwrap_or_default();
+        if !self.decisions_enabled(DecisionPath::Completion) {
+            return;
+        }
+        let input = paths::completion_input(
+            &redact::redact(task_text),
+            &response,
+            &redact::redact(diff_summary),
+        );
+        let questions = paths::completion_questions();
+        let key = task_id.to_string();
+        let hash = gate::input_hash(&redact::redact(&input), &questions);
+        if !self
+            .decisions
+            .outcomes
+            .unchanged(DecisionPath::Completion, &key, hash)
+        {
+            self.decisions
+                .outcomes
+                .forget(DecisionPath::Completion, &key);
+        }
+        self.start_decision(DecisionPath::Completion, &key, &input, questions);
+    }
+
+    /// True while the completion decision for `task_id` is in flight.
+    pub fn completion_decision_pending(&self, task_id: u32) -> bool {
+        self.decisions
+            .jobs
+            .contains_key(&(DecisionPath::Completion, task_id.to_string()))
+    }
+
+    /// The cached completion outcome for `task_id` when it vetoes the
+    /// completion. Read-only; a miss means "accept as today".
+    pub fn completion_veto(&self, task_id: u32) -> Option<CompletionOutcome> {
+        if !self.decision_path_configured(DecisionPath::Completion) {
+            return None;
+        }
+        match self.cached_decision(DecisionPath::Completion, &task_id.to_string()) {
+            Some(DecisionOutcome::Completion(outcome)) if outcome.vetoes() => Some(*outcome),
+            _ => None,
+        }
+    }
+
+    /// Test hook: store a completion outcome as if a call had answered.
+    #[cfg(test)]
+    pub(crate) fn seed_completion_outcome(&mut self, task_id: u32, outcome: CompletionOutcome) {
+        self.decisions.outcomes.record(
+            DecisionPath::Completion,
+            &task_id.to_string(),
+            0,
+            DecisionOutcome::Completion(outcome),
+        );
     }
 
     /// Test hook: number of decision calls in flight.

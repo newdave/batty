@@ -6,6 +6,7 @@ mod execute;
 mod gates;
 mod multi_repo;
 mod verify_job;
+mod veto;
 
 use super::decision::{
     analyze_completion_diff, move_task_to_review, record_completion_packet_metadata,

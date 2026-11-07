@@ -27,10 +27,12 @@ mod tests;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use tracing::info;
 
 use crate::task::load_tasks_from_dir;
 use crate::team::daemon::completion_checks::VerificationRunResult;
 use crate::team::daemon::{MergeOrigin, TeamDaemon};
+use crate::team::events::TeamEvent;
 use crate::team::task_loop::current_worktree_branch;
 use crate::team::verification_state::VerificationState;
 
@@ -39,7 +41,7 @@ pub(crate) use execute::{
     poll_deferred_direct_merges, record_merge_test_timing, restore_deferred_direct_merges,
 };
 pub(crate) use multi_repo::multi_repo_changed_paths;
-pub(crate) use verify_job::{VerificationJob, poll_verification_jobs};
+pub(crate) use verify_job::{AwaitingVeto, VerificationJob, poll_verification_jobs};
 
 use decision::MergeRoute;
 use gates::DiffEvidence;
@@ -138,6 +140,8 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         records_test_evidence: run_kind == Some(true),
     };
 
+    start_completion_veto(daemon, engineer, &ctx);
+
     if run_kind.is_some() {
         if ctx.records_test_evidence {
             ctx.verification_state.begin_iteration();
@@ -147,7 +151,61 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
     }
 
     let verification_run = verify_job::skipped_verification_run(daemon, engineer, &mut ctx);
-    finish_engineer_completion(daemon, engineer, ctx, verification_run, 0)
+    finish_or_await_veto(daemon, engineer, ctx, verification_run, 0)
+}
+
+/// Ask Jev whether this completion is real, in parallel with verification.
+/// No-op unless the completion path is enabled.
+fn start_completion_veto(daemon: &mut TeamDaemon, engineer: &str, ctx: &CompletionContext) {
+    if !daemon.decision_path_configured(crate::team::config::DecisionPath::Completion) {
+        return;
+    }
+    let task_text = crate::team::task_cmd::find_task_path(&ctx.board_dir, ctx.task_id)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let diff = &ctx.diff;
+    let diff_summary = format!(
+        "commits: {}, files changed: {}, code files changed: {}\n{}",
+        diff.total_commits,
+        diff.files_changed,
+        diff.code_files_changed,
+        diff.diff_stat_or_empty()
+    );
+    daemon.start_completion_decision(engineer, ctx.task_id, &task_text, &diff_summary);
+}
+
+/// Finish a verified completion, or park it while its Jev veto is still
+/// pending. Parked completions resume from the poll loop once the decision
+/// lands or the completion timeout passes; only a passing completion with
+/// full evidence can be vetoed, so every other one finishes now.
+fn finish_or_await_veto(
+    daemon: &mut TeamDaemon,
+    engineer: &str,
+    ctx: CompletionContext,
+    verification_run: VerificationRunResult,
+    test_duration_ms: u64,
+) -> Result<()> {
+    let vetoable = verification_run.recovery.is_none()
+        && verification_run.passed
+        && gates::has_required_evidence(daemon, engineer, &ctx);
+    if vetoable && daemon.completion_decision_pending(ctx.task_id) {
+        verify_job::await_veto(daemon, engineer, ctx, verification_run, test_duration_ms);
+        return Ok(());
+    }
+    finish_engineer_completion(daemon, engineer, ctx, verification_run, test_duration_ms)
+}
+
+/// The rejection a cached Jev veto imposes on a completion that passed every
+/// hard gate: `NarrationOnly` when the response only narrates, otherwise
+/// `InsufficientEvidence`.
+fn jev_veto(daemon: &TeamDaemon, task_id: u32) -> Option<gates::Rejection> {
+    let outcome = daemon.completion_veto(task_id)?;
+    Some(if outcome.narration_only {
+        gates::Rejection::NarrationOnly
+    } else {
+        gates::Rejection::InsufficientEvidence
+    })
 }
 
 /// Second half of completion handling: runs once the verification result is
@@ -178,6 +236,19 @@ fn finish_engineer_completion(
             &verification_run,
             has_required_evidence,
         );
+    }
+    if let Some(rejection) = jev_veto(daemon, ctx.task_id) {
+        info!(
+            engineer,
+            task_id = ctx.task_id,
+            reason = rejection.label(),
+            "Jev vetoed a completion that passed the hard gates"
+        );
+        daemon.emit_event(TeamEvent::completion_vetoed(
+            &ctx.task_id.to_string(),
+            rejection.label(),
+        ));
+        return gates::reject_completion_as(daemon, engineer, ctx, &verification_run, rejection);
     }
 
     verify_job::complete_verification(daemon, engineer, &mut ctx, &verification_run)?;
