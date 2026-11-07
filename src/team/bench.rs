@@ -24,11 +24,24 @@ pub struct BenchState {
     pub benched: BTreeMap<String, BenchEntry>,
 }
 
+/// Who benched an engineer. Automation must never touch `Manual` entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchSource {
+    #[default]
+    Manual,
+    AutoPark,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchEntry {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub source: BenchSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<u32>,
 }
 
 pub fn bench_file_path(project_root: &Path) -> PathBuf {
@@ -47,10 +60,25 @@ pub fn benched_engineer_names(project_root: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
+/// Load every bench entry, including provenance.
+pub fn bench_entries(project_root: &Path) -> Result<BTreeMap<String, BenchEntry>> {
+    Ok(load_bench_state(project_root)?.benched)
+}
+
 pub fn bench_engineer(
     project_root: &Path,
     engineer: &str,
     reason: Option<&str>,
+) -> Result<BenchEntry> {
+    bench_engineer_with(project_root, engineer, reason, BenchSource::Manual, None)
+}
+
+pub fn bench_engineer_with(
+    project_root: &Path,
+    engineer: &str,
+    reason: Option<&str>,
+    source: BenchSource,
+    task_id: Option<u32>,
 ) -> Result<BenchEntry> {
     validate_engineer(project_root, engineer)?;
     with_bench_lock(project_root, || {
@@ -59,6 +87,8 @@ pub fn bench_engineer(
         let entry = BenchEntry {
             timestamp: Utc::now().to_rfc3339(),
             reason: normalize_reason(reason),
+            source,
+            task_id,
         };
         state.benched.insert(engineer.to_string(), entry.clone());
         write_bench_state(&path, &state)?;
@@ -87,11 +117,17 @@ pub fn format_benched_engineers_section(state: &BenchState) -> Option<String> {
         format!("{:<20} {:<26} {}", "ENGINEER", "SINCE", "REASON"),
     ];
     for (engineer, entry) in &state.benched {
+        let reason = entry.reason.as_deref().unwrap_or("-");
+        let reason = match (entry.source, entry.task_id) {
+            (BenchSource::AutoPark, Some(task_id)) => {
+                format!("{reason} (auto, task #{task_id})")
+            }
+            (BenchSource::AutoPark, None) => format!("{reason} (auto)"),
+            (BenchSource::Manual, _) => reason.to_string(),
+        };
         lines.push(format!(
             "{:<20} {:<26} {}",
-            engineer,
-            entry.timestamp,
-            entry.reason.as_deref().unwrap_or("-"),
+            engineer, entry.timestamp, reason,
         ));
     }
 
@@ -278,6 +314,8 @@ roles:
             BenchEntry {
                 timestamp: "2026-04-10T10:00:00Z".to_string(),
                 reason: Some("session end".to_string()),
+                source: BenchSource::Manual,
+                task_id: None,
             },
         );
 
@@ -286,6 +324,63 @@ roles:
         assert!(formatted.contains("eng-1-1"));
         assert!(formatted.contains("2026-04-10T10:00:00Z"));
         assert!(formatted.contains("session end"));
+    }
+
+    #[test]
+    fn legacy_entry_without_source_loads_as_manual() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_team_config(tmp.path());
+        std::fs::write(
+            bench_file_path(tmp.path()),
+            "benched:\n  eng-1-1:\n    timestamp: \"2026-04-10T10:00:00Z\"\n    reason: old\n",
+        )
+        .unwrap();
+
+        let entries = bench_entries(tmp.path()).unwrap();
+        let entry = entries.get("eng-1-1").unwrap();
+        assert_eq!(entry.source, BenchSource::Manual);
+        assert_eq!(entry.task_id, None);
+    }
+
+    #[test]
+    fn bench_engineer_with_persists_source_and_task_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_team_config(tmp.path());
+
+        let entry = bench_engineer_with(
+            tmp.path(),
+            "eng-1-1",
+            Some("zero diff"),
+            BenchSource::AutoPark,
+            Some(42),
+        )
+        .unwrap();
+        assert_eq!(entry.source, BenchSource::AutoPark);
+
+        let raw = std::fs::read_to_string(bench_file_path(tmp.path())).unwrap();
+        assert!(raw.contains("source: auto_park"), "{raw}");
+        assert!(raw.contains("task_id: 42"), "{raw}");
+
+        let state = load_bench_state(tmp.path()).unwrap();
+        let formatted = format_benched_engineers_section(&state).unwrap();
+        assert!(formatted.contains("(auto, task #42)"), "{formatted}");
+    }
+
+    #[test]
+    fn bench_engineer_wrapper_writes_manual_without_task_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_team_config(tmp.path());
+
+        let entry = bench_engineer(tmp.path(), "eng-1-1", None).unwrap();
+        assert_eq!(entry.source, BenchSource::Manual);
+        assert_eq!(entry.task_id, None);
+
+        let raw = std::fs::read_to_string(bench_file_path(tmp.path())).unwrap();
+        assert!(raw.contains("source: manual"), "{raw}");
+        assert!(!raw.contains("task_id"), "{raw}");
+        let formatted =
+            format_benched_engineers_section(&load_bench_state(tmp.path()).unwrap()).unwrap();
+        assert!(!formatted.contains("(auto"));
     }
 
     #[test]

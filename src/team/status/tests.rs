@@ -2375,6 +2375,8 @@ fn format_benched_engineers_includes_reason_and_timestamp() {
             crate::team::bench::BenchEntry {
                 timestamp: "2026-04-10T12:00:00Z".to_string(),
                 reason: Some("session end".to_string()),
+                source: crate::team::bench::BenchSource::Manual,
+                task_id: None,
             },
         )]),
     })
