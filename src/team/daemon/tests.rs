@@ -1104,6 +1104,95 @@ fn zero_diff_completion_park_records_auto_park_bench_entry() {
     assert_eq!(entry.task_id, Some(7));
 }
 
+fn strike_warning_policy(
+    mode: crate::team::config::ZeroDiffRecovery,
+    enabled: bool,
+    strike_warning: bool,
+) -> WorkflowPolicy {
+    WorkflowPolicy {
+        zero_diff_recovery: mode,
+        bench_recovery: crate::team::config::BenchRecoveryConfig {
+            enabled,
+            strike_warning,
+            ..Default::default()
+        },
+        ..WorkflowPolicy::default()
+    }
+}
+
+/// Record one zero-diff strike for eng-1 and return (warning bodies, event names).
+fn first_zero_diff_strike(policy: WorkflowPolicy) -> (Vec<String>, Vec<String>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(&tmp, "batty-strike-warning");
+    write_owned_task_file(&repo, 42, "zero-diff-task", "in-progress", "eng-1");
+    let mut daemon = TestDaemonBuilder::new(&repo)
+        .members(vec![
+            manager_member("manager", None),
+            engineer_member("eng-1", Some("manager"), true),
+        ])
+        .workflow_policy(policy)
+        .build();
+    daemon.set_active_task_for_test("eng-1", 42);
+
+    assert_eq!(
+        daemon.maybe_track_zero_diff_completion("eng-1").unwrap(),
+        Some((42, 1))
+    );
+
+    let bodies =
+        crate::team::inbox::pending_messages(&crate::team::inbox::inboxes_root(&repo), "eng-1")
+            .unwrap()
+            .into_iter()
+            .map(|message| message.body)
+            .collect();
+    let events = crate::team::events::read_events(
+        &repo.join(".batty").join("team_config").join("events.jsonl"),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|event| event.event)
+    .collect();
+    (bodies, events)
+}
+
+#[test]
+fn strike_warning_in_park_mode_mentions_parking() {
+    let (bodies, events) = first_zero_diff_strike(strike_warning_policy(
+        crate::team::config::ZeroDiffRecovery::Park,
+        true,
+        true,
+    ));
+    assert_eq!(bodies.len(), 1);
+    assert!(bodies[0].contains("parks you"), "{}", bodies[0]);
+    assert!(events.iter().any(|e| e == "completion_attribution_warning"));
+}
+
+#[test]
+fn strike_warning_in_restart_mode_mentions_restart() {
+    let (bodies, events) = first_zero_diff_strike(strike_warning_policy(
+        crate::team::config::ZeroDiffRecovery::Restart,
+        true,
+        true,
+    ));
+    assert_eq!(bodies.len(), 1);
+    assert!(bodies[0].contains("restarts your session"), "{}", bodies[0]);
+    assert!(!bodies[0].contains("parks you"));
+    assert!(events.iter().any(|e| e == "completion_attribution_warning"));
+}
+
+#[test]
+fn strike_warning_is_silent_when_disabled() {
+    for (enabled, strike_warning) in [(true, false), (false, true)] {
+        let (bodies, events) = first_zero_diff_strike(strike_warning_policy(
+            crate::team::config::ZeroDiffRecovery::Park,
+            enabled,
+            strike_warning,
+        ));
+        assert!(bodies.is_empty());
+        assert!(!events.iter().any(|e| e == "completion_attribution_warning"));
+    }
+}
+
 #[test]
 #[cfg_attr(not(feature = "integration"), ignore)]
 fn daemon_lifecycle_happy_path_exercises_decomposed_modules() {
