@@ -38,6 +38,16 @@ pub enum QueuedCommand {
         #[serde(default)]
         first_failed_at: Option<u64>,
     },
+    /// Ask the daemon to restart a member whose runtime is stuck.
+    #[serde(rename = "restart")]
+    Restart {
+        member: String,
+        reason: String,
+        #[serde(default)]
+        attempts: u32,
+        #[serde(default)]
+        first_failed_at: Option<u64>,
+    },
 }
 
 impl QueuedCommand {
@@ -69,11 +79,21 @@ impl QueuedCommand {
         }
     }
 
+    pub fn restart(member: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Restart {
+            member: member.into(),
+            reason: reason.into(),
+            attempts: 0,
+            first_failed_at: None,
+        }
+    }
+
     /// Role the command is addressed to.
     pub fn recipient(&self) -> &str {
         match self {
             Self::Send { to, .. } => to,
             Self::Assign { engineer, .. } => engineer,
+            Self::Restart { member, .. } => member,
         }
     }
 
@@ -85,6 +105,11 @@ impl QueuedCommand {
                 ..
             }
             | Self::Assign {
+                attempts,
+                first_failed_at,
+                ..
+            }
+            | Self::Restart {
                 attempts,
                 first_failed_at,
                 ..
@@ -303,6 +328,21 @@ mod tests {
     use super::*;
     fn send(to: &str, message: &str) -> QueuedCommand {
         QueuedCommand::send("human", to, message)
+    }
+
+    #[test]
+    fn restart_command_round_trips_and_addresses_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = tmp.path().join("commands.jsonl");
+        enqueue_command(&queue, &QueuedCommand::restart("eng-1-1", "pane dead")).unwrap();
+
+        let commands = read_command_queue(&queue).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].recipient(), "eng-1-1");
+        assert!(matches!(
+            &commands[0],
+            QueuedCommand::Restart { reason, attempts: 0, .. } if reason == "pane dead"
+        ));
     }
 
     #[test]

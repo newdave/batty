@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use super::super::*;
 use crate::team::{checkpoint, context_management, inbox, inbox_tiered};
@@ -216,6 +216,30 @@ impl TeamDaemon {
             mailbox,
             delivery_queue,
             total: mailbox + delivery_queue,
+        }
+    }
+
+    /// Restart a member on request of `batty repair`: shim members get a cold
+    /// respawn, tmux members a pane respawn. Unknown members are ignored.
+    pub(in crate::team) fn restart_requested_member(
+        &mut self,
+        member_name: &str,
+        reason: &str,
+    ) -> Result<()> {
+        if !self
+            .config
+            .members
+            .iter()
+            .any(|member| member.name == member_name)
+        {
+            debug!(member = %member_name, "ignoring restart request for unknown member");
+            return Ok(());
+        }
+        info!(member = %member_name, reason, "restart requested via command queue");
+        if self.shim_handles.contains_key(member_name) {
+            self.handle_shim_cold_respawn(member_name, "repair_requested")
+        } else {
+            self.restart_member(member_name)
         }
     }
 
