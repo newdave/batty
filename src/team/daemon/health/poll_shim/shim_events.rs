@@ -300,6 +300,7 @@ impl TeamDaemon {
 
         // Trigger engineer completion flow if there's an active task
         if self.active_task_id(member_name).is_some() {
+            self.stash_completion_response(member_name, &response);
             if let Err(error) = merge::handle_engineer_completion(self, member_name) {
                 warn!(
                     member = member_name,

@@ -137,6 +137,16 @@ pub(super) enum Rejection {
 }
 
 impl Rejection {
+    /// Stable label for events.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::NoCommits => "no_commits",
+            Self::NarrationOnly => "narration_only",
+            Self::InsufficientEvidence => "insufficient_evidence",
+            Self::TestsFailed => "tests_failed",
+        }
+    }
+
     fn classify(has_required_evidence: bool, diff: &DiffEvidence) -> Self {
         if has_required_evidence {
             Self::TestsFailed
@@ -255,6 +265,20 @@ pub(super) fn reject_completion(
     verification_run: &VerificationRunResult,
     has_required_evidence: bool,
 ) -> Result<()> {
+    let rejection = Rejection::classify(has_required_evidence, &ctx.diff);
+    reject_completion_as(daemon, engineer, ctx, verification_run, rejection)
+}
+
+/// [`reject_completion`] with an explicit `rejection`, for callers whose
+/// reason is not implied by the evidence (the Jev completion veto rejects a
+/// completion whose evidence and tests both passed).
+pub(super) fn reject_completion_as(
+    daemon: &mut TeamDaemon,
+    engineer: &str,
+    ctx: CompletionContext,
+    verification_run: &VerificationRunResult,
+    rejection: Rejection,
+) -> Result<()> {
     let CompletionContext {
         task_id,
         trunk_branch,
@@ -270,7 +294,6 @@ pub(super) fn reject_completion(
     {
         telemetry_db::record_test_results(conn, task_id, engineer, verification_results, &[])?;
     }
-    let rejection = Rejection::classify(has_required_evidence, &diff);
     // A narration-only completion is one that DID land real commits but
     // produced no code changes. A zero-commit attempt is a distinct failure
     // mode and must not inflate the narration counter (#635).

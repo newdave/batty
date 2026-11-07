@@ -11,7 +11,7 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 use super::TeamDaemon;
-use crate::team::merge::{self, VerificationJob};
+use crate::team::merge::{self, AwaitingVeto, VerificationJob};
 use crate::team::test_job::{RunningTestInfo, TestJob};
 use crate::team::test_results::TestRunOutput;
 
@@ -19,6 +19,8 @@ use crate::team::test_results::TestRunOutput;
 pub(crate) struct BackgroundTests {
     /// Completion verifications in flight, keyed by engineer.
     pub(crate) verification: HashMap<String, VerificationJob>,
+    /// Verified completions waiting for their Jev veto, keyed by engineer.
+    pub(crate) awaiting_veto: HashMap<String, AwaitingVeto>,
     pub(super) main_smoke: Option<MainSmokeJob>,
     pub(super) chat_merges: Vec<ChatMergeJob>,
     /// Bench recovery approval runs, keyed by task.
@@ -96,6 +98,9 @@ impl BackgroundTests {
         let mut pending = self.retriggers.clone();
         for (engineer, job) in &self.verification {
             pending.insert(engineer.clone(), job.task_id());
+        }
+        for (engineer, parked) in &self.awaiting_veto {
+            pending.insert(engineer.clone(), parked.task_id());
         }
         pending
     }

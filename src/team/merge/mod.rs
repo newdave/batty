@@ -19,9 +19,10 @@ mod operations;
 #[cfg(test)]
 pub(crate) use completion::handle_engineer_completion_and_wait;
 pub(crate) use completion::{
-    DeferredDirectMerge, VerificationJob, append_merge_learning, enqueue_reviewed_merge,
-    handle_engineer_completion, multi_repo_changed_paths, poll_deferred_direct_merges,
-    poll_verification_jobs, record_merge_test_timing, restore_deferred_direct_merges,
+    AwaitingVeto, DeferredDirectMerge, VerificationJob, append_merge_learning,
+    enqueue_reviewed_merge, handle_engineer_completion, multi_repo_changed_paths,
+    poll_deferred_direct_merges, poll_verification_jobs, record_merge_test_timing,
+    restore_deferred_direct_merges,
 };
 #[cfg(test)]
 pub(crate) use lock::acquire_eventually_for_test;

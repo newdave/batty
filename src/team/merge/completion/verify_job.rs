@@ -2,7 +2,6 @@
 //! verification-state transitions, and the persisted verification snapshots.
 
 use std::path::Path;
-#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,7 +20,9 @@ use crate::team::verification_state::{EvidenceKind, VerificationPhase, Verificat
 
 use super::super::git_ops::{branch_head, head_commit};
 use super::messaging::verification_recovery_message;
-use super::{CompletionContext, finish_engineer_completion, handle_engineer_completion};
+use super::{
+    CompletionContext, finish_engineer_completion, finish_or_await_veto, handle_engineer_completion,
+};
 
 /// A completion verification running on a background thread, keyed by
 /// engineer in `TeamDaemon::background_tests`.
@@ -44,6 +45,103 @@ impl VerificationJob {
     }
 }
 
+/// A verified completion parked while its Jev veto decision runs, keyed by
+/// engineer in `TeamDaemon::background_tests`.
+pub(crate) struct AwaitingVeto {
+    ctx: CompletionContext,
+    verification_run: VerificationRunResult,
+    test_duration_ms: u64,
+    /// Resume as today once this passes, decision or not.
+    deadline: Instant,
+}
+
+impl AwaitingVeto {
+    pub(crate) fn task_id(&self) -> u32 {
+        self.ctx.task_id
+    }
+}
+
+/// Park a verified completion until its veto decision lands, for at most the
+/// completion decision timeout.
+pub(super) fn await_veto(
+    daemon: &mut TeamDaemon,
+    engineer: &str,
+    ctx: CompletionContext,
+    verification_run: VerificationRunResult,
+    test_duration_ms: u64,
+) {
+    let timeout = Duration::from_millis(
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .decisions
+            .timeouts_ms
+            .for_path(crate::team::config::DecisionPath::Completion),
+    );
+    info!(
+        engineer,
+        task_id = ctx.task_id,
+        timeout_ms = timeout.as_millis() as u64,
+        "completion verified; waiting for the Jev completion check"
+    );
+    daemon.verification.background_tests.awaiting_veto.insert(
+        engineer.to_string(),
+        AwaitingVeto {
+            ctx,
+            verification_run,
+            test_duration_ms,
+            deadline: Instant::now() + timeout,
+        },
+    );
+}
+
+/// Resume parked completions whose veto decision finished or whose wait
+/// expired. A completion whose task is no longer active is dropped.
+fn poll_awaiting_vetoes(daemon: &mut TeamDaemon) -> Result<()> {
+    let ready: Vec<String> = daemon
+        .verification
+        .background_tests
+        .awaiting_veto
+        .iter()
+        .filter(|(_, parked)| {
+            Instant::now() >= parked.deadline
+                || !daemon.completion_decision_pending(parked.ctx.task_id)
+        })
+        .map(|(engineer, _)| engineer.clone())
+        .collect();
+    let mut first_error = None;
+    for engineer in ready {
+        let Some(parked) = daemon
+            .verification
+            .background_tests
+            .awaiting_veto
+            .remove(&engineer)
+        else {
+            continue;
+        };
+        if daemon.active_task_id(&engineer) != Some(parked.ctx.task_id) {
+            info!(
+                engineer = %engineer,
+                task_id = parked.ctx.task_id,
+                "dropping parked completion: task is no longer active for this engineer"
+            );
+            continue;
+        }
+        if let Err(error) = finish_engineer_completion(
+            daemon,
+            &engineer,
+            parked.ctx,
+            parked.verification_run,
+            parked.test_duration_ms,
+        ) {
+            warn!(engineer = %engineer, error = %error, "parked completion handling failed");
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// True when a verification for `task_id` is already running (a repeated
 /// completion is ignored). A running verification for another task is
 /// cancelled, since the engineer no longer owns it.
@@ -52,6 +150,25 @@ pub(super) fn verification_already_running(
     engineer: &str,
     task_id: u32,
 ) -> bool {
+    if let Some(parked) = daemon
+        .verification
+        .background_tests
+        .awaiting_veto
+        .get(engineer)
+    {
+        if parked.task_id() == task_id {
+            info!(
+                engineer,
+                task_id, "completion awaiting its Jev check; ignoring repeated completion"
+            );
+            return true;
+        }
+        daemon
+            .verification
+            .background_tests
+            .awaiting_veto
+            .remove(engineer);
+    }
     let Some(running) = daemon
         .verification
         .background_tests
@@ -231,6 +348,7 @@ pub(super) fn skipped_verification_run(
 /// daemon poll loop; returns the first continuation error after applying all
 /// finished jobs.
 pub(crate) fn poll_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> {
+    let parked_result = poll_awaiting_vetoes(daemon);
     let finished: Vec<(String, Result<VerificationRunResult>)> = daemon
         .verification
         .background_tests
@@ -253,7 +371,10 @@ pub(crate) fn poll_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> {
             first_error.get_or_insert(error);
         }
     }
-    first_error.map_or(Ok(()), Err)
+    match (parked_result, first_error) {
+        (Err(error), _) | (Ok(()), Some(error)) => Err(error),
+        (Ok(()), None) => Ok(()),
+    }
 }
 
 pub(crate) fn timed_out_verification_run(
@@ -369,7 +490,7 @@ fn apply_verification_result(
     } else {
         0
     };
-    finish_engineer_completion(daemon, engineer, ctx, verification_run, test_duration_ms)
+    finish_or_await_veto(daemon, engineer, ctx, verification_run, test_duration_ms)
 }
 
 /// The engineer verified on the wrong branch: record `branch_recovery_required`
@@ -648,8 +769,10 @@ fn detect_flaky_failures(
 pub(crate) fn wait_for_verification_jobs(daemon: &mut TeamDaemon) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
+        daemon.poll_decisions()?;
         poll_verification_jobs(daemon)?;
-        if daemon.verification.background_tests.verification.is_empty() {
+        let tests = &daemon.verification.background_tests;
+        if tests.verification.is_empty() && tests.awaiting_veto.is_empty() {
             return Ok(());
         }
         assert!(
