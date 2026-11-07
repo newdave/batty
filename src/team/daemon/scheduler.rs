@@ -28,6 +28,12 @@ pub(in crate::team) struct Scheduler {
     pub(in crate::team) last_telemetry_retention: Option<Instant>,
     /// When the last tiered inbox expiry sweep ran (#658). Gated to at most once per minute.
     pub(in crate::team) last_tiered_inbox_sweep: Option<Instant>,
+    /// When the bench recovery step last ran (throttled to every 30s).
+    pub(in crate::team) last_bench_recovery: Option<Instant>,
+    /// When the hourly "team fully benched by hand" alert last fired. A
+    /// dedicated slot: `suppress_recent_escalation` prunes every key with the
+    /// caller's window, so it cannot hold an hourly cooldown.
+    pub(in crate::team) last_full_bench_alert: Option<Instant>,
     /// Keyed cooldowns for interventions, alerts and optional-subsystem budgets.
     pub(in crate::team) intervention_cooldowns: HashMap<String, Instant>,
     /// Tracks recent escalation keys to suppress repeated alerts.
@@ -54,6 +60,8 @@ impl Scheduler {
             last_telemetry_retention: None,
             // First sweep runs on the first tick after startup.
             last_tiered_inbox_sweep: None,
+            last_bench_recovery: None,
+            last_full_bench_alert: None,
             intervention_cooldowns: HashMap::new(),
             recent_escalations: HashMap::new(),
         }
