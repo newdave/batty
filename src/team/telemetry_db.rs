@@ -353,6 +353,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_review_queue_metrics_ts
             ON review_queue_metrics(timestamp);
+
+        CREATE TABLE IF NOT EXISTS decision_spend (
+            date   TEXT PRIMARY KEY,
+            usd    REAL NOT NULL DEFAULT 0,
+            calls  INTEGER NOT NULL DEFAULT 0
+        );
         ",
     )
     .context("failed to initialize telemetry schema")?;

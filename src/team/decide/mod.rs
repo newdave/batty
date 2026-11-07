@@ -2,7 +2,9 @@
 //! and per-path question builders. Everything here is pure or blocking-IO and
 //! never touches the daemon; the daemon runs these as background jobs.
 
+pub mod budget;
 pub mod client;
+pub mod gate;
 pub mod redact;
 
 use std::fmt;
