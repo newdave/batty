@@ -336,6 +336,8 @@ pub struct WorkflowPolicy {
     #[serde(default)]
     pub bench_recovery: BenchRecoveryConfig,
     #[serde(default)]
+    pub decisions: DecisionsConfig,
+    #[serde(default)]
     pub auto_merge: AutoMergePolicy,
     /// When true, context exhaustion restarts capture a work summary and
     /// inject it into the new agent session so it can continue where the
@@ -444,6 +446,7 @@ impl Default for WorkflowPolicy {
             allocation: AllocationPolicy::default(),
             main_smoke: MainSmokePolicy::default(),
             bench_recovery: BenchRecoveryConfig::default(),
+            decisions: DecisionsConfig::default(),
             auto_merge: AutoMergePolicy::default(),
             context_handoff_enabled: default_context_handoff_enabled(),
             handoff_screen_history: default_handoff_screen_history(),
@@ -546,6 +549,129 @@ impl Default for BenchRecoveryConfig {
             wrong_branch_rescue: default_bench_recovery_wrong_branch_rescue(),
             strike_warning: default_bench_recovery_strike_warning(),
             effort_ladder: EffortLadders::default(),
+        }
+    }
+}
+
+/// Which engine answers supervisory decisions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionProvider {
+    /// Today's regex and counter heuristics. No network calls.
+    #[default]
+    Heuristic,
+    /// TypeSafe AI Jev on the Vercel AI Gateway, heuristics as fallback.
+    Jev,
+}
+
+/// A supervisory decision that Jev may answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionPath {
+    Completion,
+    Rubric,
+    Triage,
+    ScreenState,
+    Stall,
+}
+
+impl DecisionPath {
+    pub const ALL: [DecisionPath; 5] = [
+        DecisionPath::Completion,
+        DecisionPath::Rubric,
+        DecisionPath::Triage,
+        DecisionPath::ScreenState,
+        DecisionPath::Stall,
+    ];
+
+    /// Stable snake_case label used in events and job names.
+    pub fn label(self) -> &'static str {
+        match self {
+            DecisionPath::Completion => "completion",
+            DecisionPath::Rubric => "rubric",
+            DecisionPath::Triage => "triage",
+            DecisionPath::ScreenState => "screen_state",
+            DecisionPath::Stall => "stall",
+        }
+    }
+}
+
+/// Per-path request deadlines in milliseconds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DecisionTimeouts {
+    #[serde(default = "default_decision_timeout_fast_ms")]
+    pub screen_state: u64,
+    #[serde(default = "default_decision_timeout_fast_ms")]
+    pub triage: u64,
+    #[serde(default = "default_decision_timeout_fast_ms")]
+    pub stall: u64,
+    #[serde(default = "default_decision_timeout_slow_ms")]
+    pub completion: u64,
+    #[serde(default = "default_decision_timeout_slow_ms")]
+    pub rubric: u64,
+}
+
+impl Default for DecisionTimeouts {
+    fn default() -> Self {
+        Self {
+            screen_state: default_decision_timeout_fast_ms(),
+            triage: default_decision_timeout_fast_ms(),
+            stall: default_decision_timeout_fast_ms(),
+            completion: default_decision_timeout_slow_ms(),
+            rubric: default_decision_timeout_slow_ms(),
+        }
+    }
+}
+
+impl DecisionTimeouts {
+    pub fn for_path(&self, path: DecisionPath) -> u64 {
+        match path {
+            DecisionPath::ScreenState => self.screen_state,
+            DecisionPath::Triage => self.triage,
+            DecisionPath::Stall => self.stall,
+            DecisionPath::Completion => self.completion,
+            DecisionPath::Rubric => self.rubric,
+        }
+    }
+}
+
+/// Opt-in routing of supervisory decisions through the Jev decision model.
+/// The API key is read only from the environment variable named by
+/// `api_key_env`, never from team.yaml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionsConfig {
+    #[serde(default)]
+    pub provider: DecisionProvider,
+    #[serde(default = "default_decisions_model")]
+    pub model: String,
+    #[serde(default = "default_decisions_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_decisions_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_decisions_daily_spend_cap_usd")]
+    pub daily_spend_cap_usd: f64,
+    #[serde(default = "default_decisions_min_confidence")]
+    pub min_confidence: f64,
+    #[serde(default = "default_decisions_zero_data_retention")]
+    pub zero_data_retention: bool,
+    #[serde(default)]
+    pub timeouts_ms: DecisionTimeouts,
+    #[serde(default = "default_decisions_paths")]
+    pub paths: Vec<DecisionPath>,
+}
+
+impl Default for DecisionsConfig {
+    fn default() -> Self {
+        Self {
+            provider: DecisionProvider::default(),
+            model: default_decisions_model(),
+            endpoint: default_decisions_endpoint(),
+            api_key_env: default_decisions_api_key_env(),
+            daily_spend_cap_usd: default_decisions_daily_spend_cap_usd(),
+            min_confidence: default_decisions_min_confidence(),
+            zero_data_retention: default_decisions_zero_data_retention(),
+            timeouts_ms: DecisionTimeouts::default(),
+            paths: default_decisions_paths(),
         }
     }
 }
@@ -699,6 +825,42 @@ fn default_bench_recovery_wrong_branch_rescue() -> bool {
 
 fn default_bench_recovery_strike_warning() -> bool {
     true
+}
+
+fn default_decision_timeout_fast_ms() -> u64 {
+    2000
+}
+
+fn default_decision_timeout_slow_ms() -> u64 {
+    10_000
+}
+
+fn default_decisions_model() -> String {
+    "typesafe-ai/jev-1.14.0".to_string()
+}
+
+fn default_decisions_endpoint() -> String {
+    "https://ai-gateway.vercel.sh/v1/decisions".to_string()
+}
+
+fn default_decisions_api_key_env() -> String {
+    "AI_GATEWAY_API_KEY".to_string()
+}
+
+fn default_decisions_daily_spend_cap_usd() -> f64 {
+    5.0
+}
+
+fn default_decisions_min_confidence() -> f64 {
+    0.6
+}
+
+fn default_decisions_zero_data_retention() -> bool {
+    true
+}
+
+fn default_decisions_paths() -> Vec<DecisionPath> {
+    DecisionPath::ALL.to_vec()
 }
 
 fn default_effort_ladder_claude() -> Vec<String> {

@@ -580,6 +580,61 @@ fn test_daemon_builder_disables_bench_recovery_by_default() {
 }
 
 #[test]
+fn parse_decisions_defaults() {
+    let config: TeamConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
+    let d = &config.workflow_policy.decisions;
+    assert_eq!(d.provider, DecisionProvider::Heuristic);
+    assert_eq!(d.model, "typesafe-ai/jev-1.14.0");
+    assert_eq!(d.endpoint, "https://ai-gateway.vercel.sh/v1/decisions");
+    assert_eq!(d.api_key_env, "AI_GATEWAY_API_KEY");
+    assert_eq!(d.daily_spend_cap_usd, 5.0);
+    assert_eq!(d.min_confidence, 0.6);
+    assert!(d.zero_data_retention);
+    assert_eq!(d.timeouts_ms.screen_state, 2000);
+    assert_eq!(d.timeouts_ms.triage, 2000);
+    assert_eq!(d.timeouts_ms.stall, 2000);
+    assert_eq!(d.timeouts_ms.completion, 10000);
+    assert_eq!(d.timeouts_ms.rubric, 10000);
+    assert_eq!(d.paths, DecisionPath::ALL);
+}
+
+#[test]
+fn parse_decisions_partial_override_keeps_other_defaults() {
+    let yaml = format!(
+        "{}workflow_policy:\n  decisions:\n    provider: jev\n    paths: [triage]\n    timeouts_ms:\n      triage: 500\n",
+        minimal_yaml()
+    );
+    let config: TeamConfig = serde_yaml::from_str(&yaml).unwrap();
+    let d = &config.workflow_policy.decisions;
+    assert_eq!(d.provider, DecisionProvider::Jev);
+    assert_eq!(d.paths, [DecisionPath::Triage]);
+    assert_eq!(d.timeouts_ms.triage, 500);
+    assert_eq!(d.timeouts_ms.completion, 10000);
+    assert_eq!(d.model, "typesafe-ai/jev-1.14.0");
+    assert_eq!(d.daily_spend_cap_usd, 5.0);
+}
+
+#[test]
+fn decision_path_labels_and_timeouts_cover_every_path() {
+    let t = DecisionTimeouts::default();
+    for path in DecisionPath::ALL {
+        assert!(!path.label().is_empty());
+        assert!(t.for_path(path) >= 2000);
+    }
+    assert_eq!(DecisionPath::ScreenState.label(), "screen_state");
+}
+
+#[test]
+fn test_daemon_builder_keeps_decisions_heuristic_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = crate::team::test_support::TestDaemonBuilder::new(tmp.path()).build();
+    assert_eq!(
+        daemon.config.team_config.workflow_policy.decisions.provider,
+        DecisionProvider::Heuristic
+    );
+}
+
+#[test]
 fn parse_workflow_policy_allocation_overrides() {
     let yaml = r#"
 name: test

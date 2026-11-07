@@ -570,6 +570,11 @@ impl<'a> TestDaemonBuilder<'a> {
                     enabled: false,
                     ..Default::default()
                 },
+                // Jev decisions are opt-in; tests enable them with a fake endpoint.
+                decisions: crate::team::config::DecisionsConfig {
+                    provider: crate::team::config::DecisionProvider::Heuristic,
+                    ..Default::default()
+                },
                 ..WorkflowPolicy::default()
             },
             board: BoardConfig::default(),
