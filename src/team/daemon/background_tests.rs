@@ -21,6 +21,8 @@ pub(crate) struct BackgroundTests {
     pub(crate) verification: HashMap<String, VerificationJob>,
     pub(super) main_smoke: Option<MainSmokeJob>,
     pub(super) chat_merges: Vec<ChatMergeJob>,
+    /// Bench recovery approval runs, keyed by task.
+    pub(super) bench_approvals: HashMap<u32, BenchApprovalJob>,
     /// Completion verifications (engineer -> task) interrupted by a daemon
     /// restart or hot reload; re-run on the next poll.
     pub(crate) retriggers: HashMap<String, u32>,
@@ -51,6 +53,22 @@ pub(super) struct ChatMergeJob {
     pub(super) job: TestJob<TestRunOutput>,
 }
 
+/// Why bench recovery is verifying a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BenchApprovalKind {
+    /// Every engineer is benched: approve a review task that meets the bar.
+    ApproveReview,
+    /// A parked engineer's task: hand it on if it meets the bar, else reset.
+    RecoverParked,
+}
+
+pub(super) struct BenchApprovalJob {
+    pub(super) task_id: u32,
+    pub(super) engineer: String,
+    pub(super) kind: BenchApprovalKind,
+    pub(super) job: TestJob<super::completion_checks::VerificationRunResult>,
+}
+
 impl BackgroundTests {
     /// True while the main smoke check runs on the root checkout; nothing
     /// may merge into trunk underneath it.
@@ -67,6 +85,7 @@ impl BackgroundTests {
             .collect();
         running.extend(self.main_smoke.iter().map(|smoke| smoke.job.info()));
         running.extend(self.chat_merges.iter().map(|merge| merge.job.info()));
+        running.extend(self.bench_approvals.values().map(|job| job.job.info()));
         running.sort_by(|a, b| a.label.cmp(&b.label));
         running
     }
@@ -104,6 +123,7 @@ impl TeamDaemon {
         self.retrigger_pending_verifications();
         let result = merge::poll_verification_jobs(self);
         self.poll_chat_merge_jobs();
+        self.poll_bench_approval_jobs();
         result
     }
 

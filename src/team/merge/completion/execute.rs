@@ -103,7 +103,8 @@ pub(super) fn merge_directly(
 }
 
 /// Queue a merge for a task that is already in review and whose tests just
-/// passed (chat `merge` command). The completion packet is refreshed so the
+/// passed (chat `merge` command, or bench recovery with
+/// [`MergeOrigin::BenchRecovery`]). The completion packet is refreshed so the
 /// queue's packet check sees the verified commit.
 pub(crate) fn enqueue_reviewed_merge(
     daemon: &mut TeamDaemon,
@@ -111,6 +112,7 @@ pub(crate) fn enqueue_reviewed_merge(
     engineer: &str,
     test_results: TestResults,
     test_duration_ms: u64,
+    origin: MergeOrigin,
 ) -> Result<()> {
     if daemon.is_multi_repo {
         bail!("merging from chat is not supported for multi-repo projects");
@@ -145,7 +147,7 @@ pub(crate) fn enqueue_reviewed_merge(
         confidence: 0.0,
         files_changed: 0,
         lines_changed: 0,
-        origin: MergeOrigin::Chat,
+        origin,
     });
     Ok(())
 }

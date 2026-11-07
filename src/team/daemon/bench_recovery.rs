@@ -6,19 +6,26 @@
 //! always goes through the short-lived bench lock; git, messaging and board
 //! writes here never run inside it.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use tracing::{debug, warn};
+use anyhow::{Context, Result, anyhow, bail};
+use tracing::{debug, info, warn};
 
 use super::TeamDaemon;
+use super::background_tests::{BenchApprovalJob, BenchApprovalKind};
+use super::completion_checks::{VerificationRunResult, run_automatic_verification_tracked};
+use super::merge_queue::MergeOrigin;
+use crate::team::bench::BenchEntry;
 use crate::team::bench_recovery::{
-    BenchRecoveryFrontmatter, effort_ladder_for_backend, next_effort, read_bench_recovery,
+    BarEvidence, BenchRecoveryFrontmatter, attributed_commit_count, bar_commits_met,
+    effort_ladder_for_backend, next_effort, read_bench_recovery, verification_meets_bar,
     write_bench_recovery,
 };
 use crate::team::config::RoleType;
 use crate::team::events::TeamEvent;
 use crate::team::task_cmd::{self, StatusTransitionAttribution};
+use crate::team::test_job::TestJob;
 
 /// `blocked_on` reason for a task that hit `max_auto_resets`.
 pub(super) const RESET_CAP_REASON: &str = "bench recovery: reset cap reached";
@@ -39,7 +46,7 @@ impl TeamDaemon {
     /// Reset a parked task so another engineer can pick it up, or block it
     /// when it has already been reset `max_auto_resets` times. Either way the
     /// engineer is released and unbenched.
-    pub fn reset_parked_task(&mut self, engineer: &str, task_id: u32) -> Result<()> {
+    pub(super) fn reset_parked_task(&mut self, engineer: &str, task_id: u32) -> Result<()> {
         let policy = self
             .config
             .team_config
@@ -208,6 +215,349 @@ impl TeamDaemon {
                 None,
             ),
         }
+    }
+}
+
+impl TeamDaemon {
+    /// True when every dispatchable engineer (one whose role is not
+    /// `on_demand`) has a bench entry. No dispatchable engineers is never
+    /// "all benched".
+    pub(super) fn all_engineers_benched(&self, entries: &BTreeMap<String, BenchEntry>) -> bool {
+        let mut dispatchable = self
+            .config
+            .members
+            .iter()
+            .filter(|member| member.role_type == RoleType::Engineer)
+            .filter(|member| {
+                !self
+                    .config
+                    .team_config
+                    .role_def(&member.role_name)
+                    .is_some_and(|role| role.on_demand)
+            })
+            .peekable();
+        dispatchable.peek().is_some()
+            && dispatchable.all(|member| entries.contains_key(&member.name))
+    }
+
+    /// [`Self::all_engineers_benched`] against a fresh read of the bench file
+    /// (`batty unbench` can change it at any time). Unreadable state counts
+    /// as not all benched.
+    fn all_engineers_benched_now(&self) -> bool {
+        match crate::team::bench::bench_entries(self.project_root()) {
+            Ok(entries) => self.all_engineers_benched(&entries),
+            Err(error) => {
+                warn!(error = %error, "bench recovery could not read the bench file");
+                false
+            }
+        }
+    }
+
+    /// Start verifying a review task for approval while every engineer is
+    /// benched. Returns false when nothing was started (auto-merge disabled,
+    /// already queued or already being verified).
+    pub fn start_bench_review_approval(&mut self, task_id: u32) -> Result<bool> {
+        let task = self.bench_task(task_id)?;
+        let engineer = task
+            .claimed_by
+            .clone()
+            .ok_or_else(|| anyhow!("Task #{task_id} is not assigned."))?;
+        self.start_bench_approval_job(task_id, &engineer, BenchApprovalKind::ApproveReview)
+    }
+
+    /// Start verifying a parked engineer's task: it is handed on to merge if
+    /// it meets the bar and reset otherwise.
+    pub fn start_parked_task_recovery(&mut self, engineer: &str, task_id: u32) -> Result<bool> {
+        self.start_bench_approval_job(task_id, engineer, BenchApprovalKind::RecoverParked)
+    }
+
+    fn bench_task(&self, task_id: u32) -> Result<crate::task::Task> {
+        let task_path = task_cmd::find_task_path(&self.board_dir(), task_id)?;
+        crate::task::Task::from_file(&task_path)
+    }
+
+    /// Mirror of the chat `merge` command: validate now, then run the
+    /// verification command on the task branch in a background job. The
+    /// claim is still held, so the verification's claim and branch checks
+    /// see the task as it was parked or reviewed.
+    fn start_bench_approval_job(
+        &mut self,
+        task_id: u32,
+        engineer: &str,
+        kind: BenchApprovalKind,
+    ) -> Result<bool> {
+        let task = self.bench_task(task_id)?;
+        match kind {
+            BenchApprovalKind::ApproveReview => {
+                if task.status != "review" {
+                    bail!("Task #{task_id} is not in review.");
+                }
+                if !self.config.team_config.workflow_policy.auto_merge.enabled {
+                    return Ok(false);
+                }
+            }
+            BenchApprovalKind::RecoverParked => {
+                if !matches!(task.status.as_str(), "in-progress" | "review") {
+                    bail!("Task #{task_id} is not in progress or in review.");
+                }
+            }
+        }
+        if task.claimed_by.as_deref() != Some(engineer) {
+            bail!("Task #{task_id} is not claimed by {engineer}.");
+        }
+        if self.is_multi_repo {
+            bail!("Bench recovery approval is not supported for multi-repo projects.");
+        }
+        if self.merge.queue.contains_task(task_id)
+            || self
+                .verification
+                .background_tests
+                .bench_approvals
+                .contains_key(&task_id)
+        {
+            return Ok(false);
+        }
+
+        let worktree_dir = self.worktree_dir(engineer);
+        if !worktree_dir.is_dir() {
+            bail!(
+                "Task #{task_id}: worktree {} for {engineer} is missing.",
+                worktree_dir.display()
+            );
+        }
+        let policy = &self.config.team_config.workflow_policy;
+        let test_command = policy
+            .verification
+            .test_command
+            .clone()
+            .or(policy.test_command.clone());
+        let job = TestJob::spawn_with_timeout(
+            format!("bench-approval-{task_id}"),
+            self.test_job_timeout(),
+            move |child_pgid| {
+                run_automatic_verification_tracked(
+                    &worktree_dir,
+                    test_command.as_deref(),
+                    Some(child_pgid.as_ref()),
+                )
+            },
+        );
+        self.verification.background_tests.bench_approvals.insert(
+            task_id,
+            BenchApprovalJob {
+                task_id,
+                engineer: engineer.to_string(),
+                kind,
+                job,
+            },
+        );
+        self.record_orchestrator_action(format!(
+            "recovery: verifying task #{task_id} from {engineer} for bench recovery ({})",
+            kind_label(kind)
+        ));
+        Ok(true)
+    }
+
+    /// Finish bench recovery verifications whose test command has completed.
+    pub(super) fn poll_bench_approval_jobs(&mut self) {
+        let finished: Vec<(u32, Result<VerificationRunResult>)> = self
+            .verification
+            .background_tests
+            .bench_approvals
+            .iter()
+            .filter_map(|(task_id, job)| job.job.try_take().map(|result| (*task_id, result)))
+            .collect();
+        for (task_id, result) in finished {
+            let Some(job) = self
+                .verification
+                .background_tests
+                .bench_approvals
+                .remove(&task_id)
+            else {
+                continue;
+            };
+            let duration_ms = job.job.elapsed().as_millis() as u64;
+            info!(
+                task_id,
+                engineer = %job.engineer,
+                kind = kind_label(job.kind),
+                duration_ms,
+                "bench recovery verification finished"
+            );
+            if let Err(error) = self.finish_bench_approval(&job, result, duration_ms) {
+                warn!(task_id, engineer = %job.engineer, error = %error, "bench recovery step failed");
+                self.record_orchestrator_action(format!(
+                    "recovery: bench recovery for task #{task_id} from {} failed: {error}",
+                    job.engineer
+                ));
+            }
+        }
+    }
+
+    /// Mirror of `finish_chat_merge`: re-check that the task did not change
+    /// while the tests ran, then approve, hand on or reset it.
+    fn finish_bench_approval(
+        &mut self,
+        job: &BenchApprovalJob,
+        result: Result<VerificationRunResult>,
+        test_duration_ms: u64,
+    ) -> Result<()> {
+        let task_id = job.task_id;
+        let engineer = job.engineer.as_str();
+        let task = self.bench_task(task_id)?;
+        let status_current = match job.kind {
+            BenchApprovalKind::ApproveReview => task.status == "review",
+            BenchApprovalKind::RecoverParked => {
+                matches!(task.status.as_str(), "in-progress" | "review")
+            }
+        };
+        if !status_current || task.claimed_by.as_deref() != Some(engineer) {
+            info!(
+                task_id,
+                engineer,
+                status = %task.status,
+                "discarding stale bench recovery verification: task changed while tests ran"
+            );
+            return Ok(());
+        }
+        // A review task is only approved or reset while the whole team is
+        // still benched; an unbench mid-job hands it back to people.
+        if job.kind == BenchApprovalKind::ApproveReview && !self.all_engineers_benched_now() {
+            info!(
+                task_id,
+                engineer, "bench recovery approval skipped: an engineer was unbenched"
+            );
+            return Ok(());
+        }
+
+        let auto_run_tests = self
+            .config
+            .team_config
+            .workflow_policy
+            .verification
+            .auto_run_tests;
+        let run = match result {
+            Ok(run) if verification_meets_bar(&run, auto_run_tests) => Some(run),
+            Ok(_) => None,
+            Err(error) => {
+                info!(task_id, engineer, error = %error, "bench recovery verification did not complete");
+                None
+            }
+        };
+        let task_branch = task
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::worktree::ops::engineer_task_branch_name(engineer, task_id));
+        let run = match run {
+            Some(run) if bar_commits_met(&self.bench_bar_evidence(engineer, &task_branch)?) => run,
+            _ => {
+                self.record_orchestrator_action(format!(
+                    "recovery: task #{task_id} from {engineer} does not meet the bench recovery bar (attributed commits ahead of trunk and a passing test run)"
+                ));
+                return self.reset_parked_task(engineer, task_id);
+            }
+        };
+
+        let worktree_branch =
+            crate::team::task_loop::current_worktree_branch(&self.worktree_dir(engineer))?;
+        if worktree_branch != task_branch {
+            info!(
+                task_id,
+                engineer,
+                worktree_branch = %worktree_branch,
+                "bench recovery merge skipped: worktree left the task branch"
+            );
+            return Ok(());
+        }
+        if self.merge.queue.contains_task(task_id) {
+            return Ok(());
+        }
+
+        match job.kind {
+            BenchApprovalKind::ApproveReview => {
+                let policy = &self.config.team_config.workflow_policy;
+                if !policy.auto_merge.enabled
+                    || !policy.bench_recovery.auto_approve_when_all_benched
+                {
+                    return Ok(());
+                }
+                crate::team::merge::enqueue_reviewed_merge(
+                    self,
+                    task_id,
+                    engineer,
+                    run.results,
+                    test_duration_ms,
+                    MergeOrigin::BenchRecovery,
+                )?;
+                self.emit_event(TeamEvent::task_auto_approved(
+                    engineer,
+                    &task_id.to_string(),
+                    "all engineers benched",
+                ));
+                self.record_orchestrator_action(format!(
+                    "recovery: approved review task #{task_id} from {engineer} for merge (all engineers benched)"
+                ));
+            }
+            BenchApprovalKind::RecoverParked => {
+                if task.status == "in-progress" {
+                    task_cmd::transition_task_with_attribution(
+                        &self.board_dir(),
+                        task_id,
+                        "review",
+                        StatusTransitionAttribution::daemon("daemon.bench_recovery"),
+                    )?;
+                }
+                crate::team::merge::enqueue_reviewed_merge(
+                    self,
+                    task_id,
+                    engineer,
+                    run.results,
+                    test_duration_ms,
+                    MergeOrigin::BenchRecovery,
+                )?;
+                self.unbench_after_recovery(engineer);
+                self.emit_event(TeamEvent::task_auto_approved(
+                    engineer,
+                    &task_id.to_string(),
+                    "parked work met the bench recovery bar",
+                ));
+                self.record_orchestrator_action(format!(
+                    "recovery: parked task #{task_id} from {engineer} meets the bar; queued for merge and unbenched {engineer}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit evidence for the bar: commits on the task branch ahead of
+    /// trunk, and engineer commits (not `[batty]` auto-saves) ahead of the
+    /// engineer's base branch.
+    fn bench_bar_evidence(&self, engineer: &str, task_branch: &str) -> Result<BarEvidence> {
+        let root = self.project_root();
+        let commits_ahead_of_trunk = crate::worktree::ops::ahead_count(
+            root,
+            self.config.team_config.trunk_branch(),
+            task_branch,
+        )?;
+        let attributed_commits = attributed_commit_count(
+            root,
+            &crate::worktree::ops::engineer_base_branch_name(engineer),
+            task_branch,
+        )?;
+        Ok(BarEvidence {
+            commits_ahead_of_trunk,
+            attributed_commits,
+        })
+    }
+}
+
+fn kind_label(kind: BenchApprovalKind) -> &'static str {
+    match kind {
+        BenchApprovalKind::ApproveReview => "review approval",
+        BenchApprovalKind::RecoverParked => "parked task",
     }
 }
 
@@ -460,5 +810,215 @@ mod tests {
         let task = crate::task::Task::from_file(&task_path).unwrap();
         assert_eq!(task.status, "todo");
         assert_eq!(read_bench_recovery(&task_path).bench_reset_count, 1);
+    }
+
+    fn wait_for_bench_jobs(daemon: &mut TeamDaemon) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !daemon
+            .verification
+            .background_tests
+            .bench_approvals
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bench approval job never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            daemon.poll_bench_approval_jobs();
+        }
+    }
+
+    /// Task 7 in review from eng-1 with every engineer benched.
+    fn review_daemon(
+        tmp: &tempfile::TempDir,
+        test_command: &str,
+    ) -> (PathBuf, PathBuf, TeamDaemon) {
+        let (repo, task_path, mut daemon) = parked_daemon(tmp);
+        task_cmd::update_task_frontmatter(&task_path, |mapping| {
+            task_cmd::set_optional_string(mapping, "status", Some("review"));
+        })
+        .unwrap();
+        crate::team::bench::bench_engineer(&repo, "eng-2", Some("manual")).unwrap();
+        daemon.config.team_config.workflow_policy.test_command = Some(test_command.to_string());
+        (repo, task_path, daemon)
+    }
+
+    fn queued_origins(daemon: &TeamDaemon) -> Vec<(u32, MergeOrigin)> {
+        daemon
+            .merge
+            .queue
+            .snapshot()
+            .queue
+            .iter()
+            .map(|request| (request.task_id, request.origin))
+            .collect()
+    }
+
+    #[test]
+    fn review_approval_enqueues_bench_recovery_merge_and_records_daemon_reviewer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, task_path, mut daemon) = review_daemon(&tmp, "true");
+
+        assert!(daemon.start_bench_review_approval(7).unwrap());
+        wait_for_bench_jobs(&mut daemon);
+
+        assert_eq!(
+            queued_origins(&daemon),
+            vec![(7, MergeOrigin::BenchRecovery)]
+        );
+        assert!(event_names(&repo).iter().any(|e| e == "task_auto_approved"));
+
+        daemon.process_merge_queue_for_test().unwrap();
+        let task = crate::task::Task::from_file(&task_path).unwrap();
+        assert_eq!(task.status, "done");
+        let content = std::fs::read_to_string(&task_path).unwrap();
+        assert!(
+            content.contains(crate::team::daemon::merge_queue::BENCH_RECOVERY_REVIEWER),
+            "{content}"
+        );
+        assert!(
+            content.contains("review_disposition: approved"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn review_approval_is_not_started_when_auto_merge_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, _task_path, mut daemon) = review_daemon(&tmp, "true");
+        daemon.config.team_config.workflow_policy.auto_merge.enabled = false;
+
+        assert!(!daemon.start_bench_review_approval(7).unwrap());
+        assert!(
+            daemon
+                .verification
+                .background_tests
+                .bench_approvals
+                .is_empty()
+        );
+        assert!(queued_origins(&daemon).is_empty());
+    }
+
+    #[test]
+    fn review_approval_enqueues_nothing_after_an_unbench_mid_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, task_path, mut daemon) = review_daemon(&tmp, "true");
+
+        assert!(daemon.start_bench_review_approval(7).unwrap());
+        crate::team::bench::unbench_engineer(&repo, "eng-2").unwrap();
+        wait_for_bench_jobs(&mut daemon);
+
+        assert!(queued_origins(&daemon).is_empty());
+        let task = crate::task::Task::from_file(&task_path).unwrap();
+        assert_eq!(task.status, "review");
+        assert_eq!(read_bench_recovery(&task_path).bench_reset_count, 0);
+    }
+
+    #[test]
+    fn failed_review_verification_resets_the_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, task_path, mut daemon) = review_daemon(&tmp, "false");
+
+        assert!(daemon.start_bench_review_approval(7).unwrap());
+        wait_for_bench_jobs(&mut daemon);
+
+        assert!(queued_origins(&daemon).is_empty());
+        let task = crate::task::Task::from_file(&task_path).unwrap();
+        assert_eq!(task.status, "todo");
+        assert_eq!(read_bench_recovery(&task_path).bench_reset_count, 1);
+    }
+
+    #[test]
+    fn skipped_verification_does_not_meet_the_bar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, task_path, mut daemon) = review_daemon(&tmp, "true");
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .verification
+            .auto_run_tests = false;
+
+        assert!(daemon.start_bench_review_approval(7).unwrap());
+        wait_for_bench_jobs(&mut daemon);
+
+        assert!(queued_origins(&daemon).is_empty());
+        assert_eq!(read_bench_recovery(&task_path).bench_reset_count, 1);
+    }
+
+    #[test]
+    fn parked_task_meeting_the_bar_is_queued_and_engineer_unbenched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, task_path, mut daemon) = parked_daemon(&tmp);
+        daemon.config.team_config.workflow_policy.test_command = Some("true".to_string());
+
+        assert!(daemon.start_parked_task_recovery("eng-1", 7).unwrap());
+        wait_for_bench_jobs(&mut daemon);
+
+        assert_eq!(
+            queued_origins(&daemon),
+            vec![(7, MergeOrigin::BenchRecovery)]
+        );
+        assert!(!bench_entries(&repo).unwrap().contains_key("eng-1"));
+        let task = crate::task::Task::from_file(&task_path).unwrap();
+        assert_eq!(task.status, "review");
+    }
+
+    #[test]
+    fn parked_task_without_attributed_commits_is_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, task_path, mut daemon) = parked_daemon(&tmp);
+        daemon.config.team_config.workflow_policy.test_command = Some("true".to_string());
+        // Only a daemon auto-save on the task branch: not attributed work.
+        let worktree = repo.join(".batty").join("worktrees").join("eng-1");
+        git_ok(&worktree, &["reset", "--hard", "eng-main/eng-1"]);
+        std::fs::write(worktree.join("wip.txt"), "wip\n").unwrap();
+        git_ok(&worktree, &["add", "wip.txt"]);
+        git_ok(
+            &worktree,
+            &["commit", "-m", "wip: auto-save before restart [batty]"],
+        );
+
+        assert!(daemon.start_parked_task_recovery("eng-1", 7).unwrap());
+        wait_for_bench_jobs(&mut daemon);
+
+        assert!(queued_origins(&daemon).is_empty());
+        let task = crate::task::Task::from_file(&task_path).unwrap();
+        assert_eq!(task.status, "todo");
+        assert_eq!(read_bench_recovery(&task_path).bench_reset_count, 1);
+    }
+
+    #[test]
+    fn bench_approval_is_refused_for_multi_repo_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, _task_path, mut daemon) = review_daemon(&tmp, "true");
+        daemon.is_multi_repo = true;
+
+        let error = daemon.start_bench_review_approval(7).unwrap_err();
+        assert!(error.to_string().contains("multi-repo"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_bench_approval_job_is_not_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, _task_path, mut daemon) = review_daemon(&tmp, "sleep 1");
+
+        assert!(daemon.start_bench_review_approval(7).unwrap());
+        assert!(!daemon.start_bench_review_approval(7).unwrap());
+        assert_eq!(
+            daemon.verification.background_tests.bench_approvals.len(),
+            1
+        );
+        wait_for_bench_jobs(&mut daemon);
+    }
+
+    #[test]
+    fn all_engineers_benched_needs_a_dispatchable_engineer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![manager_member("manager", None)])
+            .build();
+        assert!(!daemon.all_engineers_benched(&BTreeMap::new()));
     }
 }
