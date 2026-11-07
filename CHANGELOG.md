@@ -53,8 +53,17 @@ See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
 - `command_dropped` events when a legacy queued command gives up.
 - `batty merge --force-clear-stale` clears a merge left in verification when no
   daemon is running. `batty status` flags such a stale in-flight merge.
+- Bench recovery (`workflow_policy.bench_recovery`): engineers parked by
+  zero-diff recovery are unbenched after a cool-off, and their task is handed on
+  or reset (at most twice) to another engineer at a higher effort. When every
+  engineer is benched, `review` tasks that pass the bar are approved and merged.
+  The daemon warns one strike before parking and rescues commits made on the
+  wrong branch. `batty status` shows which benches the daemon applied.
 
 ### Changed
+
+- Bench recovery is on by default. Set `workflow_policy.bench_recovery.enabled:
+  false` to keep daemon-parked engineers benched until you unbench them.
 
 - Completion verification, the main smoke check, chat merges and post-merge
   verification run as background jobs instead of blocking the daemon loop.

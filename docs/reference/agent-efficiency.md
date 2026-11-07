@@ -57,7 +57,12 @@ Terminal backend configuration errors persist a generic marker under
 `.batty/backend-configuration/`. Repair the backend settings, then run
 `batty backend-reset MEMBER`; a running daemon recovers only that member at its
 next health check. Zero-diff `park` recovery uses the existing attribution guard
-and benches the affected engineer rather than repeatedly restarting it.
+and benches the affected engineer rather than repeatedly restarting it. Bench
+recovery (`workflow_policy.bench_recovery`) then unbenches it after a 30-minute
+cool-off, or at once when every engineer is benched, and either hands the task on
+when it passes the bar or resets it to another engineer at one effort step higher
+for that task. Before parking, the daemon warns the engineer one strike early and
+rescues commits made on the wrong branch.
 
 `batty preflight` performs static checks without inference. Startup takes a local
 exclusive lock and can perform bounded runtime consistency checks, rolling back

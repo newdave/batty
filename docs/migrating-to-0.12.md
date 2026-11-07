@@ -112,6 +112,17 @@ The daemon validates status moves against the task workflow. Moves it would
 previously have forced (for example `todo` → `done`) are refused and reported to
 the manager.
 
+### Bench recovery
+
+Bench recovery is on by default. Engineers the daemon parks after repeated
+zero-diff completions are unbenched after 30 minutes, or straight away when every
+engineer is benched, and their task is handed on or reset to another engineer.
+When every engineer is benched and `auto_merge.enabled` is true, the daemon also
+approves and merges `review` tasks that pass the bar, recorded as approved by
+`daemon (all engineers benched)`. Engineers you bench with `batty bench`, and
+benches written by earlier versions, are never unbenched automatically. To keep
+the previous behaviour, set `workflow_policy.bench_recovery.enabled: false`.
+
 ### Removed config keys
 
 These keys still load but have no effect, and `batty validate` warns about them:

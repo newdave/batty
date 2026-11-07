@@ -258,6 +258,8 @@ This block controls execution quality and merge safety.
 - `context_*` and `handoff_*`: context-pressure restart and handoff behavior
 - `review_*` and `stale_*`: escalation thresholds for aging work
 - `narration_*`: guard rails against agents narrating instead of changing code
+- `bench_recovery`: automatic unbenching, retries and approval for engineers parked
+  by zero-diff recovery
 
 `workflow_policy.main_smoke` fields:
 
@@ -269,6 +271,34 @@ This block controls execution quality and merge safety.
   the smoke check is skipped rather than reporting `main` broken.
 - `pause_dispatch_on_failure`: stop auto-dispatch while `main` is broken. Default: `true`
 - `auto_revert`: optionally revert `HEAD` after a failing smoke run. Default: `false`
+
+`workflow_policy.bench_recovery` fields. They act only on engineers the daemon
+benched itself (zero-diff `park`); `batty bench` entries are never touched:
+
+- `enabled`: turn bench recovery on or off. Default: `true`
+- `cooloff_secs`: how long a daemon-parked engineer stays benched before its task
+  is recovered. Default: `1800`
+- `max_auto_resets`: how many times a parked task is reset onto the queue before
+  it is blocked and escalated to the human. Default: `2`
+- `auto_approve_when_all_benched`: when every dispatchable engineer is benched,
+  approve and merge `review` tasks that pass the bar. Needs
+  `auto_merge.enabled`. Default: `true`
+- `wrong_branch_rescue`: before counting a zero-diff strike, cherry-pick the
+  engineer's own new commits from another branch onto the task branch.
+  Default: `true`
+- `strike_warning`: message the engineer one strike before zero-diff recovery.
+  Default: `true`
+- `effort_ladder.claude` / `effort_ladder.codex`: the effort steps a reset task
+  climbs, one per reset. Defaults: `[low, medium, high, xhigh, max]` and
+  `[minimal, low, medium, high, xhigh]`
+
+The bar for approving or handing on benched work is commits ahead of trunk, at
+least one commit by the engineer (daemon `[batty]` auto-saves do not count), and a
+passing verification run. A skipped run (`verification.auto_run_tests: false`) or
+a timeout does not pass, and the scope fence is not checked. A task that fails the
+bar is reset: its branch is archived, it returns to `todo` for a different
+engineer, and the effort for that task goes up one step. Bench recovery does
+nothing in non-git or multi-repo projects.
 
 ## `roles`
 
