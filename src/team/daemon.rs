@@ -77,6 +77,7 @@ mod board_snapshot_tests;
 mod chat;
 pub(crate) mod completion_checks;
 mod config_reload;
+mod decisions;
 mod deferred;
 mod delivery_state;
 pub(crate) mod dispatch;
@@ -339,6 +340,8 @@ pub struct TeamDaemon {
     pub(super) board_snapshot: board_snapshot::BoardSnapshotCache,
     /// Work deferred off the poll tick (scheduled retries, pending removals, log throttles).
     pub(super) deferred: deferred::DeferredState,
+    /// Jev decision jobs, cached outcomes and spend bookkeeping.
+    pub(super) decisions: decisions::DecisionsState,
 }
 
 #[cfg(any(test, feature = "scenario-test"))]
@@ -598,6 +601,7 @@ impl TeamDaemon {
             merge: merge_state::MergeState::default(),
             board_snapshot: board_snapshot::BoardSnapshotCache::default(),
             deferred: Default::default(),
+            decisions: Default::default(),
         })
     }
 
