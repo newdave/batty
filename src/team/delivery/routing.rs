@@ -9,6 +9,7 @@ use crate::team::append_shim_event_log;
 use crate::team::completion;
 use crate::team::config::RoleType;
 use crate::team::daemon::{PendingAckInboxMessage, TeamDaemon};
+use crate::team::decide::paths::TriageOutcome;
 use crate::team::errors::DeliveryError;
 use crate::team::events::TeamEvent;
 use crate::team::inbox;
@@ -121,6 +122,9 @@ enum OrchestratorOnlyReason {
     StatusQuery,
     StandupRequest,
     EngineerChatter,
+    /// Jev triage classed a manager/architect message as noise or a routine
+    /// status reply.
+    JevSuppressed(TriageOutcome),
 }
 
 impl OrchestratorOnlyReason {
@@ -130,9 +134,14 @@ impl OrchestratorOnlyReason {
             Self::StatusQuery => "status query",
             Self::StandupRequest => "standup request",
             Self::EngineerChatter => "engineer chatter",
+            Self::JevSuppressed(TriageOutcome::StatusReply) => "jev_status_reply",
+            Self::JevSuppressed(_) => "jev_noise",
         }
     }
 }
+
+/// Prefix for a Jev escalation delivered without a priority tier.
+const ESCALATION_PREFIX: &str = "[escalation] ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ManagerNoticeClass {
@@ -779,8 +788,21 @@ impl TeamDaemon {
         if self.is_engineer_member(recipient) && is_engineer_ambient_chatter(body) {
             return Some(OrchestratorOnlyReason::EngineerChatter);
         }
+        if self.uses_management_batching(recipient)
+            && let Some(verdict @ (TriageOutcome::Noise | TriageOutcome::StatusReply)) =
+                self.triage_verdict(body)
+        {
+            return Some(OrchestratorOnlyReason::JevSuppressed(verdict));
+        }
 
         None
+    }
+
+    /// True when Jev triage marked this manager/architect message as an
+    /// escalation.
+    fn is_jev_escalation(&self, recipient: &str, body: &str) -> bool {
+        self.uses_management_batching(recipient)
+            && self.triage_verdict(body) == Some(TriageOutcome::Escalation)
     }
 
     fn cached_member_status_summary(&self, member_name: &str) -> String {
@@ -858,6 +880,15 @@ impl TeamDaemon {
                 "notification isolation: diverted non-actionable engineer notice from {} for {} ({preview})",
                 from, recipient
             )),
+            OrchestratorOnlyReason::JevSuppressed(_) => {
+                let preview = shim_log_preview(&crate::team::decide::redact::redact(body));
+                self.record_orchestrator_action(format!(
+                    "notification isolation: diverted {} from {} for {} ({preview})",
+                    reason.label(),
+                    from,
+                    recipient
+                ))
+            }
         }
     }
 
@@ -1112,6 +1143,21 @@ impl TeamDaemon {
             return Ok(MessageDelivery::OrchestratorLogged);
         }
 
+        // Jev triage: a cache miss keeps today's heuristic outcome and asks
+        // for a verdict the next copy of this body can use.
+        let escalated = self.is_jev_escalation(recipient, body);
+        if self.uses_management_batching(recipient) {
+            self.start_triage_decision(body);
+        }
+        let original_body = body;
+        let tagged_body;
+        let body = if escalated {
+            tagged_body = format!("{ESCALATION_PREFIX}{body}");
+            tagged_body.as_str()
+        } else {
+            body
+        };
+
         // Shim delivery path: deliver via the structured shim channel.
         if let Some((is_ready, is_terminal, state)) = self
             .shim_handles
@@ -1170,13 +1216,22 @@ impl TeamDaemon {
 
         // All delivery falls through to inbox when shim channel is unavailable.
         let root = inbox::inboxes_root(&self.config.project_root);
-        let msg = inbox::InboxMessage::new_send(from, recipient, body);
         let tiered = self.config.team_config.workflow_policy.tiered_inboxes;
-        crate::team::inbox_tiered::deliver_flag_aware(&root, &msg, tiered).map_err(|error| {
-            DeliveryError::InboxQueue {
-                recipient: recipient.to_string(),
-                detail: error.to_string(),
-            }
+        let queued = if escalated && tiered {
+            let msg = inbox::InboxMessage::new_send(from, recipient, original_body);
+            crate::team::inbox_tiered::deliver_to_tiered_inbox(
+                &root,
+                &msg,
+                Some(crate::team::inbox_tiered::QueueTier::Priority),
+            )
+            .map(|_| ())
+        } else {
+            let msg = inbox::InboxMessage::new_send(from, recipient, body);
+            crate::team::inbox_tiered::deliver_flag_aware(&root, &msg, tiered).map(|_| ())
+        };
+        queued.map_err(|error| DeliveryError::InboxQueue {
+            recipient: recipient.to_string(),
+            detail: error.to_string(),
         })?;
         self.record_message_routed(from, recipient);
         Ok(MessageDelivery::InboxQueued)
@@ -1385,7 +1440,16 @@ impl TeamDaemon {
                 let is_send = matches!(msg.msg_type, inbox::MessageType::Send);
                 let delivery_result: Result<MessageDelivery> = match msg.msg_type {
                     inbox::MessageType::Send => {
-                        if let Some(reason) = self.orchestrator_only_reason(name, &msg.body) {
+                        let reason = self.orchestrator_only_reason(name, &msg.body);
+                        // Jev triage: hold a manager/architect message for at
+                        // most the triage timeout while its verdict is fetched.
+                        if reason.is_none()
+                            && self.uses_management_batching(name)
+                            && self.defer_for_triage(&msg.id, &msg.body)
+                        {
+                            continue;
+                        }
+                        if let Some(reason) = reason {
                             info!(
                                 from = %msg.from,
                                 to = %name,
@@ -1410,9 +1474,13 @@ impl TeamDaemon {
                                         .scheduler
                                         .cooldown_active(&nudge.cooldown_key, cooldown)
                                 });
+                            let escalated_body = self
+                                .is_jev_escalation(name, &msg.body)
+                                .then(|| format!("{ESCALATION_PREFIX}{}", msg.body));
                             let delivery_body = review_packet_nudge
                                 .as_ref()
                                 .map(|nudge| nudge.body.as_str())
+                                .or(escalated_body.as_deref())
                                 .unwrap_or(&msg.body);
                             info!(from = %msg.from, to = %name, id = %msg.id, "delivering inbox message via shim");
                             if self.shim_handles.contains_key(name) {
@@ -4953,5 +5021,348 @@ mod tests {
             super::assign_stale_terminal_status(&tasks_dir, "Task #999: does not exist"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod jev_triage_tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::super::MessageDelivery;
+    use super::OrchestratorOnlyReason;
+    use crate::shim::protocol::{Channel, Command, ShimState, socketpair};
+    use crate::team::config::{
+        DecisionPath, DecisionProvider, DecisionTimeouts, DecisionsConfig, WorkflowMode,
+        WorkflowPolicy,
+    };
+    use crate::team::daemon::TeamDaemon;
+    use crate::team::daemon::agent_handle::AgentHandle;
+    use crate::team::decide::paths::TriageOutcome;
+    use crate::team::decide::test_server::serve_once;
+    use crate::team::inbox;
+    use crate::team::inbox_tiered::{QueueTier, pending_messages_for_tier};
+    use crate::team::standup::MemberState;
+    use crate::team::test_support::{
+        EnvVarGuard, TestDaemonBuilder, architect_member, engineer_member, inferred_role_defs,
+        manager_member,
+    };
+
+    const KEY: &str = "gateway-key-for-routing-tests-0123";
+    const UNUSED: &str = "http://127.0.0.1:1/v1/decisions";
+
+    fn daemon(
+        tmp: &tempfile::TempDir,
+        endpoint: &str,
+        key_env: &str,
+        configure: impl FnOnce(&mut DecisionsConfig),
+    ) -> TeamDaemon {
+        let mut decisions = DecisionsConfig {
+            provider: DecisionProvider::Jev,
+            endpoint: endpoint.to_string(),
+            api_key_env: key_env.to_string(),
+            paths: vec![DecisionPath::Triage],
+            ..DecisionsConfig::default()
+        };
+        configure(&mut decisions);
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .workflow_policy(WorkflowPolicy {
+                decisions,
+                ..WorkflowPolicy::default()
+            })
+            .build();
+        daemon.config.members = vec![
+            architect_member("architect"),
+            manager_member("manager", Some("architect")),
+            engineer_member("eng-1", Some("manager"), false),
+        ];
+        daemon.config.team_config.roles = inferred_role_defs(&daemon.config.members);
+        daemon.config.team_config.workflow_mode = WorkflowMode::Hybrid;
+        for member in ["architect", "manager", "eng-1"] {
+            daemon
+                .config
+                .pane_map
+                .insert(member.to_string(), format!("%{member}"));
+            inbox::init_inbox(&inbox::inboxes_root(tmp.path()), member).unwrap();
+        }
+        daemon
+    }
+
+    fn idle_shim(daemon: &mut TeamDaemon, member: &str) -> Channel {
+        let (parent, child) = socketpair().unwrap();
+        let mut handle = AgentHandle::new(
+            member.to_string(),
+            Channel::new(parent),
+            12345,
+            "claude".to_string(),
+            "claude".to_string(),
+            std::path::PathBuf::from("/tmp/test"),
+        );
+        handle.apply_state_change(ShimState::Idle);
+        daemon.shim_handles.insert(member.to_string(), handle);
+        daemon.states.insert(member.to_string(), MemberState::Idle);
+        let mut receiver = Channel::new(child);
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        receiver
+    }
+
+    fn received_body(receiver: &mut Channel) -> Option<String> {
+        match receiver.recv::<Command>() {
+            Ok(Some(Command::SendMessage { body, .. })) => Some(body),
+            _ => None,
+        }
+    }
+
+    fn drain(daemon: &mut TeamDaemon) {
+        for _ in 0..500 {
+            daemon.poll_decisions().unwrap();
+            if daemon.decision_jobs_in_flight() == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("triage job did not finish");
+    }
+
+    fn reply(kind: &str) -> String {
+        json!({
+            "answers": [{"type": "choice", "name": "kind", "choice": kind, "confidence": 0.9}],
+            "provider_metadata": {"gateway": {"cost": "0.00001"}}
+        })
+        .to_string()
+    }
+
+    fn queue_inbox(tmp: &tempfile::TempDir, to: &str, body: &str) {
+        let root = inbox::inboxes_root(tmp.path());
+        inbox::deliver_to_inbox(&root, &inbox::InboxMessage::new_send("manager", to, body))
+            .unwrap();
+    }
+
+    #[test]
+    fn cached_noise_for_manager_is_diverted_to_the_orchestrator_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_UNSET_A", |_| {});
+        let mut receiver = idle_shim(&mut daemon, "manager");
+        let body = "fyi the weather is nice today";
+        daemon.seed_triage_verdict(body, TriageOutcome::Noise);
+        assert_eq!(
+            daemon.orchestrator_only_reason("manager", body),
+            Some(OrchestratorOnlyReason::JevSuppressed(TriageOutcome::Noise))
+        );
+
+        let delivery = daemon
+            .deliver_message("architect", "manager", body)
+            .unwrap();
+        assert_eq!(delivery, MessageDelivery::OrchestratorLogged);
+        assert!(received_body(&mut receiver).is_none());
+        let log = std::fs::read_to_string(crate::team::orchestrator_log_path(tmp.path())).unwrap();
+        assert!(
+            log.contains("diverted jev_noise from architect for manager"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn cached_status_reply_has_its_own_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_UNSET_B", |_| {});
+        daemon.seed_triage_verdict("ack, on it", TriageOutcome::StatusReply);
+        let reason = daemon.orchestrator_only_reason("architect", "ack, on it");
+        assert_eq!(reason.map(|r| r.label()), Some("jev_status_reply"));
+    }
+
+    #[test]
+    fn suppressed_preview_is_redacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_UNSET_C", |_| {});
+        let planted = format!("{}{}", "sk-", "ant-api03-PlantedRoutingSecret0123456789");
+        let body = format!("noise {planted}");
+        daemon.seed_triage_verdict(&body, TriageOutcome::Noise);
+        let delivery = daemon
+            .deliver_message("architect", "manager", &body)
+            .unwrap();
+        assert_eq!(delivery, MessageDelivery::OrchestratorLogged);
+        let log = std::fs::read_to_string(crate::team::orchestrator_log_path(tmp.path())).unwrap();
+        assert!(!log.contains("PlantedRoutingSecret"), "{log}");
+    }
+
+    #[test]
+    fn escalation_is_prefixed_on_the_live_shim_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_UNSET_D", |_| {});
+        let mut receiver = idle_shim(&mut daemon, "manager");
+        let body = "prod deploy is failing";
+        daemon.seed_triage_verdict(body, TriageOutcome::Escalation);
+        let delivery = daemon
+            .deliver_message("architect", "manager", body)
+            .unwrap();
+        assert_eq!(delivery, MessageDelivery::LivePane);
+        assert_eq!(
+            received_body(&mut receiver).as_deref(),
+            Some("[escalation] prod deploy is failing")
+        );
+    }
+
+    #[test]
+    fn escalation_uses_the_priority_tier_when_tiered_inboxes_are_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_UNSET_E", |_| {});
+        daemon.config.team_config.workflow_policy.tiered_inboxes = true;
+        let body = "prod deploy is failing";
+        daemon.seed_triage_verdict(body, TriageOutcome::Escalation);
+        let delivery = daemon
+            .deliver_message("architect", "manager", body)
+            .unwrap();
+        assert_eq!(delivery, MessageDelivery::InboxQueued);
+        let root = inbox::inboxes_root(tmp.path());
+        let priority = pending_messages_for_tier(&root, "manager", QueueTier::Priority).unwrap();
+        assert_eq!(priority.len(), 1);
+        assert_eq!(priority[0].body, body);
+    }
+
+    #[test]
+    fn escalation_is_prefixed_in_a_flat_inbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_UNSET_F", |_| {});
+        let body = "prod deploy is failing";
+        daemon.seed_triage_verdict(body, TriageOutcome::Escalation);
+        daemon
+            .deliver_message("architect", "manager", body)
+            .unwrap();
+        let pending = inbox::pending_messages(&inbox::inboxes_root(tmp.path()), "manager").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].body, "[escalation] prod deploy is failing");
+    }
+
+    #[test]
+    fn engineer_recipients_ignore_triage_and_start_no_job() {
+        let _key = EnvVarGuard::set("BATTY_TEST_TRIAGE_ENG", KEY);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_ENG", |_| {});
+        let mut receiver = idle_shim(&mut daemon, "eng-1");
+        let body = "please pick up task 12";
+        daemon.seed_triage_verdict(body, TriageOutcome::Noise);
+        assert_eq!(daemon.orchestrator_only_reason("eng-1", body), None);
+        let delivery = daemon.deliver_message("manager", "eng-1", body).unwrap();
+        assert_eq!(delivery, MessageDelivery::LivePane);
+        assert_eq!(received_body(&mut receiver).as_deref(), Some(body));
+        assert_eq!(daemon.decision_jobs_in_flight(), 0);
+    }
+
+    #[test]
+    fn heuristic_provider_never_triages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_UNSET_G", |d| {
+            d.provider = DecisionProvider::Heuristic
+        });
+        let mut receiver = idle_shim(&mut daemon, "manager");
+        let body = "fyi the weather is nice today";
+        daemon.seed_triage_verdict(body, TriageOutcome::Noise);
+        let delivery = daemon
+            .deliver_message("architect", "manager", body)
+            .unwrap();
+        assert_eq!(delivery, MessageDelivery::LivePane);
+        assert_eq!(received_body(&mut receiver).as_deref(), Some(body));
+        assert_eq!(daemon.decision_jobs_in_flight(), 0);
+    }
+
+    #[test]
+    fn live_cache_miss_delivers_as_today_and_triages_for_next_time() {
+        let _key = EnvVarGuard::set("BATTY_TEST_TRIAGE_LIVE", KEY);
+        let (endpoint, _rx, server) = serve_once("HTTP/1.1 200 OK", reply("noise"), Duration::ZERO);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, &endpoint, "BATTY_TEST_TRIAGE_LIVE", |_| {});
+        let mut receiver = idle_shim(&mut daemon, "manager");
+        let body = "fyi the weather is nice today";
+
+        let delivery = daemon
+            .deliver_message("architect", "manager", body)
+            .unwrap();
+        assert_eq!(delivery, MessageDelivery::LivePane);
+        assert_eq!(received_body(&mut receiver).as_deref(), Some(body));
+        assert_eq!(daemon.decision_jobs_in_flight(), 1);
+        drain(&mut daemon);
+        server.join().unwrap();
+
+        assert_eq!(
+            daemon
+                .deliver_message("architect", "manager", body)
+                .unwrap(),
+            MessageDelivery::OrchestratorLogged
+        );
+    }
+
+    #[test]
+    fn inbox_cache_miss_waits_for_the_verdict() {
+        let _key = EnvVarGuard::set("BATTY_TEST_TRIAGE_INBOX", KEY);
+        let (endpoint, _rx, server) = serve_once(
+            "HTTP/1.1 200 OK",
+            reply("actionable"),
+            Duration::from_millis(300),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, &endpoint, "BATTY_TEST_TRIAGE_INBOX", |_| {});
+        let mut receiver = idle_shim(&mut daemon, "architect");
+        let body = "please review the plan for task 9";
+        queue_inbox(&tmp, "architect", body);
+        let root = inbox::inboxes_root(tmp.path());
+
+        daemon.deliver_inbox_messages().unwrap();
+        assert_eq!(
+            inbox::pending_messages(&root, "architect").unwrap().len(),
+            1
+        );
+        assert!(received_body(&mut receiver).is_none());
+        assert_eq!(daemon.decision_jobs_in_flight(), 1);
+
+        drain(&mut daemon);
+        server.join().unwrap();
+        daemon.deliver_inbox_messages().unwrap();
+        assert_eq!(received_body(&mut receiver).as_deref(), Some(body));
+    }
+
+    #[test]
+    fn inbox_deferral_never_outlives_the_triage_timeout() {
+        let _key = EnvVarGuard::set("BATTY_TEST_TRIAGE_TIMEOUT", KEY);
+        let (endpoint, _rx, server) = serve_once(
+            "HTTP/1.1 200 OK",
+            reply("noise"),
+            Duration::from_millis(1500),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, &endpoint, "BATTY_TEST_TRIAGE_TIMEOUT", |d| {
+            d.timeouts_ms = DecisionTimeouts {
+                triage: 150,
+                ..DecisionTimeouts::default()
+            }
+        });
+        let mut receiver = idle_shim(&mut daemon, "architect");
+        let body = "please review the plan for task 9";
+        queue_inbox(&tmp, "architect", body);
+
+        daemon.deliver_inbox_messages().unwrap();
+        assert!(received_body(&mut receiver).is_none());
+        std::thread::sleep(Duration::from_millis(200));
+        // The job has not been polled: the deferral alone must give up.
+        daemon.deliver_inbox_messages().unwrap();
+        assert_eq!(received_body(&mut receiver).as_deref(), Some(body));
+        drain(&mut daemon);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn inbox_without_a_key_delivers_immediately() {
+        let _key = EnvVarGuard::unset("BATTY_TEST_TRIAGE_NOKEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(&tmp, UNUSED, "BATTY_TEST_TRIAGE_NOKEY", |_| {});
+        let mut receiver = idle_shim(&mut daemon, "architect");
+        let body = "please review the plan for task 9";
+        queue_inbox(&tmp, "architect", body);
+        daemon.deliver_inbox_messages().unwrap();
+        assert_eq!(received_body(&mut receiver).as_deref(), Some(body));
+        assert_eq!(daemon.decision_jobs_in_flight(), 0);
     }
 }

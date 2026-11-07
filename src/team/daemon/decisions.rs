@@ -51,6 +51,9 @@ pub(crate) struct DecisionsState {
     triage: BoundedCache<u64, TriageOutcome>,
     /// Inputs that failed recently: `(path, key)` to `(gate hash, when)`.
     failed: BoundedCache<JobKey, (u64, Instant)>,
+    /// Inbox message ids held back while their triage call runs, with the
+    /// time each was first held.
+    triage_deferred: BoundedCache<String, Instant>,
     no_key_reported: bool,
     budget_reported_on: Option<String>,
     /// Spend since startup as `(UTC date, USD)`, a floor when the telemetry
@@ -65,6 +68,7 @@ impl Default for DecisionsState {
             outcomes: ChangeGate::default(),
             triage: BoundedCache::new(gate::TRIAGE_CACHE_CAPACITY),
             failed: BoundedCache::new(gate::GATE_CAPACITY),
+            triage_deferred: BoundedCache::new(gate::TRIAGE_CACHE_CAPACITY),
             no_key_reported: false,
             budget_reported_on: None,
             session_spend: None,
@@ -93,6 +97,17 @@ fn map_outcome(
         }
         DecisionPath::Stall => DecisionOutcome::Stall(paths::map_stall(answers, min_confidence)?),
     })
+}
+
+/// The triage input for a message body: redacted and capped.
+fn triage_input_of(body: &str) -> String {
+    paths::triage_input(&redact::redact(body))
+}
+
+/// The triage cache key for a message body. Matches the key
+/// [`TeamDaemon::spawn_decision`] derives from [`triage_input_of`].
+pub(crate) fn triage_body_hash(body: &str) -> u64 {
+    gate::text_hash(&redact::redact(&triage_input_of(body)))
 }
 
 fn fallback_of(error: &anyhow::Error) -> Fallback {
@@ -139,6 +154,99 @@ impl TeamDaemon {
             ));
         }
         false
+    }
+
+    /// True when `path` is switched on in the config. Read-only, for
+    /// synchronous callers that only consult cached outcomes; it does not
+    /// check the key (a missing key leaves every cache empty).
+    pub fn decision_path_configured(&self, path: DecisionPath) -> bool {
+        let policy = &self.config.team_config.workflow_policy.decisions;
+        policy.provider == DecisionProvider::Jev && policy.paths.contains(&path)
+    }
+
+    /// The cached triage verdict for a message body, if triage is on.
+    pub fn triage_verdict(&self, body: &str) -> Option<TriageOutcome> {
+        if !self.decision_path_configured(DecisionPath::Triage) {
+            return None;
+        }
+        self.cached_triage(triage_body_hash(body))
+    }
+
+    /// Start a triage call for a message body. No-op when triage is off, the
+    /// verdict is cached or a call for the same body is in flight.
+    pub fn start_triage_decision(&mut self, body: &str) {
+        if !self.decision_path_configured(DecisionPath::Triage) {
+            return;
+        }
+        self.start_decision(
+            DecisionPath::Triage,
+            "",
+            &triage_input_of(body),
+            paths::triage_questions(),
+        );
+    }
+
+    fn triage_in_flight(&self, body: &str) -> bool {
+        let key = format!("{:016x}", triage_body_hash(body));
+        self.decisions
+            .jobs
+            .contains_key(&(DecisionPath::Triage, key))
+    }
+
+    /// Inbox path: true when message `id` should wait this tick for its
+    /// triage verdict. Starts the call on a miss. A message is never held
+    /// once a verdict exists, no call is running (disabled, no key, budget,
+    /// recent failure) or the triage timeout has passed since it was first
+    /// held; the caller then decides with the heuristic.
+    pub fn defer_for_triage(&mut self, id: &str, body: &str) -> bool {
+        if !self.decision_path_configured(DecisionPath::Triage) {
+            return false;
+        }
+        let id = id.to_string();
+        if self.triage_verdict(body).is_some() {
+            self.decisions.triage_deferred.remove(&id);
+            return false;
+        }
+        self.start_triage_decision(body);
+        if !self.triage_in_flight(body) {
+            self.decisions.triage_deferred.remove(&id);
+            return false;
+        }
+        let timeout = Duration::from_millis(
+            self.config
+                .team_config
+                .workflow_policy
+                .decisions
+                .timeouts_ms
+                .for_path(DecisionPath::Triage),
+        );
+        let since = match self.decisions.triage_deferred.peek(&id) {
+            Some(since) => *since,
+            None => {
+                let now = Instant::now();
+                self.decisions.triage_deferred.insert(id.clone(), now);
+                now
+            }
+        };
+        if since.elapsed() < timeout {
+            return true;
+        }
+        self.decisions.triage_deferred.remove(&id);
+        false
+    }
+
+    /// Test hook: store a triage verdict as if a call had answered.
+    #[cfg(test)]
+    pub(crate) fn seed_triage_verdict(&mut self, body: &str, verdict: TriageOutcome) {
+        self.decisions
+            .triage
+            .insert(triage_body_hash(body), verdict);
+    }
+
+    /// Test hook: number of decision calls in flight.
+    #[cfg(test)]
+    pub(crate) fn decision_jobs_in_flight(&self) -> usize {
+        self.decisions.jobs.len()
     }
 
     /// The latest mapped outcome for `(path, key)`, for every path except
