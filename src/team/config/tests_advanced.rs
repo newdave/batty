@@ -531,6 +531,55 @@ fn parse_workflow_policy_defaults_all_applied() {
 }
 
 #[test]
+fn parse_bench_recovery_defaults() {
+    let config: TeamConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
+    let b = &config.workflow_policy.bench_recovery;
+    assert!(b.enabled);
+    assert_eq!(b.cooloff_secs, 1800);
+    assert_eq!(b.max_auto_resets, 2);
+    assert!(b.auto_approve_when_all_benched);
+    assert!(b.wrong_branch_rescue);
+    assert!(b.strike_warning);
+    assert_eq!(
+        b.effort_ladder.claude,
+        ["low", "medium", "high", "xhigh", "max"]
+    );
+    assert_eq!(
+        b.effort_ladder.codex,
+        ["minimal", "low", "medium", "high", "xhigh"]
+    );
+}
+
+#[test]
+fn parse_bench_recovery_partial_override_keeps_other_defaults() {
+    let yaml = format!(
+        "{}workflow_policy:\n  bench_recovery:\n    cooloff_secs: 60\n    effort_ladder:\n      codex: [low, high]\n",
+        minimal_yaml()
+    );
+    let config: TeamConfig = serde_yaml::from_str(&yaml).unwrap();
+    let b = &config.workflow_policy.bench_recovery;
+    assert_eq!(b.cooloff_secs, 60);
+    assert!(b.enabled);
+    assert_eq!(b.max_auto_resets, 2);
+    assert_eq!(b.effort_ladder.codex, ["low", "high"]);
+    assert_eq!(b.effort_ladder.claude.len(), 5);
+}
+
+#[test]
+fn test_daemon_builder_disables_bench_recovery_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = crate::team::test_support::TestDaemonBuilder::new(tmp.path()).build();
+    assert!(
+        !daemon
+            .config
+            .team_config
+            .workflow_policy
+            .bench_recovery
+            .enabled
+    );
+}
+
+#[test]
 fn parse_workflow_policy_allocation_overrides() {
     let yaml = r#"
 name: test

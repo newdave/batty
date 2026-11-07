@@ -565,6 +565,11 @@ impl<'a> TestDaemonBuilder<'a> {
                 },
                 zero_diff_recovery: crate::team::config::ZeroDiffRecovery::Restart,
                 planning_cycle_cooldown_secs: 300,
+                // Bench recovery tests opt in explicitly via `.workflow_policy(..)`.
+                bench_recovery: crate::team::config::BenchRecoveryConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
                 ..WorkflowPolicy::default()
             },
             board: BoardConfig::default(),
