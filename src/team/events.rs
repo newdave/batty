@@ -134,6 +134,18 @@ pub struct TeamEvent {
     /// (`loop_step_error_summary`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count_since_last: Option<u32>,
+    /// Decision path (`triage`, `completion`, ...) of a Jev decision event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_path: Option<String>,
+    /// Decision provider of a Jev decision event (`jev`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     pub ts: u64,
 }
 
@@ -181,6 +193,11 @@ impl TeamEvent {
             retry_rate: None,
             time_to_completion_secs: None,
             count_since_last: None,
+            decision_path: None,
+            provider: None,
+            latency_ms: None,
+            cached: None,
+            cost_usd: None,
             ts: Self::now(),
         }
     }
@@ -392,6 +409,73 @@ impl TeamEvent {
             role: Some(role.into()),
             task: Some(task.into()),
             ..Self::base("review_nudge_sent")
+        }
+    }
+
+    /// A Jev decision was answered and applied. `member` is the agent, task
+    /// or message key the decision was about; never raw content.
+    pub fn decision_made(
+        path: &str,
+        member: &str,
+        provider: &str,
+        latency_ms: u64,
+        cached: bool,
+        cost_usd: f64,
+    ) -> Self {
+        Self {
+            role: Some(member.into()),
+            decision_path: Some(path.into()),
+            provider: Some(provider.into()),
+            latency_ms: Some(latency_ms),
+            cached: Some(cached),
+            cost_usd: Some(cost_usd),
+            ..Self::base("decision_made")
+        }
+    }
+
+    /// A Jev decision fell back to the heuristic. `reason` is a fixed label
+    /// (`no_key`, `budget`, `timeout`, `http_<code>`, ...), never content.
+    pub fn decision_fallback(path: &str, member: Option<&str>, reason: &str) -> Self {
+        Self {
+            role: member.map(str::to_string),
+            decision_path: Some(path.into()),
+            reason: Some(reason.into()),
+            ..Self::base("decision_fallback")
+        }
+    }
+
+    /// The daily Jev spend cap was reached on `date` (UTC); emitted once a day.
+    pub fn decision_budget_exceeded(date: &str, spent_usd: f64, cap_usd: f64) -> Self {
+        Self {
+            reason: Some(date.into()),
+            details: Some(format!("cap_usd={cap_usd:.4}")),
+            cost_usd: Some(spent_usd),
+            ..Self::base("decision_budget_exceeded")
+        }
+    }
+
+    /// A completion that passed every hard gate was rejected by the Jev veto.
+    pub fn completion_vetoed(task: &str, reason: &str) -> Self {
+        Self {
+            task: Some(task.into()),
+            reason: Some(reason.into()),
+            ..Self::base("completion_vetoed")
+        }
+    }
+
+    /// Advisory review rubric result. `scores` are in criterion order.
+    pub fn review_rubric(task: &str, criteria_met: bool, scores: &[f64]) -> Self {
+        let scores = scores
+            .iter()
+            .enumerate()
+            .map(|(index, score)| format!("criterion_{}={score:.2}", index + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        Self {
+            task: Some(task.into()),
+            success: Some(criteria_met),
+            details: Some(scores),
+            ..Self::base("review_rubric")
         }
     }
 
@@ -1981,6 +2065,71 @@ mod tests {
         .unwrap();
         assert!(capped.contains("\"event\":\"task_bench_reset_capped\""));
         assert!(capped.contains("\"role\":\"eng-1\""));
+    }
+
+    #[test]
+    fn decision_events_serialize_their_fields() {
+        let made = serde_json::to_string(&TeamEvent::decision_made(
+            "triage", "manager", "jev", 120, false, 0.000012,
+        ))
+        .unwrap();
+        assert!(made.contains("\"event\":\"decision_made\""));
+        assert!(made.contains("\"decision_path\":\"triage\""));
+        assert!(made.contains("\"role\":\"manager\""));
+        assert!(made.contains("\"provider\":\"jev\""));
+        assert!(made.contains("\"latency_ms\":120"));
+        assert!(made.contains("\"cached\":false"));
+        assert!(made.contains("\"cost_usd\":"));
+
+        let fallback = serde_json::to_string(&TeamEvent::decision_fallback(
+            "screen_state",
+            Some("architect"),
+            "http_429",
+        ))
+        .unwrap();
+        assert!(fallback.contains("\"event\":\"decision_fallback\""));
+        assert!(fallback.contains("\"reason\":\"http_429\""));
+        assert!(fallback.contains("\"role\":\"architect\""));
+        let no_member =
+            serde_json::to_string(&TeamEvent::decision_fallback("stall", None, "no_key")).unwrap();
+        assert!(!no_member.contains("\"role\""));
+
+        let budget = serde_json::to_string(&TeamEvent::decision_budget_exceeded(
+            "2026-11-07",
+            5.01,
+            5.0,
+        ))
+        .unwrap();
+        assert!(budget.contains("\"event\":\"decision_budget_exceeded\""));
+        assert!(budget.contains("\"reason\":\"2026-11-07\""));
+        assert!(budget.contains("cap_usd=5.0000"));
+    }
+
+    #[test]
+    fn completion_veto_and_rubric_events_serialize() {
+        let vetoed =
+            serde_json::to_string(&TeamEvent::completion_vetoed("7", "narration_only")).unwrap();
+        assert!(vetoed.contains("\"event\":\"completion_vetoed\""));
+        assert!(vetoed.contains("\"task\":\"7\""));
+        assert!(vetoed.contains("\"reason\":\"narration_only\""));
+
+        let rubric =
+            serde_json::to_string(&TeamEvent::review_rubric("7", true, &[1.9, 0.25])).unwrap();
+        assert!(rubric.contains("\"event\":\"review_rubric\""));
+        assert!(rubric.contains("\"success\":true"));
+        assert!(rubric.contains("criterion_1=1.90,criterion_2=0.25"));
+    }
+
+    #[test]
+    fn decision_events_round_trip_through_the_log_reader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let mut sink = EventSink::new(&path).unwrap();
+        sink.emit(TeamEvent::decision_made("stall", "m", "jev", 5, true, 0.0))
+            .unwrap();
+        let events = read_events(&path).unwrap();
+        assert_eq!(events[0].decision_path.as_deref(), Some("stall"));
+        assert_eq!(events[0].cached, Some(true));
     }
 
     #[test]

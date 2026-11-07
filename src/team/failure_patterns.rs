@@ -362,6 +362,11 @@ mod tests {
             retry_rate: None,
             time_to_completion_secs: None,
             count_since_last: None,
+            decision_path: None,
+            provider: None,
+            latency_ms: None,
+            cached: None,
+            cost_usd: None,
             exit_category: None,
             ts,
         }
@@ -408,6 +413,11 @@ mod tests {
             retry_rate: None,
             time_to_completion_secs: None,
             count_since_last: None,
+            decision_path: None,
+            provider: None,
+            latency_ms: None,
+            cached: None,
+            cost_usd: None,
             exit_category: None,
             ts,
         }

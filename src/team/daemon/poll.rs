@@ -273,6 +273,7 @@ impl TeamDaemon {
             daemon.process_pending_removals()
         });
         self.run_recoverable_step("shim_health_check", |daemon| daemon.shim_health_check());
+        self.run_recoverable_step("poll_decisions", |daemon| daemon.poll_decisions());
         self.run_recoverable_step("check_working_state_timeouts", |daemon| {
             daemon.check_working_state_timeouts()
         });

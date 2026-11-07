@@ -8,10 +8,14 @@ pub mod criteria;
 pub mod gate;
 pub mod paths;
 pub mod redact;
+#[cfg(test)]
+pub(crate) mod test_server;
 
 use std::fmt;
 
 use serde::Deserialize;
+
+use paths::{CompletionOutcome, RubricOutcome, ScreenOutcome, StallOutcome, TriageOutcome};
 
 /// One typed question about a block of state text.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +92,17 @@ pub struct DecisionResponse {
     /// USD cost reported by the Gateway (`provider_metadata.gateway.cost`).
     pub cost_usd: f64,
     pub input_tokens: u64,
+}
+
+/// A mapped decision, stored by the daemon until the path that asked for it
+/// reads it on a later tick.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecisionOutcome {
+    Screen(ScreenOutcome),
+    Triage(TriageOutcome),
+    Completion(CompletionOutcome),
+    Rubric(RubricOutcome),
+    Stall(StallOutcome),
 }
 
 /// Why a decision fell back to the heuristic. The label is the only text that
