@@ -67,6 +67,25 @@ pub(crate) fn run_automatic_verification_tracked(
     test_command: Option<&str>,
     child_pgid: Option<&std::sync::atomic::AtomicU32>,
 ) -> Result<VerificationRunResult> {
+    run_verification_tracked(worktree_dir, test_command, child_pgid, true)
+}
+
+/// Verification for the bench recovery bar: the same claim and task-branch
+/// checks and test run, without the scope fence, which that bar ignores.
+pub(crate) fn run_bench_bar_verification_tracked(
+    worktree_dir: &Path,
+    test_command: Option<&str>,
+    child_pgid: Option<&std::sync::atomic::AtomicU32>,
+) -> Result<VerificationRunResult> {
+    run_verification_tracked(worktree_dir, test_command, child_pgid, false)
+}
+
+fn run_verification_tracked(
+    worktree_dir: &Path,
+    test_command: Option<&str>,
+    child_pgid: Option<&std::sync::atomic::AtomicU32>,
+    enforce_scope: bool,
+) -> Result<VerificationRunResult> {
     if let Some(conflict_failure) = active_claim_conflict_failure(worktree_dir)? {
         return Ok(conflict_failure);
     }
@@ -77,7 +96,7 @@ pub(crate) fn run_automatic_verification_tracked(
     {
         return Ok(task_mismatch_failure);
     }
-    if let Some(scope_failure) = scope_validation_failure(worktree_dir)? {
+    if enforce_scope && let Some(scope_failure) = scope_validation_failure(worktree_dir)? {
         return Ok(scope_failure);
     }
 
@@ -871,8 +890,9 @@ mod tests {
         ScopeValidationResult, active_claim_conflict_failure, commit_subjects_since_main,
         current_branch_name, engineer_worktree_context, find_claimed_task_for_worktree,
         inspect_scope_fence, is_scope_ack_message, parse_scope_fence, parse_test_output,
-        run_automatic_verification, scope_validation_failure, task_mismatch_validation_failure,
-        validate_declared_scope,
+        run_automatic_verification, run_automatic_verification_tracked,
+        run_bench_bar_verification_tracked, scope_validation_failure,
+        task_mismatch_validation_failure, validate_declared_scope,
     };
 
     fn write_scope_ack_team_config(project_root: &Path) {
@@ -1173,6 +1193,12 @@ src/parser.rs:12: failure here\n";
         assert!(!result.passed);
         assert!(result.output.contains("scope fence violation"));
         assert_eq!(result.file_paths, vec!["src/team/daemon.rs".to_string()]);
+
+        // The bench recovery bar ignores the scope fence; normal verification does not.
+        let normal = run_automatic_verification_tracked(&worktree_dir, Some("true"), None).unwrap();
+        assert!(!normal.passed, "{}", normal.output);
+        let bench = run_bench_bar_verification_tracked(&worktree_dir, Some("true"), None).unwrap();
+        assert!(bench.passed, "{}", bench.output);
     }
 
     #[test]
