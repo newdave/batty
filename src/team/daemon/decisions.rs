@@ -56,6 +56,8 @@ pub(crate) struct DecisionsState {
     triage_deferred: BoundedCache<String, Instant>,
     /// Redacted last response per engineer, kept for the completion veto.
     pending_response: HashMap<String, String>,
+    /// Manager to tell about each rubric in flight, keyed by task id.
+    rubric_recipients: BoundedCache<String, String>,
     no_key_reported: bool,
     budget_reported_on: Option<String>,
     /// Spend since startup as `(UTC date, USD)`, a floor when the telemetry
@@ -72,6 +74,7 @@ impl Default for DecisionsState {
             failed: BoundedCache::new(gate::GATE_CAPACITY),
             triage_deferred: BoundedCache::new(gate::TRIAGE_CACHE_CAPACITY),
             pending_response: HashMap::new(),
+            rubric_recipients: BoundedCache::new(gate::GATE_CAPACITY),
             no_key_reported: false,
             budget_reported_on: None,
             session_spend: None,
@@ -111,6 +114,18 @@ fn triage_input_of(body: &str) -> String {
 /// [`TeamDaemon::spawn_decision`] derives from [`triage_input_of`].
 pub(crate) fn triage_body_hash(body: &str) -> u64 {
     gate::text_hash(&redact::redact(&triage_input_of(body)))
+}
+
+/// The follow-up manager message for a rubric outcome.
+fn rubric_message(task_key: &str, outcome: &paths::RubricOutcome) -> String {
+    let mut message = format!(
+        "[rubric] Task #{task_key}: criteria met: {}",
+        if outcome.criteria_met { "yes" } else { "no" }
+    );
+    for (criterion, score) in &outcome.scores {
+        message.push_str(&format!("\n- {criterion}: {}", paths::rubric_label(*score)));
+    }
+    message
 }
 
 fn fallback_of(error: &anyhow::Error) -> Fallback {
@@ -313,6 +328,60 @@ impl TeamDaemon {
         match self.cached_decision(DecisionPath::Completion, &task_id.to_string()) {
             Some(DecisionOutcome::Completion(outcome)) if outcome.vetoes() => Some(*outcome),
             _ => None,
+        }
+    }
+
+    /// Start the advisory review rubric for `task_id`; `manager` receives the
+    /// result as a follow-up message once the call answers.
+    pub fn start_review_rubric_decision(
+        &mut self,
+        task_id: u32,
+        manager: &str,
+        task_text: &str,
+        diff_summary: &str,
+        criteria: &[String],
+    ) {
+        if criteria.is_empty() || !self.decisions_enabled(DecisionPath::Rubric) {
+            return;
+        }
+        let key = task_id.to_string();
+        let input = paths::rubric_input(&redact::redact(task_text), &redact::redact(diff_summary));
+        self.start_rubric_decision(&key, &input, criteria);
+        if self
+            .decisions
+            .jobs
+            .contains_key(&(DecisionPath::Rubric, key.clone()))
+        {
+            self.decisions
+                .rubric_recipients
+                .insert(key, manager.to_string());
+        }
+    }
+
+    /// Queue the follow-up rubric message for a finished rubric call.
+    fn deliver_rubric(&mut self, task_key: &str) {
+        let Some(manager) = self
+            .decisions
+            .rubric_recipients
+            .remove(&task_key.to_string())
+        else {
+            return;
+        };
+        let Some(DecisionOutcome::Rubric(outcome)) = self
+            .cached_decision(DecisionPath::Rubric, task_key)
+            .cloned()
+        else {
+            return;
+        };
+        let scores: Vec<f64> = outcome.scores.iter().map(|(_, score)| *score).collect();
+        self.emit_event(TeamEvent::review_rubric(
+            task_key,
+            outcome.criteria_met,
+            &scores,
+        ));
+        let message = rubric_message(task_key, &outcome);
+        if let Err(error) = self.queue_message("daemon", &manager, &message) {
+            debug!(task = task_key, error = %error, "failed to queue rubric message");
         }
     }
 
@@ -565,6 +634,9 @@ impl TeamDaemon {
                     false,
                     cost_usd,
                 ));
+                if *path == DecisionPath::Rubric {
+                    self.deliver_rubric(key);
+                }
             }
             Err(fallback) => {
                 // A stale outcome must not outlive a failed refresh.
@@ -577,6 +649,9 @@ impl TeamDaemon {
                     Some(key),
                     &fallback.to_string(),
                 ));
+                if *path == DecisionPath::Rubric {
+                    self.decisions.rubric_recipients.remove(key);
+                }
             }
         }
     }
