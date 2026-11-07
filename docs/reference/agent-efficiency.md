@@ -64,6 +64,17 @@ when it passes the bar or resets it to another engineer at one effort step highe
 for that task. Before parking, the daemon warns the engineer one strike early and
 rescues commits made on the wrong branch.
 
+`batty repair [MEMBER] [--dry-run] [--yes]` does the manual recovery in one go. It
+unbenches every benched engineer (manual and auto-park), clears backend
+configuration error markers, asks a running daemon to restart members whose pane
+is dead or whose last event is an unrestarted context exhaustion or stall, and,
+when no daemon runs, clears a merge left in verification (as
+`batty merge --force-clear-stale` does). Without a daemon the restarts are
+reported as happening on the next `batty start`. It prints the plan first;
+applying needs `--yes` or a confirmation on a terminal, and `--dry-run` changes
+nothing. With `MEMBER` the stale merge is left alone. It exits non-zero if any
+action failed.
+
 `batty preflight` performs static checks without inference. Startup takes a local
 exclusive lock and can perform bounded runtime consistency checks, rolling back
 the resources created by that startup if readiness fails. A leftover
