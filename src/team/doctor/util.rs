@@ -39,7 +39,7 @@ pub(super) fn is_engineer_name(name: &str) -> bool {
     name.starts_with("eng-")
 }
 
-pub(super) fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
+pub(crate) fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     print!("{msg}");
     io::stdout().flush()?;
     let mut input = String::new();

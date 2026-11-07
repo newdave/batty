@@ -124,7 +124,7 @@ use self::launcher::{
 };
 pub(crate) use self::merge_queue::{
     MergeOrigin, MergeQueue, MergeRequest, clear_stale_in_flight_merge, persisted_in_flight_merge,
-    remove_verify_worktree, stale_in_flight_merge,
+    remove_verify_worktree, running_daemon_pid, stale_in_flight_merge,
 };
 pub use self::state::load_dispatch_queue_snapshot;
 #[cfg(test)]

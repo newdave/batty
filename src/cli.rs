@@ -123,6 +123,18 @@ pub enum Command {
         engineer: String,
     },
 
+    /// Unbench engineers, clear backend errors and restart stuck members
+    Repair {
+        /// Repair only this member (e.g., "eng-1-1"); default is the whole team
+        member: Option<String>,
+        /// Print the repair plan without changing anything
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Skip the confirmation prompt (required when stdin is not a terminal)
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+
     /// OpenClaw supervisor integration helpers for Batty
     #[command(name = "openclaw")]
     OpenClaw {
@@ -1768,6 +1780,40 @@ mod tests {
                 assert_eq!(reason.as_deref(), Some("session end"));
             }
             other => panic!("expected bench command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_subcommand_parses_member_and_flags() {
+        let cli = Cli::parse_from(["batty", "repair", "eng-1-1", "--dry-run", "--yes"]);
+        match cli.command {
+            Command::Repair {
+                member,
+                dry_run,
+                yes,
+            } => {
+                assert_eq!(member.as_deref(), Some("eng-1-1"));
+                assert!(dry_run);
+                assert!(yes);
+            }
+            other => panic!("expected repair command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_subcommand_defaults_to_whole_team() {
+        let cli = Cli::parse_from(["batty", "repair"]);
+        match cli.command {
+            Command::Repair {
+                member,
+                dry_run,
+                yes,
+            } => {
+                assert!(member.is_none());
+                assert!(!dry_run);
+                assert!(!yes);
+            }
+            other => panic!("expected repair command, got {other:?}"),
         }
     }
 
