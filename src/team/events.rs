@@ -421,6 +421,15 @@ impl TeamEvent {
         }
     }
 
+    pub fn completion_attribution_warning(role: &str, task: &str, reason: &str) -> Self {
+        Self {
+            role: Some(role.into()),
+            task: Some(task.into()),
+            reason: Some(reason.into()),
+            ..Self::base("completion_attribution_warning")
+        }
+    }
+
     pub fn task_stale(role: &str, task: &str, reason: &str) -> Self {
         Self {
             role: Some(role.into()),
@@ -1882,6 +1891,16 @@ mod tests {
         let task_val = parsed["task"].as_str().unwrap();
         assert!(task_val.contains("\"quotes\""));
         assert!(task_val.contains("<angles>"));
+    }
+
+    #[test]
+    fn completion_attribution_warning_serializes_role_task_and_reason() {
+        let event = TeamEvent::completion_attribution_warning("eng-1", "7", "strike 1/2");
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event\":\"completion_attribution_warning\""));
+        assert!(json.contains("\"role\":\"eng-1\""));
+        assert!(json.contains("\"task\":\"7\""));
+        assert!(json.contains("\"reason\":\"strike 1/2\""));
     }
 
     #[test]

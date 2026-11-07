@@ -682,7 +682,43 @@ impl TeamDaemon {
         self.record_orchestrator_action(format!(
             "quality: {member_name} reported completion for task #{task_id} without an attributed engineer commit on {expected_branch} ahead of {base_branch} ({count}/{ZERO_DIFF_COMPLETION_RECOVERY_THRESHOLD})"
         ));
+        self.maybe_warn_before_zero_diff_recovery(member_name, task_id, count);
         Ok(Some((task_id, count)))
+    }
+
+    /// One strike before the recovery threshold, tell the engineer what the
+    /// next unattributed completion will trigger.
+    fn maybe_warn_before_zero_diff_recovery(
+        &mut self,
+        member_name: &str,
+        task_id: u32,
+        count: u32,
+    ) {
+        let policy = &self.config.team_config.workflow_policy;
+        if !policy.bench_recovery.enabled
+            || !policy.bench_recovery.strike_warning
+            || count != ZERO_DIFF_COMPLETION_RECOVERY_THRESHOLD - 1
+        {
+            return;
+        }
+        let consequence = match policy.zero_diff_recovery {
+            crate::team::config::ZeroDiffRecovery::Park => {
+                "The next one parks you and needs operator review"
+            }
+            crate::team::config::ZeroDiffRecovery::Restart => "The next one restarts your session",
+        };
+        let body = format!(
+            "Task #{task_id}: your completion was recorded without an attributed commit on your task branch. Commit your work on the task branch before reporting completion again. {consequence}."
+        );
+        let _ = self.queue_daemon_message(member_name, &body);
+        self.emit_event(TeamEvent::completion_attribution_warning(
+            member_name,
+            &task_id.to_string(),
+            &format!("strike {count}/{ZERO_DIFF_COMPLETION_RECOVERY_THRESHOLD}"),
+        ));
+        self.record_orchestrator_action(format!(
+            "quality: warned {member_name} on task #{task_id} ({count}/{ZERO_DIFF_COMPLETION_RECOVERY_THRESHOLD}) before attribution recovery"
+        ));
     }
 
     pub(in super::super) fn maybe_recover_zero_diff_completion_loop(
