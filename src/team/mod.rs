@@ -41,6 +41,7 @@ pub mod context_management;
 pub mod cost;
 pub mod daemon;
 mod daemon_mgmt;
+pub mod decide;
 pub mod delivery;
 pub mod deps;
 pub mod discord;
