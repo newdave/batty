@@ -105,7 +105,7 @@ workflow_policy:
     strike_warning: true
     effort_ladder:
       claude: [low, medium, high, xhigh, max]
-      codex: [minimal, low, medium, high, xhigh]
+      codex: [minimal, low, medium, high, xhigh, max]
 ```
 
 ### Success Criteria
@@ -369,9 +369,11 @@ docs/config-reference.md, docs/reference/agent-efficiency.md, docs/migrating-to-
 // GOTCHA: archived reset branches must not be picked up by task_branch_candidates
 //   (completion_checks.rs:285-321) as recovery branches. Use the preserved/* archive helpers,
 //   whose names do not match the /<id> suffix.
-// GOTCHA: there is no effort ladder in the code. The defaults below follow the documented
-//   values; verify with `claude --help` (--effort) and Codex `model_reasoning_effort` docs, and
-//   keep them configurable.
+// GOTCHA: there is no effort ladder in the code; the defaults are configurable. Verified
+//   2026-11-07: Claude Code 2.1.302 `--effort` accepts low, medium, high, xhigh, max. The Codex
+//   API (codex-cli 0.166.0) accepts none, minimal, low, medium, high, xhigh, max for
+//   model_reasoning_effort; `none` is left off the ladder because it turns reasoning off.
+//   Support can vary by model.
 ```
 
 ## Implementation Blueprint
@@ -412,7 +414,7 @@ pub struct BenchRecoveryConfig {
     pub wrong_branch_rescue: bool,            // true
     pub strike_warning: bool,                 // true
     pub effort_ladder: EffortLadders,         // claude: [low, medium, high, xhigh, max]
-                                              // codex:  [minimal, low, medium, high, xhigh]
+                                              // codex:  [minimal, low, medium, high, xhigh, max]
 }
 // WorkflowPolicy gains: #[serde(default)] pub bench_recovery: BenchRecoveryConfig
 

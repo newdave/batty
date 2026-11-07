@@ -103,7 +103,7 @@ Scenario: Defaults
   Then workflow_policy.bench_recovery has enabled: true, cooloff_secs: 1800, max_auto_resets: 2,
     auto_approve_when_all_benched: true, wrong_branch_rescue: true, strike_warning: true
   And effort_ladder.claude == [low, medium, high, xhigh, max]
-  And effort_ladder.codex == [minimal, low, medium, high, xhigh]
+  And effort_ladder.codex == [minimal, low, medium, high, xhigh, max]
 
 Scenario: Partial override
   Given bench_recovery: { cooloff_secs: 60 }

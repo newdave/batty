@@ -290,7 +290,7 @@ benched itself (zero-diff `park`); `batty bench` entries are never touched:
   Default: `true`
 - `effort_ladder.claude` / `effort_ladder.codex`: the effort steps a reset task
   climbs, one per reset. Defaults: `[low, medium, high, xhigh, max]` and
-  `[minimal, low, medium, high, xhigh]`
+  `[minimal, low, medium, high, xhigh, max]`
 
 The bar for approving or handing on benched work is commits ahead of trunk, at
 least one commit by the engineer (daemon `[batty]` auto-saves do not count), and a
