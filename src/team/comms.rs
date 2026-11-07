@@ -224,9 +224,26 @@ impl TelegramChannel {
             } else {
                 provider_send_args(&self.target, message).to_vec()
             };
-            std::process::Command::new(&self.provider)
-                .args(args)
-                .output()
+            // On Linux, exec fails with ETXTBSY while another process still
+            // holds the executable open for writing (for example a provider
+            // script that was just written, inherited by a concurrent fork).
+            // The window is brief, so retry a few times before giving up.
+            let mut attempt = 0;
+            loop {
+                let result = std::process::Command::new(&self.provider)
+                    .args(&args)
+                    .output();
+                match result {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempt < 5 =>
+                    {
+                        attempt += 1;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    other => break other,
+                }
+            }
         };
 
         let now = unix_now_secs();
