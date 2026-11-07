@@ -85,6 +85,7 @@ pub(crate) mod process_tree;
 pub mod prompt_compose;
 pub mod quality_metrics;
 pub mod reload;
+pub mod repair;
 pub mod resolver;
 pub mod retrospective;
 pub mod retry;

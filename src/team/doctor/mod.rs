@@ -14,6 +14,7 @@ pub(super) mod cleanup;
 mod integration_checks;
 mod shim_checks;
 mod util;
+pub(crate) use util::prompt_yes_no;
 
 use checks::{
     build_board_dependency_graph, build_board_git_checks, build_performance_checks,
@@ -26,7 +27,7 @@ use integration_checks::build_integration_checks;
 use shim_checks::build_shim_checks;
 use util::{
     file_size, launch_state_path, load_daemon_state, load_launch_state, load_team_config,
-    prompt_yes_no, short_prompt_hash,
+    short_prompt_hash,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -49,6 +49,11 @@ pub fn dispatch(root: &Path, command: Command) -> Result<()> {
         )?,
         Command::Bench { engineer, reason } => lifecycle::run_bench(root, engineer, reason)?,
         Command::Unbench { engineer } => lifecycle::run_unbench(root, engineer)?,
+        Command::Repair {
+            member,
+            dry_run,
+            yes,
+        } => lifecycle::run_repair(root, member, dry_run, yes)?,
         Command::OpenClaw { command } => integrations::run_open_claw(root, command)?,
         Command::Project { command } => project::run_project(command)?,
         Command::Watchdog {

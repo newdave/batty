@@ -260,6 +260,15 @@ pub(super) fn run_unbench(root: &Path, engineer: String) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn run_repair(
+    root: &Path,
+    member: Option<String>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    team::repair::run(root, member.as_deref(), dry_run, yes)
+}
+
 pub(super) fn run_validate(root: &Path, show_checks: bool) -> Result<()> {
     team::validate_team(root, show_checks)?;
     Ok(())
