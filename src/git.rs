@@ -1214,43 +1214,48 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timeout_keeps_index_lock_written_by_a_concurrent_process() {
-        let tmp = repo_with_pre_commit("sleep 30");
+        let tmp = repo_with_pre_commit("touch .git/hook-ready; sleep 30");
         let lock = tmp.path().join(".git/index.lock");
+        let ready = tmp.path().join(".git/hook-ready");
         // A separate process (not in git's group) takes the lock during the
         // run and keeps writing to it, like a live editor integration. The
-        // 2s timeout leaves room for that process to start under load; with
-        // 800ms it sometimes had not created the lock before the timeout.
+        // writer waits until Git reaches its hook, after releasing its own
+        // index lock. A fixed startup sleep races Git under concurrent load.
+        // The timeout leaves room for the hook and writer to start.
         let mut other = Command::new("sh")
             .arg("-c")
             .arg(format!(
-                "sleep 0.2; while :; do echo x >> '{}'; sleep 0.05; done",
+                "while [ ! -e '{}' ]; do sleep 0.01; done; while :; do echo x >> '{}'; sleep 0.05; done",
+                ready.display(),
                 lock.display()
             ))
             .spawn()
             .unwrap();
         let error = cmd(tmp.path())
             .args(["commit", "-q", "--allow-empty", "-m", "x"])
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
             .run()
             .unwrap_err();
+        let hook_started = ready.exists();
         let kept = lock.exists();
         let _ = other.kill();
         let _ = other.wait();
         assert!(matches!(error, GitError::Timeout { .. }), "{error:?}");
+        assert!(hook_started, "Git did not reach the pre-commit hook");
         assert!(kept, "another process's index.lock was removed");
     }
 
     #[cfg(unix)]
     #[test]
     fn timed_out_fetch_never_touches_index_lock() {
+        assert!(!writes_index(Some("fetch")));
         let tmp = init_repo();
         let lock = tmp.path().join(".git/index.lock");
+        // The lock belongs to another process before fetch starts; its
+        // preservation must not depend on the remote helper starting in time.
+        std::fs::write(&lock, "external lock\n").unwrap();
         let script = tmp.path().join("fake-remote.sh");
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", lock.display()),
-        )
-        .unwrap();
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let remote = format!("ext::{}", script.display());
