@@ -623,8 +623,15 @@ pub(super) fn write_launch_script(
         _ => work_dir.to_path_buf(),
     };
     if sdk_mode && matches!(agent_name, "codex" | "codex-cli") {
+        // Restart handoffs replace the launch prompt, but fresh SDK threads
+        // still need the composed role instructions as well as the handoff.
+        let sdk_role_context = match role_context.filter(|role| !role.is_empty() && *role != prompt)
+        {
+            Some(role) => format!("{role}\n\nBatty launch context:\n{prompt}"),
+            None => prompt.to_string(),
+        };
         crate::shim::codex_session::LaunchContext {
-            role_context: prompt.to_string(),
+            role_context: sdk_role_context,
             resume_session_id: resume.then(|| session_id.map(str::to_string)).flatten(),
         }
         .save(work_dir, member_name)?;
@@ -1293,6 +1300,76 @@ mod tests {
         assert!(content.contains("\"$real_kanban\" --dir \"$board_dir\" \"$@\""));
         assert!(content.contains("activity annotate-status"));
         assert!(!content.contains("\"$@\" --dir"));
+    }
+
+    #[test]
+    fn codex_superpowers_reaches_interactive_and_sdk_launch_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = crate::team::team_config_dir(tmp.path());
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("engineer.md"), "Work on {{member_name}}").unwrap();
+        let member = MemberInstance {
+            name: "superpowers-worker".into(),
+            role_name: "engineer".into(),
+            role_type: RoleType::Engineer,
+            agent: Some("codex".into()),
+            model: None,
+            prompt: None,
+            posture: None,
+            model_class: None,
+            provider_overlay: None,
+            reports_to: None,
+            use_worktrees: true,
+        };
+        let prompt = crate::team::prompt_compose::render_member_prompt(
+            &member,
+            &config_dir,
+            &crate::team::prompt_compose::resolve_prompt_context(&member),
+        );
+        for (sdk_mode, handoff) in [(false, false), (true, false), (true, true)] {
+            let launch_prompt = if handoff {
+                "Continue Task #7 from the saved handoff"
+            } else {
+                &prompt
+            };
+            write_launch_script(
+                &member.name,
+                "codex",
+                None,
+                &default_claude_auth(),
+                launch_prompt,
+                Some(&prompt),
+                tmp.path(),
+                tmp.path(),
+                true,
+                false,
+                None,
+                sdk_mode,
+            )
+            .unwrap();
+            let agents = std::fs::read_to_string(
+                tmp.path()
+                    .join(".batty/codex-context/superpowers-worker/AGENTS.md"),
+            )
+            .unwrap();
+            assert!(agents.contains("superpowers:using-superpowers"));
+            if sdk_mode {
+                let context =
+                    crate::shim::codex_session::LaunchContext::load(tmp.path(), &member.name)
+                        .unwrap();
+                assert!(
+                    context
+                        .prompt(true, "Implement task")
+                        .contains("superpowers:using-superpowers")
+                );
+                assert!(context.role_context.contains(launch_prompt));
+                assert_eq!(
+                    context.role_context.matches("## Provider: Codex").count(),
+                    1
+                );
+                assert_eq!(context.prompt(false, "Continue task"), "Continue task");
+            }
+        }
     }
 
     #[test]

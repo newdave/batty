@@ -44,6 +44,31 @@ escalation should be bounded and tied to a demonstrated reasoning gap.
 
 ## Session and execution behaviour
 
+Batty's Codex provider prompt requests the installed Superpowers skills, starting
+with `superpowers:using-superpowers`. Agents load relevant skills on demand for
+debugging, tests, and verification; Batty does not copy entire skill bodies into
+every assignment. Both `codex` and `codex-cli` use this guidance through the default
+Codex provider overlay, for interactive launch context and SDK role context.
+An explicitly configured provider overlay takes precedence.
+
+The same overlay requests installed Caveman skills: `caveman` for terse replies,
+`caveman-explore` for broad repository discovery, `caveman-review` for review
+comments, and `caveman-commit` when drafting commit messages. Agents preserve
+technical payloads and completion evidence, use normal prose in persisted
+artifacts, and respect explicit style overrides. File compression and sending
+repository content to another provider require explicit authorisation.
+
+Superpowers and Caveman must already be available to the Codex process. If unavailable, the
+agent is instructed to report that once and continue with repository rules and
+verification. Batty does not install plugins or modify global configuration.
+Batty retains ownership of dispatch, worktrees, and merges; Superpowers does not
+replace the queue or establish that queue-related change loss is fixed.
+
+The guidance applies on the next launch with newly rendered role context.
+Fresh SDK sessions preserve both role instructions and any restart handoff.
+Existing SDK threads retain their earlier instructions until a fresh session;
+resumed SDK turns do not resend the role context.
+
 Codex SDK mode uses `codex exec --json` and resumes only an explicitly recorded
 provider thread ID. A new member has no thread ID until the provider reports
 `thread.started`; Batty does not invent an ID or select `--last`. The first turn
