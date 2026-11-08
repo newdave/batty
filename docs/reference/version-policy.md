@@ -31,6 +31,9 @@ only read repository contents and write commit statuses. It publishes the
 `Version Policy` status on the PR head; a PR cannot replace its own enforcement
 script. Label changes trigger a fresh check.
 
+Commit messages containing `[skip ci]` can skip ordinary PR tests but cannot
+skip this trusted-base enforcement workflow. The version status remains required.
+
 Main must require the `Version Policy` status and up-to-date branches. This
 turns a failing check into a merge block. The first installation of this trusted
 workflow needs a reviewed bootstrap merge; subsequent PRs use main's policy.
