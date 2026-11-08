@@ -942,7 +942,7 @@ pub fn ensure_worktree_branch_for_dispatch_from_trunk(
     // the destructive `checkout -B expected_branch <start_ref>` below.
     // A failed archive must abort the reset: rewriting the branch without a
     // saved copy would drop its unmerged commits.
-    archive_branch_if_commits_ahead(
+    let preserved = archive_branch_if_commits_ahead(
         worktree_path,
         expected_branch,
         selection.ref_name.as_str(),
@@ -955,6 +955,25 @@ pub fn ensure_worktree_branch_for_dispatch_from_trunk(
             worktree_path.display()
         )
     })?;
+    // An existing branch ahead of trunk is a continuation, not a fresh task.
+    // Keep the archived safety copy, and resume its original commits in place.
+    if preserved.is_some() {
+        let checkout = run_git(worktree_path, ["checkout", expected_branch])?;
+        if !checkout.status.success() {
+            bail!(
+                "failed to resume '{}': {}",
+                expected_branch,
+                String::from_utf8_lossy(&checkout.stderr).trim()
+            );
+        }
+        return Ok(DispatchBranchReset {
+            changed: true,
+            start_ref: expected_branch.to_string(),
+            fallback_reason: selection.fallback_reason,
+            reset_reason: Some(reason),
+        });
+    }
+
     ops::log_mutation_audit(
         worktree_path,
         "dispatch/branch-reset",
@@ -2345,6 +2364,10 @@ mod tests {
         let reset = ensure_worktree_branch_for_dispatch(&wt_path, "eng-1-1-659").unwrap();
         assert!(reset.changed);
         assert_eq!(git_current_branch(&wt_path).unwrap(), "eng-1-1-659");
+        assert!(
+            wt_path.join("expected.txt").exists(),
+            "resumed task must keep its prior work"
+        );
 
         let preserved = preserved_branches_for(tmp.path(), "eng-1-1-659");
         assert!(
