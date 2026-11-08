@@ -87,7 +87,8 @@ jobs:
           elif [ "$RUNNER_OS" = "macOS" ]; then
             ARCH="darwin_arm64"
           fi
-          curl -sL "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_${ARCH}.tar.gz" | sudo tar xz -C /usr/local/bin kanban-md
+          curl --fail --show-error --location --retry 5 --retry-all-errors --output "$RUNNER_TEMP/kanban-md.tar.gz" "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_${ARCH}.tar.gz"
+          sudo tar xzf "$RUNNER_TEMP/kanban-md.tar.gz" -C /usr/local/bin kanban-md
         shell: bash
 
       - name: Configure git identity and default branch
@@ -167,7 +168,8 @@ jobs:
       - name: Install kanban-md
         run: |
           KMD_VERSION="0.32.2"
-          curl -sL "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_linux_amd64.tar.gz" | sudo tar xz -C /usr/local/bin kanban-md
+          curl --fail --show-error --location --retry 5 --retry-all-errors --output "$RUNNER_TEMP/kanban-md.tar.gz" "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_linux_amd64.tar.gz"
+          sudo tar xzf "$RUNNER_TEMP/kanban-md.tar.gz" -C /usr/local/bin kanban-md
         shell: bash
 
       - name: Run fuzz targets with expanded case budget
@@ -235,7 +237,8 @@ jobs:
       - name: Install kanban-md
         run: |
           KMD_VERSION="0.32.2"
-          curl -sL "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_linux_amd64.tar.gz" | sudo tar xz -C /usr/local/bin kanban-md
+          curl --fail --show-error --location --retry 5 --retry-all-errors --output "$RUNNER_TEMP/kanban-md.tar.gz" "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_linux_amd64.tar.gz"
+          sudo tar xzf "$RUNNER_TEMP/kanban-md.tar.gz" -C /usr/local/bin kanban-md
         shell: bash
 
       - name: Configure git identity and default branch
@@ -284,7 +287,8 @@ jobs:
           elif [ "$RUNNER_OS" = "macOS" ]; then
             ARCH="darwin_arm64"
           fi
-          curl -sL "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_${ARCH}.tar.gz" | sudo tar xz -C /usr/local/bin kanban-md
+          curl --fail --show-error --location --retry 5 --retry-all-errors --output "$RUNNER_TEMP/kanban-md.tar.gz" "https://github.com/antopolskiy/kanban-md/releases/download/v${KMD_VERSION}/kanban-md_${KMD_VERSION}_${ARCH}.tar.gz"
+          sudo tar xzf "$RUNNER_TEMP/kanban-md.tar.gz" -C /usr/local/bin kanban-md
         shell: bash
 
       - name: Configure git identity and default branch
