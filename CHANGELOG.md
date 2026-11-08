@@ -2,6 +2,21 @@
 
 All notable changes to Batty are documented here.
 
+## 0.12.1 — 2026-11-09
+
+### Added
+
+- Codex agents receive compact Superpowers and Caveman guidance while Batty
+  retains dispatch, worktree, and merge ownership.
+- Pull requests enforce matching Cargo versions, release notes, and a patch bump
+  by default. Use `semver:minor` or `semver:major` for larger changes. Release
+  builds reject tags that do not match the package version and changelog.
+
+### Fixed
+
+- Fresh Codex SDK restart handoffs retain composed role instructions alongside
+  handoff text without duplicating identical prompts.
+
 ## 0.12.0 — Unreleased (2026-10-27)
 
 See [docs/migrating-to-0.12.md](docs/migrating-to-0.12.md) for upgrade steps.
