@@ -12,7 +12,7 @@ const MODEL_CLASS_STANDARD: &str = include_str!("templates/model_classes/standar
 const MODEL_CLASS_FAST: &str = include_str!("templates/model_classes/fast.md");
 
 const PROVIDER_CLAUDE: &str = "## Provider: Claude\n- Prefer explicit delegation and clear acceptance criteria when coordinating work\n- Use larger synthesis passes when the full local context is available\n";
-const PROVIDER_CODEX: &str = "## Provider: Codex\n- Work in explicit implementation steps with concrete verification after each meaningful change\n- Prefer reading the directly relevant files before editing and keep progress updates factual\n";
+const PROVIDER_CODEX: &str = include_str!("templates/providers/codex.md");
 const PROVIDER_GEMINI: &str = "## Provider: Gemini\n- Keep tool use disciplined and summarize conclusions before moving to the next step\n- When a task depends on uncertain code paths, verify them directly instead of assuming\n";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -184,6 +184,28 @@ mod tests {
         assert!(prompt.contains("## Posture: Deep Worker"));
         assert!(prompt.contains("## Model Class: Standard"));
         assert!(prompt.contains("## Provider: Codex"));
+    }
+
+    #[test]
+    fn codex_prompt_requests_superpowers_without_copying_skill_bodies() {
+        for backend in ["codex", "codex-cli"] {
+            let provider = infer_provider_overlay(Some(backend)).unwrap();
+            let prompt = compose_prompt("Assigned role", None, None, Some(&provider));
+            assert!(prompt.contains("superpowers:using-superpowers"));
+            assert!(prompt.contains("superpowers:systematic-debugging"));
+            assert!(prompt.contains("superpowers:verification-before-completion"));
+            assert!(prompt.contains("Batty owns task dispatch, worktrees, and merges"));
+            assert!(prompt.contains("unavailable"));
+            assert!(prompt.len() < 1600, "Keep the provider guidance compact");
+        }
+    }
+
+    #[test]
+    fn superpowers_guidance_is_codex_only() {
+        for provider in [None, Some("claude"), Some("gemini")] {
+            let prompt = compose_prompt("Assigned role", None, None, provider);
+            assert!(!prompt.contains("superpowers:"));
+        }
     }
 
     #[test]
