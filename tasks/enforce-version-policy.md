@@ -1,6 +1,6 @@
 ---
 title: Enforce version bumps before code merges and validate release tags
-status: in-progress
+status: done
 priority: high
 ---
 
@@ -32,5 +32,25 @@ workflow and failing-then-passing heading regressions address those findings.
 
 Local validation: 12 policy tests and 4,523 Rust tests pass, with 154 ignored.
 `make lint`, `actionlint` on both changed workflows, and independent final review
-pass. Live status reporting, required-check enforcement, and the installed 0.12.1
-binary remain rollout checks.
+pass.
+
+Live rollout evidence:
+
+- PR #29 merged the implementation and version bump as `6af79f52`.
+- Probe commit `5820c024` replaced its own checker with an always-success script
+  without bumping 0.12.1. Trusted enforcement rejected it: "patch bump from
+  0.12.1 requires 0.12.2, got 0.12.1". GitHub run `42535397273` recorded the
+  failure; main's protection then reported this candidate as BLOCKED.
+- Probe commit `2673612b` restored the real checker and retained only a docs
+  change. GitHub run `42535684126` reported Version Policy success. Both probe
+  commits used `[skip ci]`; trusted enforcement still ran.
+- Main now requires the Version Policy status and up-to-date branches, including
+  administrators. PRs are required with zero mandatory human approvals. Main had
+  no pre-existing branch protection to replace.
+- The semver:patch, semver:minor, and semver:major labels were created.
+- The committed, verified release was built and installed on this laptop.
+  `~/.cargo/bin/batty --version` reports 0.12.1 and macOS signature verification
+  passes. The prior binary is backed up in `.batty/install-backups/`.
+
+No release tag was created and no package was published. Unrelated root-checkout
+repairs remain untouched; no live daemon recovery is claimed.
