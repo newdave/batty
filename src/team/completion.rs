@@ -282,6 +282,10 @@ fn resolve_worktree_path(project_root: &Path, packet: &CompletionPacket) -> Resu
 }
 
 fn extract_packet_text(text: &str) -> Option<&str> {
+    let section = text
+        .find("## Completion Packet")
+        .map(|idx| &text[idx + "## Completion Packet".len()..]);
+    let text = section.unwrap_or(text);
     if let Some(start) = text.find("```") {
         let after_fence = &text[start + 3..];
         let inner_start = after_fence.find('\n').map(|i| i + 1).unwrap_or(0);
@@ -291,10 +295,7 @@ fn extract_packet_text(text: &str) -> Option<&str> {
         }
     }
 
-    text.find("## Completion Packet")
-        .map(|idx| &text[idx + "## Completion Packet".len()..])
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
+    section.map(str::trim).filter(|content| !content.is_empty())
 }
 
 fn find_task_path(project_root: &Path, task_id: u32) -> Result<PathBuf> {

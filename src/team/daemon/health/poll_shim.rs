@@ -2011,6 +2011,173 @@ mod tests {
     }
 
     #[test]
+    fn only_ready_packet_completes_in_progress_task() {
+        for (response, ready) in [
+            (
+                "Tests passed.\n```sh\ncargo test\n```\n## Completion Packet\n```json\n{\"task_id\":42,\"branch\":\"eng-1\",\"commit\":\"abc1234\",\"tests_run\":true,\"tests_passed\":true,\"outcome\":\"ready_for_review\"}\n```",
+                true,
+            ),
+            (
+                "Blocked on exclusive ownership. Need a manager decision.",
+                false,
+            ),
+            ("Acknowledged. Continuing work.", false),
+            (
+                r#"{"task_id":42,"branch":"eng-1","commit":"abc1234","tests_run":true,"tests_passed":true,"outcome":"ready_for_review"}"#,
+                true,
+            ),
+            (
+                r#"{"task_id":43,"branch":"eng-1","commit":"abc1234","tests_run":true,"tests_passed":true,"outcome":"ready_for_review"}"#,
+                false,
+            ),
+            (
+                r#"{"task_id":42,"branch":"eng-1","commit":"abc1234","tests_run":true,"tests_passed":false,"outcome":"blocked"}"#,
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = crate::team::test_support::init_git_repo(&tmp, "completion-intent");
+            let config = repo.join(".batty/team_config");
+            let tasks = config.join("board/tasks");
+            std::fs::create_dir_all(&tasks).unwrap();
+            std::fs::write(tasks.join("042-task.md"),
+                "---\nid: 42\ntitle: Task\nstatus: in-progress\npriority: high\nclaimed_by: eng-1\n---\nTask\n").unwrap();
+            crate::team::task_loop::setup_engineer_worktree(
+                &repo,
+                &repo.join(".batty/worktrees/eng-1"),
+                "eng-1",
+                &config,
+            )
+            .unwrap();
+            let mut daemon = TestDaemonBuilder::new(&repo)
+                .members(vec![engineer_member("eng-1", Some("manager"), true)])
+                .build();
+            daemon
+                .config
+                .team_config
+                .workflow_policy
+                .verification
+                .test_command = Some("true".into());
+            let _child = insert_mock_handle(&mut daemon, "eng-1");
+            daemon.set_active_task_for_test("eng-1", 42);
+            daemon
+                .handle_shim_event(
+                    "eng-1",
+                    Event::Completion {
+                        message_id: None,
+                        response: response.into(),
+                        last_lines: String::new(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                daemon
+                    .verification
+                    .background_tests
+                    .verification
+                    .contains_key("eng-1"),
+                ready,
+                "unexpected verification for {response}"
+            );
+            assert_eq!(daemon.active_task_id("eng-1"), Some(42));
+        }
+    }
+
+    #[test]
+    fn missing_completion_packet_gets_one_protocol_reminder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks = tmp.path().join(".batty/team_config/board/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("042-task.md"),
+            "---\nid: 42\ntitle: Task\nstatus: in-progress\npriority: high\nclaimed_by: eng-1\n---\nTask\n").unwrap();
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![engineer_member("eng-1", Some("manager"), true)])
+            .build();
+        let _child = insert_mock_handle(&mut daemon, "eng-1");
+        daemon.set_active_task_for_test("eng-1", 42);
+        for _ in 0..2 {
+            daemon
+                .handle_shim_event(
+                    "eng-1",
+                    Event::Completion {
+                        message_id: None,
+                        response: "Need an ownership decision.".into(),
+                        last_lines: String::new(),
+                    },
+                )
+                .unwrap();
+        }
+        let handle = &daemon.shim_handles["eng-1"];
+        assert_eq!(handle.in_flight_messages.len(), 1);
+        assert!(
+            handle.in_flight_messages[0]
+                .body
+                .contains("ready_for_review")
+        );
+        assert!(handle.in_flight_messages[0].body.contains("blocked"));
+        assert!(daemon.verification.background_tests.verification.is_empty());
+    }
+
+    #[test]
+    fn queued_architect_turn_still_applies_planning_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![architect_member("architect")])
+            .build();
+        let _child = insert_mock_handle(&mut daemon, "architect");
+        daemon.scheduler.planning_cycle_active = true;
+        let handle = daemon.shim_handles.get_mut("architect").unwrap();
+        handle
+            .send_message_with_id("manager", "plan", Some("m1".into()))
+            .unwrap();
+        handle
+            .send_message_with_id("manager", "next", Some("m2".into()))
+            .unwrap();
+        daemon
+            .handle_shim_event(
+                "architect",
+                Event::Completion {
+                    message_id: Some("m1".into()),
+                    response: String::new(),
+                    last_lines: String::new(),
+                },
+            )
+            .unwrap();
+        assert!(!daemon.scheduler.planning_cycle_active);
+        assert_eq!(daemon.states.get("architect"), Some(&MemberState::Working));
+    }
+
+    #[test]
+    fn queued_turn_does_not_complete_active_task_or_mark_engineer_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut daemon = TestDaemonBuilder::new(tmp.path())
+            .members(vec![engineer_member("eng-1", Some("manager"), true)])
+            .build();
+        let _child = insert_mock_handle(&mut daemon, "eng-1");
+        daemon.set_active_task_for_test("eng-1", 42);
+        let handle = daemon.shim_handles.get_mut("eng-1").unwrap();
+        handle
+            .send_message_with_id("manager", "task", Some("m1".into()))
+            .unwrap();
+        handle
+            .send_message_with_id("manager", "continue", Some("m2".into()))
+            .unwrap();
+        let result = daemon.handle_shim_event(
+            "eng-1",
+            Event::Completion {
+                message_id: Some("m1".into()),
+                response: "Continuing with the queued instructions.".into(),
+                last_lines: String::new(),
+            },
+        );
+        assert_eq!(daemon.states.get("eng-1"), Some(&MemberState::Working));
+        assert!(daemon.shim_handles["eng-1"].is_working());
+        assert_eq!(daemon.shim_handles["eng-1"].in_flight_messages.len(), 1);
+        assert!(daemon.verification.background_tests.verification.is_empty());
+        result.unwrap();
+    }
+
+    #[test]
     fn handle_shim_event_died_marks_dead() {
         let tmp = tempfile::tempdir().unwrap();
         let mut daemon = TestDaemonBuilder::new(tmp.path()).build();

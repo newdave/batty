@@ -278,6 +278,101 @@ fn parked_completion_proceeds_once_the_completion_timeout_passes() {
 }
 
 #[test]
+fn parked_completion_discards_board_only_block_or_reassignment() {
+    for (status, owner) in [("blocked", "eng-1"), ("in-progress", "eng-2")] {
+        let _key = EnvVarGuard::set("BATTY_TEST_VETO_AUTHORITY", KEY);
+        let (endpoint, _rx, server) = serve_once(
+            "HTTP/1.1 200 OK",
+            completion_reply(0.1, 0.95),
+            Duration::from_millis(500),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, mut daemon) = passing_completion(&tmp, &endpoint, "BATTY_TEST_VETO_AUTHORITY");
+        daemon
+            .config
+            .team_config
+            .workflow_policy
+            .decisions
+            .timeouts_ms = DecisionTimeouts {
+            completion: 50,
+            ..DecisionTimeouts::default()
+        };
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        poll_verification_jobs(&mut daemon).unwrap();
+        assert_eq!(daemon.verification.background_tests.awaiting_veto.len(), 1);
+        let tasks =
+            crate::task::load_tasks_from_dir(&repo.join(".batty/team_config/board/tasks")).unwrap();
+        let path = &tasks.iter().find(|task| task.id == 42).unwrap().source_path;
+        let original_head = current_head(&repo);
+        let content = std::fs::read_to_string(path)
+            .unwrap()
+            .replace("status: in-progress", &format!("status: {status}"))
+            .replace("claimed_by: eng-1", &format!("claimed_by: {owner}"));
+        std::fs::write(path, content).unwrap();
+        std::thread::sleep(Duration::from_millis(70));
+        poll_verification_jobs(&mut daemon).unwrap();
+        daemon.process_merge_queue_for_test().unwrap();
+        let task = crate::task::Task::from_file(path).unwrap();
+        assert_eq!(task.status, status);
+        assert_eq!(task.claimed_by.as_deref(), Some(owner));
+        assert_eq!(daemon.active_task_id("eng-1"), Some(42));
+        assert_eq!(daemon.retry_count_for_test("eng-1"), None);
+        assert_eq!(current_head(&repo), original_head);
+        assert!(
+            daemon
+                .verification
+                .background_tests
+                .awaiting_veto
+                .is_empty()
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn parked_completion_discards_result_when_a_follow_up_turn_starts() {
+    let _key = EnvVarGuard::set("BATTY_TEST_VETO_FOLLOW_UP", KEY);
+    let (endpoint, _rx, server) = serve_once(
+        "HTTP/1.1 200 OK",
+        completion_reply(0.99, 0.01),
+        Duration::from_millis(300),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, mut daemon) = passing_completion(&tmp, &endpoint, "BATTY_TEST_VETO_FOLLOW_UP");
+    daemon
+        .config
+        .team_config
+        .workflow_policy
+        .decisions
+        .timeouts_ms = DecisionTimeouts {
+        completion: 50,
+        ..DecisionTimeouts::default()
+    };
+    handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+    assert_eq!(daemon.verification.background_tests.awaiting_veto.len(), 1);
+    let original_head = current_head(&repo);
+    let _peer = start_follow_up_turn(&mut daemon);
+
+    wait_for_verification_jobs(&mut daemon).unwrap();
+    daemon.process_merge_queue_for_test().unwrap();
+    server.join().unwrap();
+
+    assert_eq!(daemon.active_task_id("eng-1"), Some(42));
+    assert_eq!(daemon.retry_count_for_test("eng-1"), None);
+    assert_eq!(
+        daemon.member_state_for_test("eng-1"),
+        Some(MemberState::Working)
+    );
+    assert_eq!(current_head(&repo), original_head);
+    let tasks =
+        crate::task::load_tasks_from_dir(&repo.join(".batty/team_config/board/tasks")).unwrap();
+    assert_eq!(
+        tasks.iter().find(|task| task.id == 42).unwrap().status,
+        "in-progress"
+    );
+}
+
+#[test]
 fn heuristic_provider_never_parks_or_vetoes() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, mut daemon) = passing_completion(&tmp, UNUSED, "BATTY_TEST_VETO_HEURISTIC");

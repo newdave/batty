@@ -50,6 +50,29 @@ fn verification_snapshot_path(repo: &Path, task_id: u32, engineer: &str, attempt
         ))
 }
 
+fn start_follow_up_turn(daemon: &mut TeamDaemon) -> crate::shim::protocol::Channel {
+    let (parent, child) = socketpair().unwrap();
+    let mut handle = AgentHandle::new(
+        "eng-1".to_string(),
+        crate::shim::protocol::Channel::new(parent),
+        12345,
+        "codex".to_string(),
+        "codex".to_string(),
+        daemon.worktree_dir("eng-1"),
+    );
+    handle
+        .send_message_with_id(
+            "manager",
+            "Continue the task",
+            Some("follow-up".to_string()),
+        )
+        .unwrap();
+    handle.apply_state_change(ShimState::Working);
+    daemon.shim_handles.insert("eng-1".to_string(), handle);
+    daemon.set_member_state_for_test("eng-1", MemberState::Working);
+    crate::shim::protocol::Channel::new(child)
+}
+
 fn write_task_file(project_root: &Path, id: u32, title: &str) {
     write_task_file_with_body(project_root, id, title, "Task description.\n");
 }

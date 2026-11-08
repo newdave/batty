@@ -577,3 +577,27 @@ fn no_commits_rejection_does_not_retry_and_keeps_task() {
     // Active task kept — engineer still owns it (false-done prevention)
     assert_eq!(daemon.active_task_id("eng-1"), Some(42));
 }
+
+#[test]
+fn completion_ignores_blocked_or_reassigned_tasks_before_verification() {
+    for (status, owner) in [("blocked", "eng-1"), ("in-progress", "eng-2")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(&tmp, "stale-completion");
+        write_task_file(&repo, 42, "stale-completion");
+        let path = repo.join(".batty/team_config/board/tasks/042-stale-completion.md");
+        let content = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("status: in-progress", &format!("status: {status}"))
+            .replace("claimed_by: eng-1", &format!("claimed_by: {owner}"));
+        std::fs::write(&path, content).unwrap();
+        let mut daemon = setup_completion_daemon(&repo, "eng-1");
+        daemon.set_active_task_for_test("eng-1", 42);
+        // No worktree: rejecting stale board authority must precede git inspection.
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        assert!(!daemon.verification.engineers.contains_key("eng-1"));
+        assert_eq!(daemon.retry_count_for_test("eng-1"), None);
+        let task = crate::task::Task::from_file(&path).unwrap();
+        assert_eq!(task.status, status);
+        assert_eq!(task.claimed_by.as_deref(), Some(owner));
+    }
+}

@@ -80,3 +80,11 @@ tests_passed: true
 test_command: pytest
 outcome: ready_for_review
 ```
+
+## Task completion intent
+
+End a successful task turn with the structured completion packet in the final
+response as well as the manager message. Use `outcome: ready_for_review`, the
+current task ID, branch and commit, and truthful passing test evidence. The daemon
+starts verification only for a complete successful packet; ordinary replies and
+blockers do not request task completion.
