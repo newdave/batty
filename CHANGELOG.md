@@ -2,6 +2,31 @@
 
 All notable changes to Batty are documented here.
 
+## 0.12.2 — 2026-11-09
+
+### Fixed
+
+- Agent turn endings require a successful completion packet before starting
+  verification. Blocker replies and acknowledgements retain task ownership.
+- Completion and asynchronous verification respect fresh board status and
+  ownership, including changes during the completion veto wait.
+- Blocked task checkouts survive idle cleanup, and redispatch resumes existing
+  committed work instead of replacing its branch from trunk.
+- Queued engineer turns stay working without triggering concurrent verification;
+  queued architect messages do not discard completed planning responses.
+- A new engineer turn invalidates pending test and veto results even when it
+  starts after verification and has not changed the committed worktree HEAD.
+- Completion packets remain discoverable after earlier command-output fences.
+  Older prompts receive one actionable protocol reminder per task.
+- Git timeout fixtures synchronize concurrent lock creation and preserve an
+  external lock without depending on remote-helper startup timing.
+- CI dependency downloads fail clearly and retry before extracting archives.
+
+### Changed
+
+- Project delivery rules require regression evidence, independent review, and
+  one writer per checkout during final verification.
+
 ## 0.12.1 — 2026-11-09
 
 ### Added
