@@ -1,0 +1,84 @@
+name: Version Policy
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: version-policy-${{ github.event_name }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Version Policy Tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test version policy
+        run: python3 -m unittest discover -s scripts -p test_check_version.py
+
+  version:
+    name: Evaluate Version Policy
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Mark candidate version check pending
+        run: >-
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA"
+          -f state=pending -f context='Version Policy'
+          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      # Execute only trusted base code. Candidate Git objects are read as data;
+      # no candidate script, hook, build, or package installation runs here.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch candidate objects without checking them out
+        run: git fetch --no-tags origin "$HEAD_SHA"
+
+      - name: Check candidate version and release notes with trusted policy
+        id: policy
+        run: python3 scripts/check_version.py --base "$BASE_SHA" --head "$HEAD_SHA" --event "$GITHUB_EVENT_PATH"
+
+      # pull_request_target runs on the base SHA. Publish the required status
+      # explicitly on the candidate SHA, including checkout or setup failures.
+      - name: Report version policy result on candidate
+        if: always() && !cancelled()
+        env:
+          POLICY_STATE: ${{ steps.policy.outcome == 'success' && 'success' || 'failure' }}
+        run: >-
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA"
+          -f state="$POLICY_STATE" -f context='Version Policy'
+          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

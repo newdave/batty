@@ -88,6 +88,13 @@ ureq = { version = "2", features = ["json"] }
 
 ## Building & Installing
 
+Every code or build-input PR must bump the package version before merging or
+installing a changed binary. Keep `Cargo.toml`, `Cargo.lock`, and the matching
+`CHANGELOG.md` section aligned. The Version Policy check defaults to one patch
+increment; use exactly one `semver:minor` or `semver:major` label for a larger
+bump. Documentation-only and test-only PRs may retain the current version.
+Never install changed code under an already-shipped version number.
+
 After building, always re-sign the binary before running from `~/.cargo/bin`:
 
 ```bash
