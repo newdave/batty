@@ -194,6 +194,15 @@ mod tests {
             assert!(prompt.contains("superpowers:using-superpowers"));
             assert!(prompt.contains("superpowers:systematic-debugging"));
             assert!(prompt.contains("superpowers:verification-before-completion"));
+            assert!(prompt.contains("`caveman`"));
+            assert!(prompt.contains("`caveman-explore`"));
+            assert!(prompt.contains("`caveman-review`"));
+            assert!(prompt.contains("`caveman-commit`"));
+            assert!(
+                prompt.contains(
+                    "Do not compress files or send repository content to another provider"
+                )
+            );
             assert!(prompt.contains("Batty owns task dispatch, worktrees, and merges"));
             assert!(prompt.contains("unavailable"));
             assert!(prompt.len() < 1600, "Keep the provider guidance compact");
@@ -205,6 +214,7 @@ mod tests {
         for provider in [None, Some("claude"), Some("gemini")] {
             let prompt = compose_prompt("Assigned role", None, None, provider);
             assert!(!prompt.contains("superpowers:"));
+            assert!(!prompt.contains("caveman"));
         }
     }
 

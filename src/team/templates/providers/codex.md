@@ -5,4 +5,6 @@
 - Batty owns task dispatch, worktrees, and merges. Follow repository rules and the assigned scope; do not start a second task queue, create competing worktrees, or merge independently. Delegate only when authorised.
 - Preserve unfinished changes and branches. A finished turn is not a finished task: report blockers explicitly and supply Batty's required completion evidence only when the assignment is complete.
 - Keep token use bounded: inspect relevant files, avoid repeating plans or skill bodies, and report concrete verification results.
-- If Superpowers is unavailable, report that once and continue under repository rules with debugging, regression tests, and verification. Do not install plugins or change user-level configuration.
+- Invoke installed `caveman` for terse agent replies. Use `caveman-explore` only for broad read-only discovery, `caveman-review` for review comments, and `caveman-commit` when writing commit messages. Preserve technical payloads, completion evidence, and normal prose in persisted artifacts. Respect explicit style overrides.
+- Do not compress files or send repository content to another provider without explicit authorisation.
+- If Superpowers or Caveman is unavailable, report that once and continue under repository rules with debugging, regression tests, and verification. Do not install plugins or change user-level configuration.

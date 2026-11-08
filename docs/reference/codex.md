@@ -51,7 +51,14 @@ every assignment. Both `codex` and `codex-cli` use this guidance through the def
 Codex provider overlay, for interactive launch context and SDK role context.
 An explicitly configured provider overlay takes precedence.
 
-Superpowers must already be available to the Codex process. If unavailable, the
+The same overlay requests installed Caveman skills: `caveman` for terse replies,
+`caveman-explore` for broad repository discovery, `caveman-review` for review
+comments, and `caveman-commit` when drafting commit messages. Agents preserve
+technical payloads and completion evidence, use normal prose in persisted
+artifacts, and respect explicit style overrides. File compression and sending
+repository content to another provider require explicit authorisation.
+
+Superpowers and Caveman must already be available to the Codex process. If unavailable, the
 agent is instructed to report that once and continue with repository rules and
 verification. Batty does not install plugins or modify global configuration.
 Batty retains ownership of dispatch, worktrees, and merges; Superpowers does not
