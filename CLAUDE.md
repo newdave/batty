@@ -126,3 +126,25 @@ Every agent working on this project should continuously self-analyze:
 - Are docs aligned with code? If a feature shipped without docs, write them.
 
 **Never just report a problem — create a board task for it.** Narrating issues without creating actionable tasks is the #1 failure mode.
+
+## Regression Delivery Gate
+
+- For a reported bug, record the observed failure, root cause and introducing or
+  contributing commit when history supports attribution. Distinguish inherited
+  behavior from regressions introduced by the fork.
+- Add a regression that fails before the fix and passes afterward. Test the
+  public event or command path when the failure crosses modules; a helper-only
+  test does not establish that the incident is fixed.
+- For completion, dispatch and reconciliation changes, cover task status and
+  ownership changes before work starts and while asynchronous work runs. Preserve
+  unfinished branches and prove the legitimate success path still works.
+- Before delivery, run focused regressions, `cargo test`, and `make lint`.
+  Investigate failures; an isolated rerun alone does not prove a failure harmless.
+  Run relevant tmux integration tests against a private tmux server.
+- Obtain an independent review of the final diff. Resolve correctness findings
+  before publishing; track deferred issues as actionable tasks.
+- Keep one writer per checkout during final verification. Coordinate concurrent
+  work or validate the intended commits in an isolated worktree. Source changes
+  during a gate invalidate that gate for the changed code.
+- Report local checks, CI, merge state, installed binary and live recovery
+  separately. Do not claim runtime recovery from unit tests alone.
