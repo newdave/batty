@@ -410,13 +410,13 @@ fn apply_verification_result(
     let duration_ms = job.elapsed().as_millis() as u64;
 
     let current_task = daemon.active_task_id(engineer);
-    if current_task != Some(task_id) {
+    if current_task != Some(task_id) || !daemon.completion_claim_is_current(engineer, task_id)? {
         info!(
             engineer,
             task_id,
             current_task = ?current_task,
             duration_ms,
-            "discarding stale verification result: task is no longer active for this engineer"
+            "discarding stale verification result: task ownership or current turn changed"
         );
         return Ok(());
     }

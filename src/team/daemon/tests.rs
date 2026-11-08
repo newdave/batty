@@ -1423,6 +1423,8 @@ fn daemon_lifecycle_happy_path_exercises_decomposed_modules() {
     daemon
         .assign_task_with_task_id(member_name, assignment, Some(42))
         .unwrap();
+    // Dispatch owns the board claim as well as the in-memory assignment.
+    write_owned_task_file(&repo, 42, "lifecycle-task", "in-progress", member_name);
     daemon.active_tasks.insert(member_name.to_string(), 42);
     assert_eq!(daemon.active_task_id(member_name), Some(42));
     assert_eq!(daemon.states.get(member_name), Some(&MemberState::Working));

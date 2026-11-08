@@ -5136,3 +5136,37 @@ fn preserve_blocker_stays_unless_the_task_is_done_and_its_work_is_on_trunk() {
         );
     }
 }
+
+#[test]
+fn reconcile_stale_worktrees_keeps_blocked_task_branch_without_active_claim() {
+    let _path_lock = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(&tmp, "blocked-worktree");
+    let worktree_dir = repo.join(".batty/worktrees/eng-1");
+    let team_config_dir = repo.join(".batty/team_config");
+    setup_engineer_worktree(
+        &repo,
+        &worktree_dir,
+        &engineer_base_branch_name("eng-1"),
+        &team_config_dir,
+    )
+    .unwrap();
+    crate::team::task_loop::checkout_worktree_branch_from_main(&worktree_dir, "eng-1/42").unwrap();
+    std::fs::write(worktree_dir.join("saved.txt"), "unfinished work\n").unwrap();
+    git_ok(&worktree_dir, &["add", "saved.txt"]);
+    git_ok(&worktree_dir, &["commit", "-m", "save unfinished work"]);
+    let tasks = team_config_dir.join("board/tasks");
+    std::fs::create_dir_all(&tasks).unwrap();
+    std::fs::write(tasks.join("042-blocked.md"),
+        "---\nid: 42\ntitle: Blocked task\nstatus: blocked\npriority: high\nbranch: eng-1/42\n---\nWaiting for dependency.\n").unwrap();
+    let mut daemon = TestDaemonBuilder::new(repo.as_path())
+        .members(vec![
+            manager_member("manager", None),
+            engineer_member("eng-1", Some("manager"), true),
+        ])
+        .states(HashMap::from([("eng-1".to_string(), MemberState::Idle)]))
+        .build();
+    daemon.maybe_reconcile_stale_worktrees().unwrap();
+    assert_eq!(current_worktree_branch(&worktree_dir).unwrap(), "eng-1/42");
+    assert!(worktree_dir.join("saved.txt").exists());
+}

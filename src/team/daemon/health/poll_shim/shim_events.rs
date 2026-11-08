@@ -266,16 +266,27 @@ impl TeamDaemon {
             "shim reports completion"
         );
 
-        if let Some(handle) = self.shim_handles.get_mut(member_name) {
-            handle.apply_state_change(ShimState::Idle);
+        let has_queued_turn = if let Some(handle) = self.shim_handles.get_mut(member_name) {
             handle.complete_in_flight_message(message_id.as_deref());
-        }
-        self.states
-            .insert(member_name.to_string(), MemberState::Idle);
-        self.update_automation_timers_for_state(member_name, MemberState::Idle);
+            let pending = !handle.in_flight_messages.is_empty();
+            handle.apply_state_change(if pending {
+                ShimState::Working
+            } else {
+                ShimState::Idle
+            });
+            pending
+        } else {
+            false
+        };
+        let state = if has_queued_turn {
+            MemberState::Working
+        } else {
+            MemberState::Idle
+        };
+        self.states.insert(member_name.to_string(), state);
+        self.update_automation_timers_for_state(member_name, state);
         self.maybe_persist_member_session_id(member_name);
-
-        if self.handle_stalled_mid_turn_completion(member_name, &response)? {
+        if !has_queued_turn && self.handle_stalled_mid_turn_completion(member_name, &response)? {
             return Ok(());
         }
 
@@ -294,6 +305,59 @@ impl TeamDaemon {
                 );
             }
             return Ok(());
+        }
+
+        // Codex starts the queued turn immediately after emitting this event.
+        // Do not verify or recover its checkout while that turn is still editing.
+        if has_queued_turn {
+            return Ok(());
+        }
+
+        // Reconcile board authority before counting a turn as a task completion.
+        if let Some(task_id) = self.active_task_id(member_name) {
+            if !self.completion_claim_is_current(member_name, task_id)? {
+                // Retain terminal-task cleanup; blocked/reassigned tasks are ignored.
+                merge::handle_engineer_completion(self, member_name)?;
+                return Ok(());
+            }
+            // A transport completion ends any turn, including acknowledgements and
+            // blockers. Only an explicit, successful packet requests task verification.
+            let ready = crate::team::completion::parse_completion(&response).is_ok_and(|packet| {
+                packet.task_id == task_id
+                    && packet.outcome == "ready_for_review"
+                    && packet.tests_passed
+                    && crate::team::completion::validate_completion(&packet).is_complete
+            });
+            if !ready {
+                info!(
+                    member = member_name,
+                    task_id, "turn ended without a ready completion packet; retaining task"
+                );
+                let reminder_key = format!("completion_packet_required_{member_name}_{task_id}");
+                if !self
+                    .scheduler
+                    .intervention_cooldowns
+                    .contains_key(&reminder_key)
+                {
+                    let body = format!(
+                        "Task #{task_id} remains assigned; this turn did not request verification. \
+                         When work is complete and required checks pass, end your final response \
+                         with a JSON or YAML completion packet under `## Completion Packet`: \
+                         task_id: {task_id}, branch: <actual branch>, commit: <actual commit>, \
+                         tests_run: true, tests_passed: true, outcome: ready_for_review. \
+                         Also send the packet and test evidence to your manager. \
+                         If blocked or unfinished, do not claim passing checks or emit a ready packet. \
+                         Record a specific blocker with `batty task update {task_id} --blocked-on \
+                         \"<blocker>\"` and `batty task transition {task_id} blocked`, then notify your manager. \
+                         This protocol reminder is sent once per task during this daemon run."
+                    );
+                    self.queue_daemon_message(member_name, &body)?;
+                    self.scheduler
+                        .intervention_cooldowns
+                        .insert(reminder_key, Instant::now());
+                }
+                return Ok(());
+            }
         }
 
         let zero_diff_completion = self.maybe_track_zero_diff_completion(member_name)?;

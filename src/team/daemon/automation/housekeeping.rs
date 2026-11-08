@@ -159,6 +159,14 @@ impl TeamDaemon {
                 continue;
             }
 
+            // Blocking releases the active claim, not the saved task checkout.
+            // Keep it available for continuation until another task is dispatched.
+            if board_tasks.iter().any(|task| {
+                task.status == "blocked" && authoritative_task_branch(&engineer, task) == branch
+            }) {
+                continue;
+            }
+
             let completed_task_for_branch = board_tasks.iter().find(|task| {
                 task.claimed_by.as_deref() == Some(engineer.as_str())
                     && task.status == "done"

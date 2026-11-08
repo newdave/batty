@@ -481,52 +481,32 @@ fn verification_max_iterations_blocks_task_and_escalates_manager() {
 }
 
 #[test]
-fn verification_escalation_on_backlog_task_clears_state_and_does_not_repeat() {
+fn backlog_task_never_starts_verification_or_consumes_retries() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = init_git_repo(&tmp, "batty-merge-test");
     write_task_file(&repo, 42, "backlog-loop");
     set_task_status(&repo, "042-backlog-loop.md", "in-progress", "backlog");
-    let team_config_dir = repo.join(".batty").join("team_config");
-    let worktree_dir = repo.join(".batty").join("worktrees").join("eng-1");
-    setup_engineer_worktree(&repo, &worktree_dir, "eng-1", &team_config_dir).unwrap();
-    std::fs::remove_file(worktree_dir.join("Cargo.toml")).unwrap();
-
     let mut daemon = setup_completion_daemon(&repo, "eng-1");
-    daemon
-        .config
-        .team_config
-        .workflow_policy
-        .verification
-        .max_iterations = 1;
-    let escalations = |dir: &Path| {
-        read_events(&dir.join("events.jsonl"))
-            .unwrap()
-            .iter()
-            .filter(|e| e.event == "verification_max_iterations_reached")
-            .count()
-    };
-    let mut first_escalation_at = None;
-    for attempt in 0..4 {
-        daemon.set_active_task_for_test("eng-1", 42);
-        daemon.set_member_state_for_test("eng-1", MemberState::Working);
+    daemon.set_active_task_for_test("eng-1", 42);
+    for _ in 0..4 {
         handle_engineer_completion_and_wait(&mut daemon, "eng-1").unwrap();
-        if first_escalation_at.is_none() && escalations(&team_config_dir) > 0 {
-            first_escalation_at = Some(attempt);
-            break;
-        }
+        assert!(daemon.verification.background_tests.verification.is_empty());
+        assert_eq!(daemon.retry_count_for_test("eng-1"), None);
+        assert!(!daemon.verification.engineers.contains_key("eng-1"));
     }
-
+    assert_eq!(daemon.active_task_id("eng-1"), Some(42));
+    let task = crate::task::Task::from_file(
+        &repo.join(".batty/team_config/board/tasks/042-backlog-loop.md"),
+    )
+    .unwrap();
+    assert_eq!(task.status, "backlog");
+    assert_eq!(task.claimed_by.as_deref(), Some("eng-1"));
+    assert!(!verification_snapshot_path(&repo, 42, "eng-1", 1).exists());
     assert!(
-        first_escalation_at.is_some(),
-        "verification never escalated"
+        inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1")
+            .unwrap()
+            .is_empty()
     );
-    assert_eq!(escalations(&team_config_dir), 1);
-    assert!(!daemon.verification.engineers.contains_key("eng-1"));
-    // Backlog -> blocked is illegal; escalation must route via todo.
-    let task =
-        crate::task::Task::from_file(&team_config_dir.join("board/tasks/042-backlog-loop.md"))
-            .unwrap();
-    assert_eq!(task.status, "blocked");
 }
 
 #[test]
@@ -789,4 +769,72 @@ fn stopping_background_tests_kills_the_command_and_re_runs_it_after_restart() {
     wait_for_verification_jobs(&mut daemon).unwrap();
     assert!(marker.exists());
     assert!(verification_snapshot_path(&repo, 42, "eng-1", 1).exists());
+}
+
+#[test]
+fn async_verification_discards_board_only_block_or_reassignment() {
+    for (status, owner) in [("blocked", "eng-1"), ("in-progress", "eng-2")] {
+        let gate_dir = tempfile::tempdir().unwrap();
+        let gate = gate_dir.path().join("open");
+        let (_tmp, repo, mut daemon) = setup_background_verification(&format!(
+            "while [ ! -f '{}' ]; do sleep 0.05; done; exit 1",
+            gate.display()
+        ));
+        handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+        let path = repo.join(".batty/team_config/board/tasks/042-background-verification.md");
+        let content = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("status: in-progress", &format!("status: {status}"))
+            .replace("claimed_by: eng-1", &format!("claimed_by: {owner}"));
+        std::fs::write(&path, content).unwrap();
+        std::fs::write(&gate, "").unwrap();
+        wait_for_verification_jobs(&mut daemon).unwrap();
+        assert!(!verification_snapshot_path(&repo, 42, "eng-1", 1).exists());
+        assert_eq!(daemon.retry_count_for_test("eng-1"), None);
+        let task = crate::task::Task::from_file(&path).unwrap();
+        assert_eq!(task.status, status);
+        assert_eq!(task.claimed_by.as_deref(), Some(owner));
+        assert!(
+            inbox::pending_messages(&inbox::inboxes_root(&repo), "eng-1")
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn async_verification_discards_result_when_a_follow_up_turn_starts() {
+    let gate_dir = tempfile::tempdir().unwrap();
+    let gate = gate_dir.path().join("open");
+    let (_tmp, repo, mut daemon) = setup_background_verification(&format!(
+        "while [ ! -f '{}' ]; do sleep 0.05; done; exit 0",
+        gate.display()
+    ));
+    handle_engineer_completion(&mut daemon, "eng-1").unwrap();
+    let original_head = current_head(&repo);
+    let _peer = start_follow_up_turn(&mut daemon);
+    let worktree = daemon.worktree_dir("eng-1");
+    let engineer_head = current_head(&worktree);
+    std::fs::write(worktree.join("follow-up.txt"), "unfinished edits\n").unwrap();
+    std::fs::write(gate, "").unwrap();
+
+    wait_for_verification_jobs(&mut daemon).unwrap();
+    daemon.process_merge_queue_for_test().unwrap();
+
+    assert!(
+        !verification_snapshot_path(&repo, 42, "eng-1", 1).exists(),
+        "the earlier turn must not publish verification evidence for a live follow-up"
+    );
+    assert_eq!(daemon.active_task_id("eng-1"), Some(42));
+    assert_eq!(daemon.retry_count_for_test("eng-1"), None);
+    assert_eq!(
+        daemon.member_state_for_test("eng-1"),
+        Some(MemberState::Working)
+    );
+    assert_eq!(current_head(&repo), original_head);
+    assert_eq!(current_head(&worktree), engineer_head);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("follow-up.txt")).unwrap(),
+        "unfinished edits\n"
+    );
 }

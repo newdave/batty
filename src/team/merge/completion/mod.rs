@@ -88,6 +88,10 @@ pub(crate) fn handle_engineer_completion(daemon: &mut TeamDaemon, engineer: &str
         return Ok(());
     }
 
+    if !daemon.completion_claim_is_current(engineer, task_id)? {
+        return Ok(());
+    }
+
     let worktree_dir = daemon.worktree_dir(engineer);
     let trunk_branch = daemon.config.team_config.trunk_branch().to_string();
     let manager_name = daemon.manager_name(engineer);
@@ -227,6 +231,13 @@ fn finish_engineer_completion(
     verification_run: VerificationRunResult,
     test_duration_ms: u64,
 ) -> Result<()> {
+    // A background result must not reclaim a task blocked or reassigned mid-run.
+    if daemon.active_task_id(engineer) != Some(ctx.task_id)
+        || !daemon.completion_claim_is_current(engineer, ctx.task_id)?
+    {
+        return Ok(());
+    }
+
     if let Some(recovery) = verification_run.recovery.as_ref() {
         return verify_job::handle_branch_recovery(
             daemon,

@@ -31,6 +31,28 @@ pub(super) fn verification_retry_required_task(task: &crate::task::Task) -> bool
 }
 
 impl TeamDaemon {
+    /// A transport turn ending is not authority to complete a blocked or reassigned task.
+    /// Read the board afresh: reconciliation and completion events can race.
+    pub(crate) fn completion_claim_is_current(&self, engineer: &str, task_id: u32) -> Result<bool> {
+        // A newer turn invalidates the previous completion even if HEAD is unchanged.
+        if self
+            .shim_handles
+            .get(engineer)
+            .is_some_and(|handle| !handle.is_ready() || !handle.in_flight_messages.is_empty())
+        {
+            return Ok(false);
+        }
+        let tasks = crate::task::load_tasks_from_dir(&self.board_dir().join("tasks"))?;
+        Ok(tasks.iter().any(|task| {
+            task.id == task_id
+                && task.status == "in-progress"
+                && task.claimed_by.as_deref().is_some_and(|claim| {
+                    super::super::health::resolve_engineer_claim(&self.config.members, claim)
+                        == Some(engineer)
+                })
+        }))
+    }
+
     pub(in crate::team::daemon) fn reconcile_active_tasks(&mut self) -> Result<()> {
         let board_dir = self.board_dir();
         let tasks_dir = board_dir.join("tasks");
